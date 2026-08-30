@@ -29,29 +29,28 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install
-        run: pip install -e '.[dev]'
-
-      - name: Lint
+      # scripts/lint and scripts/test select this job's own .venv, so it
+      # is created first, the same way a developer creates one locally.
+      - name: Create .venv and install
         run: |
-          ruff check .
-          ruff format --check .
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -e '.[dev]'
 
-      - name: Test
-        run: pytest -q
+      - name: scripts/lint
+        run: scripts/lint
 
-      - name: The catalogue must match the declared sources
-        # sources.json is generated; a stale one is a directory that lies.
-        run: |
-          python -m mcuhome.packagetool catalog
-          git diff --exit-code sources.json
+      # The catalogue-regeneration check (sources.json against
+      # publishing.json) is part of scripts/test — see that script's
+      # head comment for why it belongs to test rather than lint.
+      - name: scripts/test
+        run: scripts/test -q
 
       - name: Verify the published sources
         # Every source publishing.json declares, so adding one needs no
         # workflow change.
         run: |
           for source in $(jq -r '.sources | keys[]' publishing.json); do
-            python verify.py "$source" --anchor anchor.json
+            .venv/bin/python verify.py "$source" --anchor anchor.json
           done
 
       - name: Report remaining validity
@@ -59,7 +58,7 @@ jobs:
         # threshold — for keys.json that is the signal to arrange a root
         # ceremony, which nothing automatic can do.
         run: |
-          python -m mcuhome.packagetool status \
+          .venv/bin/python -m mcuhome.packagetool status \
             --source $(jq -r '.sources | keys[]' publishing.json | tr '\n' ' ')
 
   license-reuse:

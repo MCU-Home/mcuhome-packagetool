@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The test gate: pytest against the fixed test vectors, plus the
+# catalogue-regeneration check the README names ("the regenerated
+# catalogue matched against publishing.json"). That check belongs here
+# rather than in scripts/lint: it asserts that the generated sources.json
+# still matches what publishing.json declares — a correctness/freshness
+# assertion over generated output, not a style check. Run from this
+# repository's own .venv; extra arguments are passed through to pytest
+# only (the catalogue check takes none).
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+venv="$root/.venv"
+
+if [ ! -x "$venv/bin/python" ]; then
+  echo "scripts/test: no .venv found. Create it first: python3.13 -m venv .venv && .venv/bin/pip install -e '.[dev]' (see README, \"Working on this repository\")." >&2
+  exit 1
+fi
+
+cd "$root"
+"$venv/bin/python" -m pytest -q "$@"
+"$venv/bin/python" -m mcuhome.packagetool catalog
+git diff --exit-code sources.json
