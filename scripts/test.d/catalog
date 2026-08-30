@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The catalogue-regeneration check: sources.json, the site's unsigned
+# directory, is generated from publishing.json — this asserts the
+# committed sources.json still matches what publishing.json declares.
+# A correctness/freshness assertion over generated output, not a style
+# check, so it lives in the test gate rather than lint. Run from this
+# repository's own .venv.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+venv="$root/.venv"
+
+if [ ! -x "$venv/bin/python" ]; then
+  echo "test.d/catalog: no .venv found. Create it first: python3.13 -m venv .venv && .venv/bin/pip install -e . --group dev (see README)." >&2
+  exit 1
+fi
+
+cd "$root"
+"$venv/bin/python" -m mcuhome.packagetool catalog
+git diff --exit-code sources.json

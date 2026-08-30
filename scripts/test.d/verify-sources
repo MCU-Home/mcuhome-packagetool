@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The reference verifier over every source publishing.json declares,
+# checked against anchor.json, followed by the remaining-validity
+# report: a broken signature or a document past its warning threshold
+# fails here rather than in somebody's build. Needs network (fetches the
+# published documents) — that is fine, it is its own job, kept apart
+# from the offline pytest/catalog checks. Run from this repository's
+# own .venv.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+venv="$root/.venv"
+
+if [ ! -x "$venv/bin/python" ]; then
+  echo "test.d/verify-sources: no .venv found. Create it first: python3.13 -m venv .venv && .venv/bin/pip install -e . --group dev (see README)." >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "test.d/verify-sources: jq is not installed. Install it first (e.g. apt install jq)." >&2
+  exit 1
+fi
+
+cd "$root"
+sources="$(jq -r '.sources | keys[]' publishing.json)"
+for source in $sources; do
+  "$venv/bin/python" verify.py "$source" --anchor anchor.json
+done
+
+# shellcheck disable=SC2086
+"$venv/bin/python" -m mcuhome.packagetool status --source $sources

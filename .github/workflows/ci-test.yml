@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Test gate: one job per wrapper in scripts/test.d/ (pytest, catalog,
+# verify-sources), plus a pre-check that every wrapper has a job here.
+#
+# test-pytest and test-catalog are offline: the fixed test vectors and
+# the catalogue-regeneration check (sources.json against
+# publishing.json). test-verify-sources is its own job because it needs
+# network — the reference verifier and the remaining-validity report run
+# against the *published* sources, so a broken signature or an expiring
+# document fails here rather than in somebody's build.
+#
+# All actions are pinned to commit SHAs, not tags.
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-gates:
+    name: Check gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: scripts/test check-ci
+        run: scripts/test check-ci
+
+  test-pytest:
+    name: Test (pytest)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check -e . --group dev
+
+      - name: scripts/test pytest
+        run: scripts/test pytest
+
+  test-catalog:
+    name: Test (catalog)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check -e . --group dev
+
+      - name: scripts/test catalog
+        run: scripts/test catalog
+
+  test-verify-sources:
+    name: Test (verify-sources)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check -e . --group dev
+
+      - name: scripts/test verify-sources
+        run: scripts/test verify-sources
