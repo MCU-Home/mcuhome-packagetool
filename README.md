@@ -50,22 +50,35 @@ exactly as much as the original.
 | `tests/` | The suite, and the fixed source directories it verifies, one per outcome |
 | `.github/` | The publish, refresh and check workflows |
 
-## Working on this repository
+## Development — how to work on this repository
 
-The repository wants Python 3.13 and its `dev` extra; beyond `cryptography`
-and `packaging` it uses the standard library. The gate is lint, the unit suite
-against the fixed test vectors, and the regenerated catalogue matched against
-`publishing.json`:
+This repository has its own virtual environment in `.venv/`; nothing is
+installed into the system Python or into another repository's environment.
+`bin/` holds the user-facing entry points, `scripts/` the development
+tooling: `scripts/test` and `scripts/lint` dispatch the checks — `all` runs
+every one, `list` names them, `<name>` runs one — and each check is its own
+wrapper in `scripts/test.d/` or `scripts/lint.d/`. The wrappers select
+`.venv` themselves (never activate one by hand) and are exactly what CI
+runs, one job per check.
+
+Needs Python 3.13; beyond `cryptography` and `packaging` it uses the
+standard library. `scripts/test catalog` checks the committed `sources.json`
+against `publishing.json`; `scripts/test verify-sources` additionally needs
+`jq` and network access to check every published document against
+`anchor.json`.
 
 ```sh
-pip install -e '.[dev]'
-ruff check . && ruff format --check . && pytest -q
-python -m mcuhome.packagetool catalog && git diff --exit-code sources.json
+python3.13 -m venv .venv && .venv/bin/pip install -e . --group dev
 ```
 
-The same commands run on every push and pull request, followed there by the
-reference verifier over every source `publishing.json` declares, so a broken
-signature or an expiring document fails here rather than in somebody's build.
+```sh
+scripts/test all
+scripts/lint all
+```
+
+The rules that hold across every MCUHome repository — coding standards,
+commits, licensing — are in the organization's
+[contributing guide](https://github.com/mcu-home/.github/blob/main/CONTRIBUTING.md).
 
 ## Configuration
 
