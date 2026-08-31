@@ -61,14 +61,14 @@ wrapper in `scripts/test.d/` or `scripts/lint.d/`. The wrappers select
 `.venv` themselves (never activate one by hand) and are exactly what CI
 runs, one job per check.
 
-Needs Python 3.13; beyond `cryptography` and `packaging` it uses the
+Needs Python ≥3.13; beyond `cryptography` and `packaging` it uses the
 standard library. `scripts/test catalog` checks the committed `sources.json`
 against `publishing.json`; `scripts/test verify-sources` additionally needs
 `jq` and network access to check every published document against
 `anchor.json`.
 
 ```sh
-python3.13 -m venv .venv && .venv/bin/pip install -e . --group dev
+python3 -m venv .venv && .venv/bin/pip install -e . --group dev
 ```
 
 ```sh
