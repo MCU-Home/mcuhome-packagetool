@@ -13,6 +13,7 @@ Commands:
 ``anchor``    a root key set as a client would embed or configure it
 ``init``      lay down a complete, empty source
 ``add``       record one package in a source
+``add-meta``  record a meta package: one name for a set of concrete ones
 ``refresh``   renew the publisher-signed documents before they expire
 ``status``    how long each document is still valid (a CI guard)
 ``prune``     list superseded part files past their grace period
@@ -40,6 +41,7 @@ from mcuhome.packagetool.source import (
     KEYS_FILE,
     MIRRORS_FILE,
     PublicKey,
+    add_meta_package,
     add_package,
     init_source,
     read_document,
@@ -73,6 +75,28 @@ def _publisher_keys(paths: list[Path]) -> list[SigningKey]:
         )
     blocks = [f"-----BEGIN{part}" for part in blob.split("-----BEGIN") if part.strip()]
     return [load_private_pem(block.encode("utf-8")) for block in blocks]
+
+
+def _meta(members: list[str]) -> dict[str, dict[str, str]]:
+    """``--member arch:linux-amd64=<package>`` arguments as the meta object.
+
+    One flag per member and not one JSON blob on the command line: a
+    workflow builds these strings with `jq` and a person types them, and
+    both notice a typo here rather than in a signed document.
+    """
+    meta: dict[str, dict[str, str]] = {}
+    for member in members:
+        coordinate, separator, package = member.partition("=")
+        dimension, colon, key = coordinate.partition(":")
+        if not (separator and colon and dimension and key and package):
+            raise SystemExit(
+                f"--member {member!r} is not <dimension>:<key>=<package>, "
+                "e.g. arch:linux-amd64=mcuhome-build-tools_linux-amd64"
+            )
+        if key in meta.setdefault(dimension, {}):
+            raise SystemExit(f"--member names {dimension}:{key} twice")
+        meta[dimension][key] = package
+    return meta
 
 
 def _public(path: Path) -> dict:
@@ -126,6 +150,19 @@ def main(argv: list[str]) -> int:
     add.add_argument("--sha256", required=True)
     add.add_argument("--size", type=int, required=True)
     add.add_argument("--publisher-key", type=Path, nargs="*", default=[])
+
+    add_meta = commands.add_parser("add-meta", help="record a meta package in a source")
+    add_meta.add_argument("--source", type=Path, required=True)
+    add_meta.add_argument("--name", required=True, help="the meta package's name")
+    add_meta.add_argument("--version", required=True, help="the version its members share")
+    add_meta.add_argument(
+        "--member",
+        action="append",
+        required=True,
+        metavar="DIMENSION:KEY=PACKAGE",
+        help="one member, e.g. arch:linux-amd64=mcuhome-build-tools_linux-amd64 (repeatable)",
+    )
+    add_meta.add_argument("--publisher-key", type=Path, nargs="*", default=[])
 
     renew = commands.add_parser("refresh", help="renew the publisher-signed documents")
     renew.add_argument("--source", type=Path, nargs="+", required=True)
@@ -206,6 +243,18 @@ def main(argv: list[str]) -> int:
             file=arguments.file,
             sha256=arguments.sha256,
             size=arguments.size,
+            issued=now,
+            signers=_publisher_keys(arguments.publisher_key),
+        )
+        print(f"{arguments.name} {arguments.version} recorded in {landed}")
+        return 0
+
+    if arguments.command == "add-meta":
+        landed = add_meta_package(
+            arguments.source,
+            name=arguments.name,
+            version=arguments.version,
+            meta=_meta(arguments.member),
             issued=now,
             signers=_publisher_keys(arguments.publisher_key),
         )

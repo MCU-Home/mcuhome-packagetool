@@ -28,7 +28,9 @@ What is checked, in the order ADR 0025 §9 gives:
 4. (choosing a mirror is the client's)
 5. ``index.json`` — a publisher signature, and freshness against state
 6. every part named by the head — its sha256
-7. package entries — shape; the bytes themselves are checked when fetched
+7. package entries — shape; the bytes themselves are checked when fetched.
+   A *meta* entry, which names packages rather than bytes, additionally
+   has its hash recomputed from the members it points at
 8. revocation — ``compromised`` invalidates the past, ``retired`` does not
 
 Usage::
@@ -337,17 +339,33 @@ def verify_parts(source: Path, index: dict) -> int:
     return len(parts)
 
 
-def verify_entries(source: Path, index: dict) -> int:
-    """The shape of every package entry, head and parts.
+def canonical_json(document: object) -> bytes:
+    """RFC 8785 canonical JSON of a document of objects and strings.
 
-    The *bytes* of a package are checked when it is fetched, against the
-    ``sha256`` recorded here; what this can check without fetching is
-    that every entry states a file, a hash and a size at all.
+    Spelled out rather than handed to ``json.dumps``: RFC 8785 sorts object
+    members by their UTF-16 code units and Python sorts strings by code
+    point, which agree for every name a package would carry and disagree
+    above the basic multilingual plane. Only objects and strings are
+    accepted — a number would drag ECMAScript's number formatting in, and
+    nothing hashed here is one.
     """
+    if isinstance(document, str):
+        return json.dumps(document, ensure_ascii=False).encode("utf-8")
+    if isinstance(document, dict):
+        members = sorted(document.items(), key=lambda item: str(item[0]).encode("utf-16-be"))
+        body = b",".join(
+            canonical_json(str(name)) + b":" + canonical_json(value) for name, value in members
+        )
+        return b"{" + body + b"}"
+    raise Refused("a meta package may only carry objects and strings")
+
+
+def _all_entries(source: Path, index: dict) -> dict[str, dict[str, dict]]:
+    """Every package entry of the source — head and parts — as one map."""
+    merged: dict[str, dict[str, dict]] = {}
     documents = [index]
     for part in index.get("parts") or []:
         documents.append(json.loads((source / str(part["file"])).read_bytes()))
-    total = 0
     for document in documents:
         packages = document.get("packages")
         if not isinstance(packages, dict):
@@ -356,9 +374,88 @@ def verify_entries(source: Path, index: dict) -> int:
             if not isinstance(versions, dict):
                 raise Refused(f"{name}: versions is not an object")
             for version, entry in versions.items():
-                if not isinstance(entry, dict) or not {"file", "sha256", "size"} <= set(entry):
-                    raise Refused(f"{name} {version}: entry needs file, sha256 and size")
-                total += 1
+                if not isinstance(entry, dict):
+                    raise Refused(f"{name} {version}: entry is not an object")
+                merged.setdefault(str(name), {})[str(version)] = entry
+    return merged
+
+
+def check_meta_entry(entries: dict[str, dict[str, dict]], name: str, version: str, entry: dict):
+    """One meta entry: its members exist at its version, and its hash is right.
+
+    A **meta package** is a name standing for a set of concrete packages,
+    one per coordinate of one or more dimensions — ``arch`` is the first,
+    and the shape is deliberately general. Its entry names packages instead
+    of bytes, so it carries no ``file`` and no ``size``.
+
+    Two rules are checked here, and both are recomputed rather than
+    believed:
+
+    * **The version invariant.** A meta package at version V exists exactly
+      when every member exists at V; the meta version *is* its members'
+      version. A member missing at this version is a refusal.
+    * **The hash.** It is the SHA-256 of the UTF-8 RFC 8785 canonical JSON
+      of the ``meta`` object with every leaf replaced by that package's
+      ``{"name", "sha256"}``. Both sides can compute it from the index
+      alone, so a meta entry can be checked without fetching anything —
+      and pinning the meta package pins every member's bytes.
+    """
+    if not {"meta", "sha256"} <= set(entry):
+        raise Refused(f"{name} {version}: a meta entry needs meta and sha256")
+    for absent in ("file", "size"):
+        if absent in entry:
+            raise Refused(
+                f"{name} {version}: a meta entry names packages, not bytes — it carries no {absent}"
+            )
+    meta = entry["meta"]
+    if not isinstance(meta, dict) or not meta:
+        raise Refused(f"{name} {version}: meta names no dimension")
+
+    expanded: dict[str, dict[str, dict[str, str]]] = {}
+    for dimension, members in meta.items():
+        if not isinstance(members, dict) or not members:
+            raise Refused(f"{name} {version}: the meta dimension {dimension!r} names no packages")
+        resolved: dict[str, dict[str, str]] = {}
+        for key, package in members.items():
+            member = entries.get(str(package), {}).get(version)
+            if member is None:
+                raise Refused(
+                    f"{name} {version} points at {package} {version}, which this source does "
+                    f"not publish ({dimension}={key})"
+                )
+            if "meta" in member:
+                raise Refused(f"{name} {version} points at {package}, which is itself meta")
+            digest = member.get("sha256")
+            if not isinstance(digest, str):
+                raise Refused(f"{package} {version}: entry records no sha256")
+            resolved[str(key)] = {"name": str(package), "sha256": digest}
+        expanded[str(dimension)] = resolved
+
+    recomputed = hashlib.sha256(canonical_json(expanded)).hexdigest()
+    if recomputed != entry["sha256"]:
+        raise Refused(
+            f"{name} {version}: the meta hash is {entry['sha256']}, and its members hash to "
+            f"{recomputed} — this entry does not describe the packages it points at"
+        )
+
+
+def verify_entries(source: Path, index: dict) -> int:
+    """The shape of every package entry, head and parts.
+
+    The *bytes* of a package are checked when it is fetched, against the
+    ``sha256`` recorded here; what this can check without fetching is that
+    every entry states a file, a hash and a size at all — and, for a meta
+    entry, that its members are here and its hash is the one they produce.
+    """
+    entries = _all_entries(source, index)
+    total = 0
+    for name, versions in entries.items():
+        for version, entry in versions.items():
+            if "meta" in entry:
+                check_meta_entry(entries, name, version, entry)
+            elif not {"file", "sha256", "size"} <= set(entry):
+                raise Refused(f"{name} {version}: entry needs file, sha256 and size")
+            total += 1
     return total
 
 

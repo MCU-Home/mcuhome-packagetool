@@ -216,14 +216,19 @@ async function collect(source) {
   for (const document_ of documents) {
     for (const [name, versions] of Object.entries(document_.packages || {})) {
       for (const [version, entry] of Object.entries(versions)) {
+        // A meta entry names other packages instead of a file — it carries
+        // `meta` and deliberately no `file`/`size` (see README "Meta
+        // packages"). Nothing to fetch, so no href either.
+        const isMeta = Boolean(entry.meta) && !entry.file;
         rows.push({
           source: source.name,
           name,
           version,
-          size: Number(entry.size) || 0,
+          meta: isMeta ? entry.meta : null,
+          size: isMeta ? 0 : (Number(entry.size) || 0),
           sha256: String(entry.sha256 || ""),
-          href: source.path + entry.file,
-          file: entry.file,
+          href: isMeta ? null : source.path + entry.file,
+          file: isMeta ? null : entry.file,
         });
       }
     }
@@ -272,7 +277,9 @@ function render() {
   for (const row of shown) {
     const tr = el("tr");
     tr.append(el("td", row.source), el("td", row.name), el("td", row.version));
-    tr.append(el("td", humanSize(row.size), { class: "num", title: `${row.size} bytes` }));
+    tr.append(row.meta
+      ? el("td", "meta", { class: "num", title: "a meta package: resolves to other packages, nothing to fetch" })
+      : el("td", humanSize(row.size), { class: "num", title: `${row.size} bytes` }));
 
     const hash = el("td");
     const code = el("code", row.sha256.slice(0, 12) + "…", {
@@ -287,10 +294,22 @@ function render() {
     tr.append(hash);
 
     const files = el("td");
-    const link = el("a", row.file, { href: row.href });
-    link.addEventListener("click", (event) => askBeforeDownloading(event, row));
-    files.append(link, document.createTextNode(" · "));
-    files.append(el("a", "sha256", { href: row.href + ".sha256" }));
+    if (row.meta) {
+      // No file to link to — show what the meta entry resolves to instead:
+      // dimension -> coordinate -> concrete package name.
+      const parts = [];
+      for (const [dimension, members] of Object.entries(row.meta)) {
+        for (const [key, packageName] of Object.entries(members)) {
+          parts.push(`${dimension}=${key} → ${packageName}`);
+        }
+      }
+      files.append(el("span", parts.join(", "), { title: "resolves to (dimension=coordinate → package)" }));
+    } else {
+      const link = el("a", row.file, { href: row.href });
+      link.addEventListener("click", (event) => askBeforeDownloading(event, row));
+      files.append(link, document.createTextNode(" · "));
+      files.append(el("a", "sha256", { href: row.href + ".sha256" }));
+    }
     tr.append(files);
     body.append(tr);
   }

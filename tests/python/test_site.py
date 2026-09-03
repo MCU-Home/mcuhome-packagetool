@@ -2,7 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """The served site: its directory of sources, and what its pages may load.
 
-Two properties are worth a test rather than a habit.
+Three properties are worth a test rather than a habit.
+
+**The operational configuration has the shape the publish workflow
+assumes.** A source declares a list of packages, and the workflow reads
+that list with jq — a malformed entry would surface as a failed publish
+rather than as a failed test.
 
 **The catalogue cannot drift.** ``sources.json`` is generated from
 ``publishing.json``; a source added to one and not the other would be a
@@ -35,8 +40,61 @@ def catalog() -> dict:
     return json.loads((ROOT / CATALOG_FILE).read_text(encoding="utf-8"))
 
 
-def test_the_catalogue_is_up_to_date(catalog: dict) -> None:
-    publishing = json.loads((ROOT / "publishing.json").read_text(encoding="utf-8"))
+@pytest.fixture(scope="module")
+def publishing() -> dict:
+    return json.loads((ROOT / "publishing.json").read_text(encoding="utf-8"))
+
+
+def test_every_source_declares_the_packages_it_carries(publishing: dict) -> None:
+    """The shape the publish workflow loops over, checked before it runs.
+
+    A source carries a list of packages rather than one, because an
+    architecture is a suffix of a package name and not a source of its
+    own. The workflow reads that list with jq while publishing; a
+    malformed entry is a failed publish, and this is where it is cheap.
+    """
+    for name, entry in publishing["sources"].items():
+        assert entry.get("repository"), f"{name}: no upstream repository"
+        packages = entry.get("packages")
+        assert isinstance(packages, list) and packages, f"{name}: no packages declared"
+        for package in packages:
+            assert isinstance(package, dict) and package.keys() >= {"name", "asset"}, (
+                f"{name}: every package states a name and an asset pattern"
+            )
+            assert package["asset"].startswith(package["name"] + "-"), (
+                f"{name}: the asset pattern of {package['name']} must name that package — "
+                "the workflow derives the version by stripping the name from the file name"
+            )
+
+
+def test_a_declared_meta_package_names_packages_the_source_carries(publishing: dict) -> None:
+    """The shape the publish workflow turns into ``add-meta`` arguments.
+
+    A meta package stands for packages of its own source: one it does not
+    carry could never be published together with it, and the version
+    invariant — a meta package exists exactly when every member does — could
+    then never be satisfied by one publish.
+    """
+    for name, entry in publishing["sources"].items():
+        meta = entry.get("meta")
+        if meta is None:
+            continue
+        assert meta.get("name"), f"{name}: the meta package has no name"
+        carried = {package["name"] for package in entry["packages"]}
+        assert meta["name"] not in carried, (
+            f"{name}: {meta['name']} is both a meta package and a concrete one"
+        )
+        members = meta.get("members")
+        assert isinstance(members, dict) and members, f"{name}: the meta package names no member"
+        for dimension, mapping in members.items():
+            assert isinstance(mapping, dict) and mapping, f"{name}: {dimension} names no package"
+            for key, package in mapping.items():
+                assert package in carried, (
+                    f"{name}: {dimension}={key} names {package}, which this source does not carry"
+                )
+
+
+def test_the_catalogue_is_up_to_date(catalog: dict, publishing: dict) -> None:
     assert catalog == build_catalog(publishing), (
         "sources.json is stale — run: python -m mcuhome.packagetool catalog"
     )

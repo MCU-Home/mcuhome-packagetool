@@ -1,13 +1,52 @@
 {
-  "note": "Operational configuration of this repository, not published metadata: it says which upstream release feeds which source. Nothing verifies against it and no client reads it — the signed documents inside each source are what count.",
+  "note": "Operational configuration of this repository, not published metadata: it says which upstream release feeds which source, which package names that source carries, and which meta package stands for a family of them. Nothing verifies against it and no client reads it — the signed documents inside each source are what count.",
   "sources": {
+    "build-tools": {
+      "description": "The build environment's host tools, one package per platform: the compiler toolchain, the build system, the workspace tool and the wheel set the build's virtual environment is created from. Published with a meta package under the family name, which a build pins instead of one platform's package.",
+      "meta": {
+        "members": {
+          "arch": {
+            "linux-amd64": "mcuhome-build-tools_linux-amd64",
+            "linux-arm64": "mcuhome-build-tools_linux-arm64"
+          }
+        },
+        "name": "mcuhome-build-tools"
+      },
+      "packages": [
+        {
+          "asset": "mcuhome-build-tools_linux-amd64-*.tar.zst",
+          "name": "mcuhome-build-tools_linux-amd64"
+        },
+        {
+          "asset": "mcuhome-build-tools_linux-arm64-*.tar.zst",
+          "name": "mcuhome-build-tools_linux-arm64"
+        }
+      ],
+      "repository": "mcu-home/mcuhome-sdk",
+      "title": "MCUHome build tools"
+    },
+    "build-workspace": {
+      "description": "The build environment's source world, architecture-neutral: the framework and its dependencies at pinned revisions, the base patches applied, the blobs fetched and the generated code that is a release constant already generated.",
+      "packages": [
+        {
+          "asset": "mcuhome-build-workspace-*.tar.zst",
+          "name": "mcuhome-build-workspace"
+        }
+      ],
+      "repository": "mcu-home/mcuhome-sdk",
+      "title": "MCUHome build workspace"
+    },
     "sdk": {
-      "asset": "mcuhome-sdk-*.tar.zst",
       "description": "The source package a build compiles from: the Zephyr module, the C runtime, the components and the code generator.",
-      "package": "mcuhome-sdk",
+      "packages": [
+        {
+          "asset": "mcuhome-sdk-*.tar.zst",
+          "name": "mcuhome-sdk"
+        }
+      ],
       "repository": "mcu-home/mcuhome-sdk",
       "title": "MCUHome SDK"
     }
   },
-  "version": 1
+  "version": 3
 }

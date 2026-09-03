@@ -13,6 +13,8 @@ Three operations matter and each is small:
 ``init``      lay a source down: ``keys.json`` (root-signed),
               ``mirrors.json`` and an empty ``index.json``
 ``add``       record one package, in the part that covers it or in the head
+``add-meta``  record a *meta* package: one name standing for a set of
+              concrete packages, one per architecture
 ``refresh``   renew the two publisher-signed documents before they expire
 
 What deliberately has no operation here is *deleting* anything.
@@ -47,11 +49,16 @@ from mcuhome.packagetool.keys import SigningKey
 __all__ = [
     "INDEX_FILE",
     "KEYS_FILE",
+    "META_KEY",
     "MIRRORS_FILE",
     "PublicKey",
+    "add_meta_package",
     "add_package",
+    "canonical_json",
     "covering_part",
+    "expand_meta",
     "init_source",
+    "meta_sha256",
     "part_filename",
     "read_document",
     "refresh",
@@ -63,6 +70,10 @@ KEYS_FILE = "keys.json"
 MIRRORS_FILE = "mirrors.json"
 INDEX_FILE = "index.json"
 KEYS_ARCHIVE = "keys"
+
+#: What makes an index entry a *meta* entry: it names packages instead of
+#: bytes, so it carries this member and neither ``file`` nor ``size``.
+META_KEY = "meta"
 
 
 @dataclass(frozen=True)
@@ -261,6 +272,162 @@ def add_package(
         versions = dict(entries.get(name) or {})
         versions[version] = entry
         rebuilt = {**entries, name: versions}
+        payload = dump({"packages": rebuilt})
+        filename = part_filename(target.get("covers") or {}, payload)
+        (source / filename).write_bytes(payload)
+        target["file"] = filename
+        target["sha256"] = hashlib.sha256(payload).hexdigest()
+        index["parts"] = parts
+        landed = filename
+
+    index.update(header(issued=issued, expires_days=INDEX_EXPIRY_DAYS))
+    index.setdefault("parts", parts)
+    write_signed(path, index, signers)
+    return landed
+
+
+# --------------------------------------------------------------------------- meta packages
+
+
+def canonical_json(document: object) -> bytes:
+    """RFC 8785 canonical JSON of a document of objects and strings.
+
+    Written out rather than handed to :func:`json.dumps`, for one reason:
+    RFC 8785 sorts object members by their **UTF-16 code units** and Python
+    sorts strings by code point. The two agree for every name anybody would
+    give a package and disagree above the basic multilingual plane, and a
+    hash rule that is *usually* the standard is not the standard.
+
+    Only objects and strings are accepted. Numbers are where canonical JSON
+    gets hard (RFC 8785 pins them to ECMAScript's number-to-string), and no
+    document hashed here needs one — refusing is cheaper than being subtly
+    wrong.
+    """
+    if isinstance(document, str):
+        return json.dumps(document, ensure_ascii=False).encode("utf-8")
+    if isinstance(document, dict):
+        members = sorted(document.items(), key=lambda item: str(item[0]).encode("utf-16-be"))
+        body = b",".join(
+            canonical_json(str(name)) + b":" + canonical_json(value) for name, value in members
+        )
+        return b"{" + body + b"}"
+    raise SystemExit(
+        f"canonical JSON here covers objects and strings; {type(document).__name__} is neither"
+    )
+
+
+def meta_sha256(expanded: dict) -> str:
+    """The hash of a meta package: SHA-256 of its expanded document.
+
+    The document is the entry's ``meta`` object with every leaf — a package
+    name — replaced by that package's ``{"name", "sha256"}``, so the hash
+    covers *which* packages the meta stands for **and** their bytes. Change
+    one member's name, one member's content, or the shape of the map, and
+    the hash changes.
+
+    Both sides can compute it from the index alone: the publisher when it
+    writes the entry, and a client when it reads one — which is why
+    ``verify.py`` recomputes rather than believes it.
+    """
+    return hashlib.sha256(canonical_json(expanded)).hexdigest()
+
+
+def _entry_of(source: Path, index: dict, name: str, version: str) -> dict | None:
+    """One package version's entry, wherever in the source it is recorded."""
+    found = (index.get("packages") or {}).get(name, {}).get(version)
+    if isinstance(found, dict):
+        return found
+    for part in index.get("parts") or []:
+        found = _entries_of_part(source, part).get(name, {}).get(version)
+        if isinstance(found, dict):
+            return found
+    return None
+
+
+def expand_meta(source: Path, index: dict, meta: dict, version: str) -> dict:
+    """*meta* with every member name replaced by its ``{name, sha256}``.
+
+    This is where the version invariant is enforced: **a meta package at
+    version V exists exactly when every one of its members exists at V, and
+    the meta version is its members' version.** A member that is not
+    published at this version yet is a refusal naming it, not a meta entry
+    with a hole in it — the point of the meta package is that pinning it
+    pins every platform's bytes.
+    """
+    expanded: dict[str, dict[str, dict[str, str]]] = {}
+    for dimension, members in sorted(meta.items()):
+        if not isinstance(members, dict) or not members:
+            raise SystemExit(f"the meta dimension {dimension!r} names no packages")
+        resolved: dict[str, dict[str, str]] = {}
+        for key, package in sorted(members.items()):
+            entry = _entry_of(source, index, str(package), version)
+            if entry is None:
+                raise SystemExit(
+                    f"{package} {version} is not published in this source — a meta package "
+                    f"is written once every member exists at its version ({dimension}={key})"
+                )
+            if META_KEY in entry:
+                raise SystemExit(
+                    f"{package} {version} is itself a meta package; a meta package names "
+                    "concrete packages, so that resolving it is one step and never a search"
+                )
+            digest = entry.get("sha256")
+            if not isinstance(digest, str):
+                raise SystemExit(f"{package} {version} records no sha256")
+            resolved[str(key)] = {"name": str(package), "sha256": digest}
+        expanded[str(dimension)] = resolved
+    if not expanded:
+        raise SystemExit("a meta package needs at least one dimension")
+    return expanded
+
+
+def add_meta_package(
+    source: Path,
+    *,
+    name: str,
+    version: str,
+    meta: dict,
+    issued: datetime,
+    signers: Sequence[SigningKey],
+) -> str:
+    """Record (or confirm) one meta package. Returns where it landed.
+
+    A meta entry carries ``meta`` and ``sha256`` and deliberately no
+    ``file`` and no ``size``: it names packages, not bytes, and a client
+    resolves it to a member before it fetches anything.
+
+    Writing it again is allowed where :func:`add_package` refuses, and only
+    because it cannot mean anything different: the members are immutable, so
+    a recomputation of an existing entry either produces the identical
+    document — in which case nothing is written and nothing was replaced —
+    or it proves that something which cannot change did. Both are useful
+    answers, and the second is a refusal.
+    """
+    path = source / INDEX_FILE
+    index = read_document(path)
+    entry = {META_KEY: meta, "sha256": meta_sha256(expand_meta(source, index, meta, version))}
+
+    published = _entry_of(source, index, name, version)
+    if published is not None:
+        if published != entry:
+            raise SystemExit(
+                f"{name} {version} is already published in this source and states something "
+                "else — a published version is never replaced"
+            )
+        return f"{INDEX_FILE} (unchanged)"
+
+    assert_advances(index, issued, INDEX_FILE)
+    parts = list(index.get("parts") or [])
+    target = covering_part(parts, version)
+
+    if target is None:
+        packages = dict(index.get("packages") or {})
+        packages[name] = {**(packages.get(name) or {}), version: entry}
+        index["packages"] = packages
+        landed = INDEX_FILE
+    else:
+        entries = _entries_of_part(source, target)
+        rebuilt = {**entries, name: {**(entries.get(name) or {}), version: entry}}
         payload = dump({"packages": rebuilt})
         filename = part_filename(target.get("covers") or {}, payload)
         (source / filename).write_bytes(payload)

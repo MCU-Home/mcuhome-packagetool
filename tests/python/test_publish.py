@@ -17,21 +17,24 @@ from pathlib import Path
 import pytest
 from make_vectors import BASE, NOW, VECTORS, key, public
 
-from mcuhome.packagetool.documents import parse_stamp
+from mcuhome.packagetool.documents import parse_stamp, write_signed
 from mcuhome.packagetool.source import (
     INDEX_FILE,
     KEYS_FILE,
     MIRRORS_FILE,
+    add_meta_package,
     add_package,
+    canonical_json,
     covering_part,
     init_source,
+    meta_sha256,
     read_document,
     refresh,
     unreferenced_parts,
     write_keys,
     write_mirrors,
 )
-from verify import load_anchor, verify_source
+from verify import Refused, load_anchor, verify_source
 
 ANCHOR = load_anchor(VECTORS / "anchor.json")
 
@@ -185,6 +188,211 @@ def test_rotating_keys_archives_the_predecessor(source: Path) -> None:
     assert json.loads(archived.read_text())["roots"]["keys"][0]["keyid"] == public(roots[0]).keyid
     # The anchor still reaches the new set, through the archived one.
     assert verify_source(source, ANCHOR, now=NOW)
+
+
+# --------------------------------------------------------------------------- meta packages
+
+TOOLS = "mcuhome-build-tools"
+MEMBERS = {
+    "arch": {
+        "linux-amd64": f"{TOOLS}_linux-amd64",
+        "linux-arm64": f"{TOOLS}_linux-arm64",
+    }
+}
+
+
+def _publish_members(source: Path, *, version: str = "0.1.0", only: str | None = None) -> None:
+    """The concrete per-architecture packages a meta package stands for."""
+    for index, (arch, package) in enumerate(sorted(MEMBERS["arch"].items())):
+        if only is not None and arch != only:
+            continue
+        add_package(
+            source,
+            name=package,
+            version=version,
+            file=f"{package}-{version}.tar.zst",
+            sha256=f"{index + 1:x}" * 64,
+            size=10 + index,
+            issued=BASE + timedelta(days=index + 1),
+            signers=[key("publisher-1")],
+        )
+
+
+def test_canonical_json_is_rfc_8785() -> None:
+    """The one property the frozen hash rule rests on: no whitespace, and
+    members sorted by their UTF-16 code units rather than by code point.
+
+    The two orders differ where a character above the basic multilingual
+    plane meets one just below the surrogate range: as UTF-16, U+1F600
+    begins with 0xD83D and therefore sorts *before* U+E000, while by code
+    point it sorts after. A plain ``sorted()`` over the keys gets this pair
+    the wrong way round, and a hash rule that is usually the standard is
+    not the standard.
+    """
+    assert canonical_json({"b": "2", "a": "1"}) == b'{"a":"1","b":"2"}'
+    assert canonical_json({"\U0001f600": "x", "\ue000": "y"}) == (
+        '{"\U0001f600":"x","\ue000":"y"}'.encode()
+    )
+    with pytest.raises(SystemExit):
+        canonical_json({"a": 1})
+
+
+def test_the_meta_hash_is_the_documented_document() -> None:
+    """Frozen rule: SHA-256 of the UTF-8 RFC 8785 canonical JSON of the meta
+    object with every leaf expanded to ``{"name", "sha256"}``.
+
+    Spelled out here as bytes, not as a call to the same function that
+    produced it — a hash rule both sides recompute is only worth something
+    if it is written down somewhere that fails when it changes.
+    """
+    from hashlib import sha256
+
+    expanded = {
+        "arch": {
+            "linux-amd64": {"name": f"{TOOLS}_linux-amd64", "sha256": "1" * 64},
+            "linux-arm64": {"name": f"{TOOLS}_linux-arm64", "sha256": "2" * 64},
+        }
+    }
+    document = (
+        '{"arch":{"linux-amd64":{"name":"mcuhome-build-tools_linux-amd64","sha256":"'
+        + "1" * 64
+        + '"},"linux-arm64":{"name":"mcuhome-build-tools_linux-arm64","sha256":"'
+        + "2" * 64
+        + '"}}}'
+    ).encode()
+    assert canonical_json(expanded) == document
+    assert meta_sha256(expanded) == sha256(document).hexdigest()
+
+
+def test_a_meta_package_is_recorded_and_verifies(source: Path) -> None:
+    """The whole path: members published, meta written, verifier recomputes."""
+    _publish_members(source)
+    landed = add_meta_package(
+        source,
+        name=TOOLS,
+        version="0.1.0",
+        meta=MEMBERS,
+        issued=BASE + timedelta(days=3),
+        signers=[key("publisher-1")],
+    )
+    assert landed == INDEX_FILE
+
+    entry = read_document(source / INDEX_FILE)["packages"][TOOLS]["0.1.0"]
+    assert entry["meta"] == MEMBERS
+    assert set(entry) == {"meta", "sha256"}, "a meta entry names packages, not bytes"
+    assert entry["sha256"] == meta_sha256(
+        {
+            "arch": {
+                "linux-amd64": {"name": f"{TOOLS}_linux-amd64", "sha256": "1" * 64},
+                "linux-arm64": {"name": f"{TOOLS}_linux-arm64", "sha256": "2" * 64},
+            }
+        }
+    )
+    # Three entries: the two members and the meta package.
+    assert verify_source(source, ANCHOR, now=NOW)["entries"] == 3
+
+
+def test_a_meta_package_needs_every_member_at_its_version(source: Path) -> None:
+    """The version invariant: it exists exactly when all its members do."""
+    _publish_members(source, only="linux-amd64")
+    with pytest.raises(SystemExit, match="linux-arm64.*not published|not published.*linux-arm64"):
+        add_meta_package(
+            source,
+            name=TOOLS,
+            version="0.1.0",
+            meta=MEMBERS,
+            issued=BASE + timedelta(days=3),
+            signers=[key("publisher-1")],
+        )
+    assert TOOLS not in read_document(source / INDEX_FILE)["packages"]
+
+
+def test_recording_one_meta_package_twice_changes_nothing(source: Path) -> None:
+    """Its members are immutable, so a second run can only confirm it."""
+    _publish_members(source)
+    common = {"name": TOOLS, "version": "0.1.0", "meta": MEMBERS, "signers": [key("publisher-1")]}
+    add_meta_package(source, issued=BASE + timedelta(days=3), **common)
+    before = (source / INDEX_FILE).read_bytes()
+    assert "unchanged" in add_meta_package(source, issued=BASE + timedelta(days=4), **common)
+    assert (source / INDEX_FILE).read_bytes() == before
+
+
+def test_a_meta_package_that_says_something_else_is_refused(source: Path) -> None:
+    """A published version is never replaced — meta entries included."""
+    _publish_members(source)
+    common = {"name": TOOLS, "version": "0.1.0", "signers": [key("publisher-1")]}
+    add_meta_package(source, meta=MEMBERS, issued=BASE + timedelta(days=3), **common)
+    with pytest.raises(SystemExit, match="already published"):
+        add_meta_package(
+            source,
+            meta={"arch": {"linux-amd64": f"{TOOLS}_linux-amd64"}},
+            issued=BASE + timedelta(days=4),
+            **common,
+        )
+
+
+def test_a_meta_package_may_not_point_at_another(source: Path) -> None:
+    """Resolving a meta entry is one step, never a search."""
+    _publish_members(source)
+    add_meta_package(
+        source,
+        name=TOOLS,
+        version="0.1.0",
+        meta=MEMBERS,
+        issued=BASE + timedelta(days=3),
+        signers=[key("publisher-1")],
+    )
+    with pytest.raises(SystemExit, match="itself a meta package"):
+        add_meta_package(
+            source,
+            name="mcuhome-build-tools-everything",
+            version="0.1.0",
+            meta={"family": {"tools": TOOLS}},
+            issued=BASE + timedelta(days=4),
+            signers=[key("publisher-1")],
+        )
+
+
+def test_the_verifier_recomputes_a_meta_hash_rather_than_believing_it(source: Path) -> None:
+    """A meta entry can be checked without fetching anything — so it is."""
+    _publish_members(source)
+    add_meta_package(
+        source,
+        name=TOOLS,
+        version="0.1.0",
+        meta=MEMBERS,
+        issued=BASE + timedelta(days=3),
+        signers=[key("publisher-1")],
+    )
+    index = read_document(source / INDEX_FILE)
+    index["packages"][TOOLS]["0.1.0"]["sha256"] = "f" * 64
+    write_signed(source / INDEX_FILE, index, [key("publisher-1")])
+    with pytest.raises(Refused, match="does not describe the packages it points at"):
+        verify_source(source, ANCHOR, now=NOW)
+
+
+def test_the_verifier_refuses_a_meta_entry_whose_member_is_missing(source: Path) -> None:
+    """Signed or not, an entry pointing at nothing is not a package."""
+    _publish_members(source, only="linux-amd64")
+    index = read_document(source / INDEX_FILE)
+    index["packages"][TOOLS] = {
+        "0.1.0": {"meta": MEMBERS, "sha256": "f" * 64},
+    }
+    write_signed(source / INDEX_FILE, index, [key("publisher-1")])
+    with pytest.raises(Refused, match="does not publish"):
+        verify_source(source, ANCHOR, now=NOW)
+
+
+def test_the_verifier_refuses_a_meta_entry_that_claims_bytes(source: Path) -> None:
+    """``file`` and ``size`` would make it look fetchable, and it is not."""
+    _publish_members(source)
+    index = read_document(source / INDEX_FILE)
+    index["packages"][TOOLS] = {
+        "0.1.0": {"meta": MEMBERS, "sha256": "f" * 64, "file": "x.tar.zst", "size": 1}
+    }
+    write_signed(source / INDEX_FILE, index, [key("publisher-1")])
+    with pytest.raises(Refused, match="names packages, not bytes"):
+        verify_source(source, ANCHOR, now=NOW)
 
 
 def test_keygen_never_overwrites(tmp_path: Path) -> None:

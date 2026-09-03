@@ -1,0 +1,11 @@
+{
+  "expires": "2026-10-03T06:34:08Z",
+  "issued": "2026-09-03T06:34:08Z",
+  "min_client": 1,
+  "mirrors": [
+    {
+      "url": "https://packages.mcuhome.org/build-tools/"
+    }
+  ],
+  "version": 1
+}

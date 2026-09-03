@@ -15,6 +15,21 @@
 # is declared in publishing.json, so a second source is an entry in that
 # file rather than a fork of this workflow — and an unknown source name
 # is a refusal that lists the ones that exist.
+#
+# A source declares a list of packages, not one: an architecture is a
+# suffix of a package name rather than a source of its own, so the tools
+# family lives in one source carrying one package per platform. The
+# steps below therefore loop over the (asset, package) pairs the source
+# declares, and publishing is one act for the whole set — a build that
+# pins a version has to find every platform of it at once.
+#
+# A source may also declare a **meta package**: one name standing for that
+# whole family, whose index entry maps each architecture to the concrete
+# package and carries a hash derived from theirs. It is written here,
+# automatically, right after the members it points at — because it can
+# only exist once all of them do, and this is the one moment where that is
+# true by construction. `add-meta` remains a manual path for the case a
+# publish was completed by hand.
 
 name: Publish a package
 
@@ -61,49 +76,118 @@ jobs:
             echo "::error::publishing.json knows no source '$SOURCE'. It knows: $known"
             exit 1
           fi
-          jq -r --arg s "$SOURCE" '.sources[$s]
-            | "repository=\(.repository)", "package=\(.package)", "asset=\(.asset)"' \
+          if ! jq -e --arg s "$SOURCE" \
+              '.sources[$s].packages | arrays and length > 0' publishing.json >/dev/null; then
+            echo "::error::publishing.json declares no packages for source '$SOURCE'"
+            exit 1
+          fi
+          jq -r --arg s "$SOURCE" '.sources[$s] | "repository=\(.repository)"' \
             publishing.json >> "$GITHUB_OUTPUT"
 
-      - name: Fetch the release asset
+      - name: Fetch the release assets
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ steps.source.outputs.repository }}
-          ASSET: ${{ steps.source.outputs.asset }}
+          SOURCE: ${{ inputs.source }}
+          TAG: ${{ inputs.tag }}
         run: |
-          gh release download "${{ inputs.tag }}" \
-            --repo "$REPOSITORY" \
-            --pattern "$ASSET" \
-            --pattern "$ASSET.sha256" \
-            --dir incoming
+          set -euo pipefail
+          while IFS= read -r asset; do
+            echo "::group::$asset"
+            # The declaration sidecar is fetched with the archive where the
+            # release carries one: a provisioner reads it *before* it
+            # unpacks anything, so it has to be served next to the archive
+            # rather than only inside it. A release without one downloads
+            # fine — the patterns are a union and the archive always
+            # matches.
+            gh release download "$TAG" \
+              --repo "$REPOSITORY" \
+              --pattern "$asset" \
+              --pattern "$asset.sha256" \
+              --pattern "$asset.build-environment.json" \
+              --dir incoming
+            echo "::endgroup::"
+          done < <(jq -r --arg s "$SOURCE" '.sources[$s].packages[].asset' publishing.json)
 
       - name: Check the bytes against the sidecar the build wrote
         run: |
           cd incoming
           sha256sum -c ./*.sha256
 
-      - name: Record it in the source
+      - name: Record them in the source
         env:
           MCUHOME_PUBLISHER_KEYS: ${{ secrets.PUBLISHER_KEY }}
           SOURCE: ${{ inputs.source }}
-          PACKAGE: ${{ steps.source.outputs.package }}
         run: |
           set -euo pipefail
-          archive=$(ls incoming/"$PACKAGE"-*.tar.zst)
-          filename=$(basename "$archive")
-          version=${filename#"$PACKAGE"-}
-          version=${version%.tar.zst}
-          # The file has to be in the source before the index names it:
-          # `file` is relative to the source, and a mirror copies the
-          # directory, not a link.
-          cp "$archive" "$archive.sha256" "$SOURCE/"
-          python -m mcuhome.packagetool add \
+          while IFS=$'\t' read -r package asset; do
+            # Selected by the same pattern the download used, so what is
+            # recorded is what was fetched. More than one match would make
+            # the choice arbitrary, and a published version is never
+            # replaced — so it stops here instead.
+            mapfile -t archives < <(compgen -G "incoming/$asset" || true)
+            if [ "${#archives[@]}" -ne 1 ]; then
+              echo "::error::$asset matched ${#archives[@]} files in incoming/, expected one"
+              exit 1
+            fi
+            archive="${archives[0]}"
+            filename=$(basename "$archive")
+            version=${filename#"$package"-}
+            version=${version%.tar.zst}
+            printf '%s\n' "$version" >> incoming/versions
+            # The file has to be in the source before the index names it:
+            # `file` is relative to the source, and a mirror copies the
+            # directory, not a link.
+            cp "$archive" "$archive.sha256" "$SOURCE/"
+            # And the declaration next to it where the build wrote one, for
+            # the same reason it exists at all: it is read before the
+            # archive is unpacked, so it has to be reachable without the
+            # archive.
+            if [ -f "$archive.build-environment.json" ]; then
+              cp "$archive.build-environment.json" "$SOURCE/"
+            fi
+            python -m mcuhome.packagetool add \
+              --source "$SOURCE" \
+              --name "$package" \
+              --version "$version" \
+              --file "$filename" \
+              --sha256 "$(sha256sum "$archive" | cut -d' ' -f1)" \
+              --size "$(stat -c%s "$archive")"
+          done < <(jq -r --arg s "$SOURCE" \
+            '.sources[$s].packages[] | "\(.name)\t\(.asset)"' publishing.json)
+
+      # A meta package stands for the family that was just published, and
+      # its version *is* its members' version — so this step refuses rather
+      # than guesses when the publish did not carry one single version, and
+      # the tool itself refuses when a member the meta names is not in the
+      # source at that version.
+      - name: Record the meta package this source declares
+        env:
+          MCUHOME_PUBLISHER_KEYS: ${{ secrets.PUBLISHER_KEY }}
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          if [ "$(jq -r --arg s "$SOURCE" '.sources[$s].meta // "none"' publishing.json)" = none ]
+          then
+            echo "$SOURCE declares no meta package"
+            exit 0
+          fi
+          mapfile -t versions < <(sort -u incoming/versions)
+          if [ "${#versions[@]}" -ne 1 ]; then
+            echo "::error::the packages of this publish carry ${#versions[@]} different versions (${versions[*]}) — a meta package is one version of a whole family"
+            exit 1
+          fi
+          members=()
+          while IFS=$'\t' read -r dimension key package; do
+            members+=(--member "$dimension:$key=$package")
+          done < <(jq -r --arg s "$SOURCE" \
+            '.sources[$s].meta.members | to_entries[] as $d
+             | $d.value | to_entries[] | "\($d.key)\t\(.key)\t\(.value)"' publishing.json)
+          python -m mcuhome.packagetool add-meta \
             --source "$SOURCE" \
-            --name "$PACKAGE" \
-            --version "$version" \
-            --file "$filename" \
-            --sha256 "$(sha256sum "$archive" | cut -d' ' -f1)" \
-            --size "$(stat -c%s "$archive")"
+            --name "$(jq -r --arg s "$SOURCE" '.sources[$s].meta.name' publishing.json)" \
+            --version "${versions[0]}" \
+            "${members[@]}"
 
       - name: Verify what is about to be published
         run: python verify.py "${{ inputs.source }}" --anchor anchor.json
