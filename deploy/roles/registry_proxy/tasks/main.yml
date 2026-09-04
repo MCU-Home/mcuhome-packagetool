@@ -138,10 +138,10 @@
     group: root
     # The bcrypt hashes of the mirror credentials are in here.
     mode: "0600"
-    # And for the same reason they are not printed: --diff would put the
-    # whole file into the run's transcript, and a transcript travels.
-    diff: false
     validate: "{{ registry_proxy_validate_command if registry_proxy_validate_config | bool else omit }}"
+  # And for the same reason they are not printed: --diff would put the
+  # whole file into the run's transcript, and a transcript travels.
+  diff: false
   register: registry_proxy_config
   vars:
     registry_proxy_validate_command: >-
