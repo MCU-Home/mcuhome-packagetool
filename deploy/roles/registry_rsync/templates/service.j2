@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# One instance per connection, started by the socket unit next to this
+# one. The connection is this process's standard input; that is how an
+# rsync daemon has been run from inetd since long before systemd.
+
+[Unit]
+Description=rsync export of the packagetool registry (%I)
+Documentation=https://github.com/mcu-home/mcuhome-packagetool
+
+# The same guarantee the socket unit carries, once more where the files
+# are actually read: no mount, no transfer.
+RequiresMountsFor={{ registry_root }}
+AssertPathIsMountPoint={{ registry_root }}
+
+[Service]
+# The leading "-" is deliberate. A refused or aborted connection makes
+# rsync exit non-zero, and a public export gets those all day; treating
+# each of them as a failed unit would drown anything worth being told
+# about. What still fails visibly is the assertion above — a missing
+# registry filesystem is not a client's doing.
+ExecStart=-{{ registry_rsync_binary }} --daemon --config={{ registry_rsync_config_path }}{{ ' --bwlimit=' ~ registry_rsync_bwlimit if registry_rsync_bwlimit else '' }}
+StandardInput=socket
+StandardOutput=inherit
+StandardError=journal
+
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateDevices=yes

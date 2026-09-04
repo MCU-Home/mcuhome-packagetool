@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# The public face of the registry: TLS, the host names, and who is let
+# in. Everything behind it listens on the loopback address and serves
+# files; this file is the only place that knows a host name.
+#
+# Every site binds the addresses it is meant to answer on and nothing
+# else. Caddy builds the port-80 server it needs for the redirect and for
+# the ACME challenge from the same addresses, so a name that is not
+# supposed to be reachable somewhere does not get a listener there
+# either.
+#
+# Indented with tabs, because that is what "caddy fmt" produces and a
+# generated file should not make Caddy complain about its formatting on
+# every start.
+{
+	# No admin API. Nothing here reconfigures Caddy at runtime; the unit
+	# is restarted instead, which is one way in less.
+	admin off
+{% if registry_proxy_acme_email %}
+	email {{ registry_proxy_acme_email }}
+{% endif %}
+{% if registry_proxy_acme_ca %}
+	acme_ca {{ registry_proxy_acme_ca }}
+{% endif %}
+	servers {
+		protocols h1 h2{{ ' h3' if registry_proxy_http3 | bool else '' }}
+	}
+}
+{% for site in registry_proxy_sites %}
+{% set denied = site.auth | default('none') == 'basic' and site.users | default([]) | length == 0 %}
+
+{{ site.name }} {
+	bind {{ site.bind | join(' ') }}
+{% if site.tls | default('acme') == 'internal' %}
+
+	# Deliberately not a publicly issued certificate. This name does not
+	# resolve to this server yet, so an ACME challenge could only fail;
+	# Caddy would retry it for a month and collect failed validations at
+	# the certificate authority for no gain. The site is otherwise
+	# complete and switching this to "acme" is the whole cutover.
+	tls internal
+{% endif %}
+
+	header {
+		# The tree is served with the content types it deserves; a
+		# browser guessing something else about a signed document helps
+		# nobody.
+		X-Content-Type-Options nosniff
+{% if registry_proxy_hsts | bool %}
+		Strict-Transport-Security "max-age={{ registry_proxy_hsts_max_age }}"
+{% endif %}
+	}
+{% if site.auth | default('none') == 'basic' %}
+{% if not denied %}
+
+	basic_auth bcrypt {{ (site.realm | default('restricted')) | tojson }} {
+{% for user in site.users %}
+		{{ user.name }} {{ user.hash }}
+{% endfor %}
+	}
+{% else %}
+
+	# This site takes credentials and none are configured, so nobody can
+	# be let in. Answering 403 here rather than leaving the site out keeps
+	# the name, the certificate and the shape of the setup in place, and
+	# the upstream is never asked.
+	respond "No credentials are configured for this host." 403
+{% endif %}
+{% endif %}
+{% if site.upstream is defined and not denied %}
+
+	# Nothing between here and the upstream buffers the response, so a
+	# range request and its 206 pass through as they came, which is what
+	# a resumed download of a large package depends on.
+	reverse_proxy {{ site.upstream }}
+{% endif %}
+
+	log {
+		output stdout
+		format json
+	}
+}
+{% endfor %}

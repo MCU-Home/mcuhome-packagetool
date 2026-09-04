@@ -1,0 +1,70 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the registry_proxy role. See README.md next to this file
+# for what the role does with them.
+
+# The image the proxy runs from. Pulled once and then kept; pin a digest
+# (caddy@sha256:...) if a moving tag is not good enough for you.
+registry_proxy_image: docker.io/library/caddy:2-alpine
+
+# The virtual hosts. Empty by default on purpose: a proxy without sites
+# is a proxy that answers nothing, which is the right thing for a role
+# nobody has configured yet. Every entry:
+#
+#   name    the host name, and the name the certificate is for
+#   bind    the host addresses this site listens on, as a list. Ports 80
+#           and 443 on exactly these addresses, nothing else.
+#   upstream  where the request goes, "address:port"
+#   tls     "acme" (default) for a publicly issued certificate, or
+#           "internal" for one from Caddy's own CA — which is what a name
+#           that does not point at this server yet wants, because it asks
+#           no certificate authority anything.
+#   auth    "none" (default) or "basic"
+#   users   for "basic": a list of {name, hash} with bcrypt hashes, as
+#           "caddy hash-password" prints them. An empty list denies
+#           everyone — see the README.
+#   realm   for "basic": the realm shown in the password prompt.
+registry_proxy_sites: []
+
+# The address a certificate authority may reach you at. Let's Encrypt
+# uses it for expiry warnings; leaving it empty means issuance runs
+# without one.
+registry_proxy_acme_email: ""
+
+# A different ACME directory, e.g. Let's Encrypt's staging endpoint while
+# a setup is being tried out. Empty means Caddy's own defaults.
+registry_proxy_acme_ca: ""
+
+# HTTP/3. Off, because it runs over UDP 443 and a host firewall that only
+# opens TCP would leave clients trying a port that is closed. Open UDP
+# 443 first, then turn this on.
+registry_proxy_http3: false
+
+# HSTS. Off by default: it is a promise to browsers that cannot be taken
+# back for as long as it lasts, and a registry is mostly fetched by
+# tools.
+registry_proxy_hsts: false
+registry_proxy_hsts_max_age: 31536000
+
+# Where the generated configuration goes on the host.
+registry_proxy_config_dir: /etc/packagetool
+registry_proxy_config_path: /etc/packagetool/Caddyfile
+
+# The systemd unit, the container, and the two volumes. The data volume
+# holds the certificates and their keys and must survive a container
+# being replaced — throwing it away means asking the certificate
+# authority for everything again, and rate limits are real.
+registry_proxy_service: packagetool-proxy
+registry_proxy_container: packagetool-proxy
+registry_proxy_data_volume: packagetool-proxy-data
+registry_proxy_config_volume: packagetool-proxy-config
+
+# Check the generated configuration with the image's own Caddy before it
+# is written.
+registry_proxy_validate_config: true
+
+# The docker client. A full path, because systemd units need one.
+registry_proxy_docker: /usr/bin/docker
+registry_proxy_docker_service: docker.service

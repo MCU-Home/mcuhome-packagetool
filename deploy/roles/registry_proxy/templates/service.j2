@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# The proxy runs in a container, and systemd — not Docker's restart
+# policy — owns it, so that it can be ordered, can fail visibly, and can
+# have an OnFailure notification hung off it.
+#
+# It deliberately carries no dependency on the registry filesystem. The
+# proxy serves no files: with the tree gone it answers 502, which is a
+# clear message and keeps the certificates being renewed. A proxy that
+# refused to start would take the whole host's TLS down with the volume.
+
+[Unit]
+Description=Caddy, the TLS front end of the packagetool registry
+Documentation=https://github.com/mcu-home/mcuhome-packagetool
+Requires={{ registry_proxy_docker_service }}
+After={{ registry_proxy_docker_service }} network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+
+# A container left behind by a kill -9 would keep the name.
+ExecStartPre=-{{ registry_proxy_docker }} rm --force {{ registry_proxy_container }}
+ExecStart={{ registry_proxy_docker }} run --rm --name {{ registry_proxy_container }} \
+    --network host \
+    --read-only \
+    --tmpfs /tmp:mode=1777 \
+    --cap-drop ALL \
+    --cap-add NET_BIND_SERVICE \
+    --security-opt no-new-privileges \
+    --log-driver none \
+    --volume {{ registry_proxy_data_volume }}:/data \
+    --volume {{ registry_proxy_config_volume }}:/config \
+    --volume {{ registry_proxy_config_path }}:/etc/caddy/Caddyfile:ro \
+    {{ registry_proxy_image }} \
+    caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+ExecStop={{ registry_proxy_docker }} stop --time 20 {{ registry_proxy_container }}
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# The web server runs in a container, and systemd — not Docker's restart
+# policy — owns it: a unit can be ordered after the filesystem the
+# registry lives on, can be told to fail when that filesystem is missing,
+# and can hang an OnFailure notification off itself. A container with
+# "--restart=always" can do none of the three.
+
+[Unit]
+Description=nginx serving the packagetool registry
+Documentation=https://github.com/mcu-home/mcuhome-packagetool
+Requires={{ registry_web_docker_service }}
+After={{ registry_web_docker_service }}
+
+# The registry root is a mount. Without these two lines a boot that comes
+# up without the volume would serve the empty directory underneath it —
+# an existing registry that suddenly has nothing in it, which is exactly
+# the answer a mirror must never get. RequiresMountsFor pulls the mount
+# unit in and waits for it; the assertion is the second half, because a
+# mount unit that is not there at all cannot fail either.
+RequiresMountsFor={{ registry_root }}
+AssertPathIsMountPoint={{ registry_root }}
+
+[Service]
+Type=exec
+
+# A container left behind by a kill -9 would keep the name.
+ExecStartPre=-{{ registry_web_docker }} rm --force {{ registry_web_container }}
+ExecStart={{ registry_web_docker }} run --rm --name {{ registry_web_container }} \
+    --network host \
+    --read-only \
+    --tmpfs /var/cache/nginx:mode=0755 \
+    --tmpfs /var/run:mode=0755 \
+    --cap-drop ALL \
+    --cap-add CHOWN --cap-add SETGID --cap-add SETUID \
+    --security-opt no-new-privileges \
+    --log-driver none \
+    --volume {{ registry_root }}:{{ registry_root }}:ro \
+    --volume {{ registry_web_config_path }}:/etc/nginx/nginx.conf:ro \
+    --entrypoint nginx \
+    {{ registry_web_image }} -g "daemon off;"
+ExecStop={{ registry_web_docker }} stop --time 20 {{ registry_web_container }}
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

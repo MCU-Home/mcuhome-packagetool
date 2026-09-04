@@ -1,0 +1,135 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The web server that serves the registry tree: an nginx container behind
+# the reverse proxy, listening on the loopback address only.
+#
+# It expects the registry_storage role (or an equivalent layout) to have
+# run, and Docker to be installed and running.
+
+- name: Check the web server settings
+  ansible.builtin.assert:
+    that:
+      - registry_root | default('', true) is match('^/.+')
+      - registry_web_image | default('', true) | length > 0
+      - registry_web_listen_address | default('', true) | length > 0
+      - registry_web_ports | unique | length == registry_web_ports | length
+    fail_msg: >-
+      registry_root must be an absolute path, registry_web_image and
+      registry_web_listen_address must be set, and the vhost ports must
+      differ from each other.
+    quiet: true
+  vars:
+    registry_web_ports:
+      - "{{ registry_web_tree_port }}"
+      - "{{ registry_web_bootstrap_port }}"
+      - "{{ registry_web_mirror_sync_port }}"
+
+- name: Create the configuration directory
+  ansible.builtin.file:
+    path: "{{ registry_web_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Pulled here rather than by the unit: a server that is restarted or
+# rebooted must come up with the image it was running, not with whatever
+# the tag points at that day.
+- name: Look for the web server image
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_web_docker }}"
+      - image
+      - inspect
+      - "{{ registry_web_image }}"
+  register: registry_web_image_present
+  changed_when: false
+  failed_when: false
+
+- name: Pull the web server image
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_web_docker }}"
+      - pull
+      - "{{ registry_web_image }}"
+  when: registry_web_image_present.rc != 0
+  changed_when: true
+
+# The image's own nginx reads the file before it is written, so a
+# configuration it would refuse never reaches the destination path.
+- name: Write the web server configuration
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: "{{ registry_web_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "{{ registry_web_validate_command if registry_web_validate_config | bool else omit }}"
+  register: registry_web_config
+  vars:
+    registry_web_validate_command: >-
+      {{ registry_web_docker }} run --rm --volume %s:/etc/nginx/nginx.conf:ro
+      --entrypoint nginx {{ registry_web_image }} -t -c /etc/nginx/nginx.conf
+
+- name: Write the web server unit
+  ansible.builtin.template:
+    src: service.j2
+    dest: /etc/systemd/system/{{ registry_web_service }}.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: registry_web_unit
+
+- name: Enable the web server
+  ansible.builtin.systemd_service:
+    name: "{{ registry_web_service }}.service"
+    daemon_reload: true
+    enabled: true
+    state: started
+
+# Deliberately not a handler: the checks below have to run against the
+# configuration that was just written, not against whatever was running
+# when the play started.
+- name: Restart the web server for the new configuration  # noqa: no-handler
+  ansible.builtin.systemd_service:
+    name: "{{ registry_web_service }}.service"
+    state: restarted
+  when: registry_web_config is changed or registry_web_unit is changed
+
+- name: Wait for the full tree vhost
+  ansible.builtin.wait_for:
+    host: "{{ registry_web_listen_address }}"
+    port: "{{ registry_web_tree_port }}"
+    state: started
+    timeout: 30
+
+# Proof that what was configured actually answers on this server. The
+# tree vhost answers 404 while nothing is published yet, which is a
+# perfectly good answer from a server that is running.
+- name: Check the full tree vhost answers
+  ansible.builtin.uri:
+    url: http://{{ registry_web_listen_address }}:{{ registry_web_tree_port }}/
+    method: HEAD
+    status_code: [200, 403, 404]
+
+# The bootstrap vhost serves an allow list, so what proves it is
+# configured is a path that is not on the list being refused. This one
+# needs nothing to have been published yet.
+- name: Check the bootstrap vhost answers and serves nothing else
+  ansible.builtin.uri:
+    url: "{{ registry_web_bootstrap_url }}/index.html"
+    method: HEAD
+    status_code: 404
+  vars:
+    registry_web_bootstrap_url: >-
+      http://{{ registry_web_listen_address }}:{{ registry_web_bootstrap_port }}
+  when: registry_web_bootstrap_enabled | bool
+
+- name: Check the mirror-sync vhost answers
+  ansible.builtin.uri:
+    url: http://{{ registry_web_listen_address }}:{{ registry_web_mirror_sync_port }}/index.json
+    method: HEAD
+    status_code: [200, 404]
+  when: registry_web_mirror_sync_enabled | bool

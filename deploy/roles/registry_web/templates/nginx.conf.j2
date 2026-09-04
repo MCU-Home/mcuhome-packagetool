@@ -1,0 +1,266 @@
+{#
+SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+SPDX-License-Identifier: Apache-2.0
+
+The three vhosts differ only in what they are allowed to serve, so the
+cache and content-type rules are written once as macros and used from
+each of them. What ends up on the server is a plain nginx configuration
+with every rule spelled out.
+#}
+{% macro immutable() %}
+            # Immutable: the name can never stand for different bytes.
+            add_header Cache-Control "public, max-age={{ registry_web_immutable_max_age }}, immutable" always;
+{%- endmacro %}
+{% macro revalidate() %}
+            # Always revalidated: this document is replaced in place, and
+            # a stale copy is exactly what the freshness rules exist to
+            # catch.
+            add_header Cache-Control "no-cache" always;
+{%- endmacro %}
+{% macro tree_server_head(port) %}
+    listen {{ registry_web_listen_address }}:{{ port }};
+    server_name _;
+
+    # The docroot is a symlink that a publish replaces. It is resolved
+    # per request, which is what makes the switch atomic for clients;
+    # open_file_cache would cache the old target and is therefore not
+    # configured here.
+    root {{ registry_root }}/current;
+    index index.html;
+
+    # A registry is read-only. "if" with nothing but a return in it is
+    # one of the two uses of it that are safe.
+    if ($request_method !~ ^(GET|HEAD)$) {
+        return 405;
+    }
+{%- endmacro %}
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# nginx serving a packagetool registry. It sits behind the reverse proxy
+# and listens on {{ registry_web_listen_address }} only: it terminates no
+# TLS, knows no host names, and answers whatever the proxy sends it.
+#
+# Three servers, one port each, because they serve three different
+# things:
+#
+#   {{ registry_web_tree_port }}  the full registry tree, through <root>/current
+{% if registry_web_bootstrap_enabled %}
+#   {{ registry_web_bootstrap_port }}  the bootstrap subset: the documents a client needs to
+#         find a mirror, and nothing else
+{% endif %}
+{% if registry_web_mirror_sync_enabled %}
+#   {{ registry_web_mirror_sync_port }}  the dump distribution for official mirrors, out of
+#         <root>/mirror-sync
+{% endif %}
+#
+# Nothing is compressed here, deliberately. Package files are compressed
+# already, the documents are a kilobyte each, and on-the-fly compression
+# is the classic way to lose byte ranges on the large files that need
+# them most.
+
+worker_processes auto;
+error_log /dev/stderr warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # The client address is the proxy's, so the address worth logging is
+    # the one the proxy forwarded. The requested range is logged too: a
+    # partial fetch of a large package looks like a truncated download
+    # otherwise.
+    log_format registry '$http_x_forwarded_for "$request" $status $body_bytes_sent '
+                        'range="$http_range" "$http_user_agent"';
+    access_log /dev/stdout registry;
+
+    sendfile on;
+    tcp_nopush on;
+    server_tokens off;
+    charset utf-8;
+
+    # Redirects stay relative. An absolute one would be built from the
+    # host and port nginx sees, and what it sees is the proxy.
+    absolute_redirect off;
+    port_in_redirect off;
+
+    keepalive_timeout 65s;
+    client_max_body_size 1k;
+    client_body_timeout 10s;
+    send_timeout 60s;
+
+    # The full registry tree.
+    server {
+{{ tree_server_head(registry_web_tree_port) }}
+
+        autoindex {{ 'on' if registry_web_autoindex else 'off' }};
+{% if not registry_web_autoindex %}
+
+        # A directory without an index file is a 404, not a 403. There is
+        # nothing forbidden about it, and a public file tree has no use
+        # for the distinction.
+        error_page 403 = @missing;
+
+        location @missing {
+            return 404;
+        }
+{% endif %}
+
+        # --- the signed head documents ---------------------------------
+        location = /sources.json {
+{{ revalidate() }}
+        }
+
+        location = /anchor.json {
+{{ revalidate() }}
+        }
+
+        location ~ ^/[^/]+/(index|keys|mirrors)\.json$ {
+{{ revalidate() }}
+        }
+
+        location ~ ^/[^/]+/(index|keys|mirrors)\.json\.sig$ {
+            # A signature envelope is JSON; the extension is not in any
+            # mime.types.
+            default_type application/json;
+{{ revalidate() }}
+        }
+
+        # --- written once, never rewritten -----------------------------
+        # An archived key set is named after the moment it was issued and
+        # is never replaced, and an index part carries the hash of its own
+        # content in its name. Both are safe to keep forever.
+        location ~ ^/[^/]+/keys/[^/]+\.json$ {
+{{ immutable() }}
+        }
+
+        location ~ ^/[^/]+/keys/[^/]+\.json\.sig$ {
+            default_type application/json;
+{{ immutable() }}
+        }
+
+        location ~ "^/[^/]+/index-.+-[0-9a-f]{16}\.json$" {
+            # Quoted because of the braces: nginx would read them as the
+            # start of a block otherwise.
+{{ immutable() }}
+        }
+
+        # --- package files ---------------------------------------------
+        # A published version is immutable and is never deleted, so its
+        # bytes and its checksum sidecar never change either.
+        location ~ \.tar\.zst$ {
+            default_type application/zstd;
+{{ immutable() }}
+        }
+
+        location ~ \.tar\.zst\.sha256$ {
+            default_type text/plain;
+{{ immutable() }}
+        }
+
+        # --- pages ------------------------------------------------------
+        location ~ \.html$ {
+{{ revalidate() }}
+        }
+
+        # --- everything else --------------------------------------------
+        location / {
+            add_header Cache-Control "public, max-age={{ registry_web_default_max_age }}" always;
+        }
+    }
+{% if registry_web_bootstrap_enabled %}
+
+    # The bootstrap subset. Same tree, but only the documents a client
+    # needs to get from "I have an anchor and a source name" to "I know
+    # which mirror to fetch from": the key set it verifies against the
+    # anchor, the archived key sets it may have to walk back through, and
+    # the signed mirror list. No index, no packages, no pages — a client
+    # that resolved a package here would find nothing to download, and a
+    # host that answers with half a source is worse than one that answers
+    # with none of it.
+    server {
+{{ tree_server_head(registry_web_bootstrap_port) }}
+
+        autoindex off;
+
+        location = /anchor.json {
+{{ revalidate() }}
+        }
+
+        location = /sources.json {
+{{ revalidate() }}
+        }
+
+        location ~ ^/[^/]+/(keys|mirrors)\.json$ {
+{{ revalidate() }}
+        }
+
+        location ~ ^/[^/]+/(keys|mirrors)\.json\.sig$ {
+            default_type application/json;
+{{ revalidate() }}
+        }
+
+        location ~ ^/[^/]+/keys/[^/]+\.json$ {
+{{ immutable() }}
+        }
+
+        location ~ ^/[^/]+/keys/[^/]+\.json\.sig$ {
+            default_type application/json;
+{{ immutable() }}
+        }
+
+{% if registry_web_bootstrap_redirect %}
+        location = / {
+            return 302 {{ registry_web_bootstrap_redirect }};
+        }
+
+{% endif %}
+        # Everything not named above does not exist here. Deny by
+        # construction: the rules add files, they do not subtract them.
+        location / {
+            return 404;
+        }
+    }
+{% endif %}
+{% if registry_web_mirror_sync_enabled %}
+
+    # The dump distribution for official mirrors. Its docroot is beside
+    # the served tree, not inside it, so no path under the public vhosts
+    # can reach it. Who may read it is decided by the reverse proxy in
+    # front — nothing here is public.
+    server {
+        listen {{ registry_web_listen_address }}:{{ registry_web_mirror_sync_port }};
+        server_name _;
+
+        root {{ registry_root }}/mirror-sync;
+        autoindex off;
+
+        if ($request_method !~ ^(GET|HEAD)$) {
+            return 405;
+        }
+
+        # The chain index is polled, usually with HEAD against its ETag,
+        # and it is rewritten whenever a dump is added or dropped.
+        location = /index.json {
+{{ revalidate() }}
+        }
+
+        # A dump is named after the snapshot it carries and is written
+        # once.
+        location ~ ^/(full|snapshot)-[^/]+\.btrfs\.dump$ {
+{{ immutable() }}
+        }
+
+        location / {
+            return 404;
+        }
+    }
+{% endif %}
+}

@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# The anonymous read-only rsync export of the registry. A mirror runs
+#
+#   rsync -a --delete rsync://<host>/{{ registry_rsync_module }}/ <local dir>
+#
+# and has the whole tree, which is the point of the registry being a
+# plain file tree in the first place.
+#
+# The daemon is started per connection by systemd, so the "address" and
+# "port" parameters would be ignored here: what it listens on is the
+# socket unit's business, and the socket unit names the addresses.
+#
+# There is no bandwidth parameter in this file because rsync has none.
+# The limit is on the daemon's command line, in the unit.
+
+lock file = {{ registry_rsync_lock_file }}
+syslog facility = daemon
+max verbosity = 1
+
+# No reverse lookup per connection. It costs a DNS round trip before the
+# first byte and buys a name in a log line.
+reverse lookup = no
+
+[{{ registry_rsync_module }}]
+    comment = {{ registry_rsync_comment }}
+
+    # The served docroot: a symlink that a publish replaces. rsync
+    # resolves it, and chroots into it, once per connection — so a
+    # transfer that is already running keeps the tree it started with,
+    # and the next connection gets the new one. Neither ever sees a tree
+    # that is half published.
+    path = {{ registry_root }}/current
+
+    # Not optional here. Since 3.2.7 an unset "use chroot" means the
+    # daemon tries and carries on without it if it cannot, and a module
+    # whose path is a symlink is exactly the case where running without
+    # the chroot has been a path-traversal problem in the past.
+    use chroot = yes
+    numeric ids = yes
+
+    read only = yes
+    write only = no
+    list = yes
+
+    uid = {{ registry_rsync_uid }}
+    gid = {{ registry_rsync_gid }}
+
+    # Enforced through the lock file above, across all the per-connection
+    # processes. A client that arrives when the limit is reached is told
+    # to come back later.
+    max connections = {{ registry_rsync_max_connections }}
+    timeout = {{ registry_rsync_timeout }}
+
+    transfer logging = yes
+{% if registry_rsync_refuse_options %}
+    refuse options = {{ registry_rsync_refuse_options }}
+{% endif %}
+{% if registry_rsync_dont_compress %}
+    dont compress = {{ registry_rsync_dont_compress }}
+{% endif %}

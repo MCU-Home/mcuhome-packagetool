@@ -1,0 +1,197 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The reverse proxy in front of the registry: a Caddy container that
+# terminates TLS, answers for the host names, and forwards to whatever
+# serves the files.
+#
+# It expects Docker to be installed and running, and the host firewall to
+# allow 80 and 443 on the addresses the sites bind.
+
+- name: Check every site's bind is a list, not a plain string
+  ansible.builtin.assert:
+    that:
+      # "bind" is meant to be a YAML sequence of addresses. A plain string
+      # also has a length and is iterable character by character, so the
+      # length/content checks below would not catch it — they would just
+      # treat the string as a one-address-per-character list.
+      - item.bind | type_debug == 'list'
+    fail_msg: >-
+      {{ item.name | default('(unnamed site)') }}: bind must be a YAML
+      list of addresses, e.g. ["203.0.113.1", "2001:db8::1"], not a plain
+      string. A bare string would be iterated character by character.
+    quiet: true
+  loop: "{{ registry_proxy_sites | selectattr('bind', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name | default('(unnamed site)') }}"
+
+- name: Check the proxy settings
+  ansible.builtin.assert:
+    that:
+      - registry_proxy_image | default('', true) | length > 0
+      - registry_proxy_sites | length > 0
+      - registry_proxy_sites | rejectattr('name', 'defined') | list | length == 0
+      - registry_proxy_sites | rejectattr('bind', 'defined') | list | length == 0
+      # Written without backslash escapes on purpose: a YAML scalar, a
+      # Jinja string literal and a regular expression all want a say in
+      # what a backslash means, and a character class needs none of them.
+      - registry_proxy_sites | map(attribute='name', default='') | select('match', '^[^ ]+$')
+        | list | length == registry_proxy_sites | length
+      - registry_proxy_sites | map(attribute='bind', default=[]) | map('length')
+        | select('eq', 0) | list | length == 0
+      # An empty string among the addresses is the interesting case: it
+      # is what an inventory value that was never filled in looks like.
+      - registry_proxy_sites | map(attribute='bind', default=[]) | flatten
+        | select('eq', '') | list | length == 0
+    fail_msg: >-
+      registry_proxy_image must be set and every entry of
+      registry_proxy_sites needs a name and at least one bind address
+      that is not empty. A site without bind addresses would listen
+      everywhere.
+    quiet: true
+
+- name: Check every site that takes credentials carries usable ones
+  ansible.builtin.assert:
+    that:
+      - item.users | default([]) | rejectattr('name', 'defined') | list | length == 0
+      - item.users | default([]) | rejectattr('hash', 'defined') | list | length == 0
+      # "[$]" rather than an escaped dollar, for the same reason as above.
+      - item.users | default([]) | selectattr('hash', 'defined')
+        | rejectattr('hash', 'match', '^[$]2[aby][$]') | list | length == 0
+    fail_msg: >-
+      {{ item.name }}: every entry in users needs a name and a bcrypt
+      hash as "caddy hash-password" prints it. Plain passwords are not
+      accepted here.
+    quiet: true
+  loop: "{{ registry_proxy_sites | selectattr('auth', 'defined') | selectattr('auth', 'eq', 'basic') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Create the configuration directory
+  ansible.builtin.file:
+    path: "{{ registry_proxy_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Look for the proxy image
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_proxy_docker }}"
+      - image
+      - inspect
+      - "{{ registry_proxy_image }}"
+  register: registry_proxy_image_present
+  changed_when: false
+  failed_when: false
+
+- name: Pull the proxy image
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_proxy_docker }}"
+      - pull
+      - "{{ registry_proxy_image }}"
+  when: registry_proxy_image_present.rc != 0
+  changed_when: true
+
+# The certificates live in the data volume. Creating it here rather than
+# letting "docker run" do it means a run that never gets as far as
+# starting the container still leaves the volume in place, and it is one
+# less thing that happens implicitly.
+- name: Look for the proxy volumes
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_proxy_docker }}"
+      - volume
+      - inspect
+      - "{{ item }}"
+  register: registry_proxy_volume_present
+  changed_when: false
+  failed_when: false
+  loop:
+    - "{{ registry_proxy_data_volume }}"
+    - "{{ registry_proxy_config_volume }}"
+
+- name: Create the proxy volumes
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_proxy_docker }}"
+      - volume
+      - create
+      - "{{ item.item }}"
+  when: item.rc != 0
+  changed_when: true
+  loop: "{{ registry_proxy_volume_present.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# The image's own Caddy loads and provisions the configuration before it
+# is written, so a file it would refuse never reaches the destination
+# path. It starts no listener and talks to no certificate authority.
+- name: Write the proxy configuration
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ registry_proxy_config_path }}"
+    owner: root
+    group: root
+    # The bcrypt hashes of the mirror credentials are in here.
+    mode: "0600"
+    # And for the same reason they are not printed: --diff would put the
+    # whole file into the run's transcript, and a transcript travels.
+    diff: false
+    validate: "{{ registry_proxy_validate_command if registry_proxy_validate_config | bool else omit }}"
+  register: registry_proxy_config
+  vars:
+    registry_proxy_validate_command: >-
+      {{ registry_proxy_docker }} run --rm --volume %s:/etc/caddy/Caddyfile:ro
+      {{ registry_proxy_image }} caddy validate --config /etc/caddy/Caddyfile
+      --adapter caddyfile
+
+- name: Write the proxy unit
+  ansible.builtin.template:
+    src: service.j2
+    dest: /etc/systemd/system/{{ registry_proxy_service }}.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: registry_proxy_unit
+
+- name: Enable the proxy
+  ansible.builtin.systemd_service:
+    name: "{{ registry_proxy_service }}.service"
+    daemon_reload: true
+    enabled: true
+    state: started
+
+# Deliberately not a handler: the checks below have to run against the
+# configuration that was just written.
+- name: Restart the proxy for the new configuration  # noqa: no-handler
+  ansible.builtin.systemd_service:
+    name: "{{ registry_proxy_service }}.service"
+    state: restarted
+  when: registry_proxy_config is changed or registry_proxy_unit is changed
+
+- name: Wait for the proxy to listen
+  ansible.builtin.wait_for:
+    host: "{{ registry_proxy_sites[0].bind[0] }}"
+    port: 443
+    state: started
+    timeout: 30
+
+# Proof that the proxy is up, is bound where it was told to be, and knows
+# the name: a plain HTTP request to the bound address, with the site's
+# name in the Host header, is answered with the permanent redirect to
+# HTTPS that Caddy serves on port 80.
+- name: Check every site answers on its first bind address
+  ansible.builtin.uri:
+    url: http://{{ '[' ~ item.bind[0] ~ ']' if ':' in item.bind[0] else item.bind[0] }}/
+    method: HEAD
+    headers:
+      Host: "{{ item.name }}"
+    follow_redirects: none
+    status_code: [200, 308]
+  loop: "{{ registry_proxy_sites }}"
+  loop_control:
+    label: "{{ item.name }}"

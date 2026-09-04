@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# systemd owns the listening socket, for two reasons. rsyncd's own
+# "address" parameter holds exactly one address and this export answers
+# on an IPv4 and an IPv6 one; and a socket unit is where the dependency
+# on the registry filesystem belongs — with the volume missing, nothing
+# listens at all, which is a far better answer to a mirror than an empty
+# tree.
+
+[Unit]
+Description=rsync export of the packagetool registry
+Documentation=https://github.com/mcu-home/mcuhome-packagetool
+RequiresMountsFor={{ registry_root }}
+AssertPathIsMountPoint={{ registry_root }}
+
+[Socket]
+{% if registry_rsync_listen_addresses | length > 0 %}
+{% for address in registry_rsync_listen_addresses %}
+ListenStream={{ '[' ~ address ~ ']' if ':' in address else address }}:{{ registry_rsync_port }}
+{% endfor %}
+{% else %}
+ListenStream={{ registry_rsync_port }}
+{% endif %}
+
+# One process per connection, the way the rsync project's own units do
+# it. rsyncd's connection limit is enforced through record locks on its
+# lock file, so it works across processes.
+Accept=yes
+
+# The addresses may not be configured yet when this unit starts. Binding
+# one that is not there is allowed, and it starts answering the moment it
+# appears, which is what keeps a boot from being a race.
+FreeBind=yes
+
+[Install]
+WantedBy=sockets.target

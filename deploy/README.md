@@ -58,22 +58,77 @@ the docroot points at is never deleted.
 |---|---|
 | `registry_storage` | btrfs filesystem on a dedicated device, the registry subvolume, the mount, and the tree inside it. |
 | `registry_snapshot` | installs `packagetool-snapshot`: snapshot, docroot switch, retention. |
+| `registry_web` | nginx, in a container, serving the tree on the loopback address: the full tree, the bootstrap subset, the mirror dumps. |
+| `registry_proxy` | Caddy, in a container: TLS, the host names, credentials where they are needed. |
+| `registry_rsync` | the anonymous read-only rsync export, native and started per connection. |
 
 Each role has a README of its own next to it.
 
-A minimal playbook using both:
+A playbook using all of them:
 
 ```yaml
-- name: Set the registry storage up
+- name: Set the registry up
   hosts: registry
   become: true
   vars:
     registry_root: /srv/registry
     registry_storage_device: /dev/disk/by-id/...
+    registry_rsync_listen_addresses: ["203.0.113.10", "2001:db8::10"]
+    registry_proxy_sites:
+      - name: mirror.example.org
+        bind: ["203.0.113.10", "2001:db8::10"]
+        upstream: "127.0.0.1:8080"
   roles:
     - role: registry_storage
     - role: registry_snapshot
+    - role: registry_web
+    - role: registry_proxy
+    - role: registry_rsync
 ```
+
+## How the serving side fits together
+
+```
+        HTTPS                       rsync
+          |                           |
+   Caddy (container)            rsyncd (native,
+   TLS, names, auth              per connection)
+          |                           |
+   nginx (container)                  |
+   127.0.0.1:8080/8081/8082           |
+          |                           |
+          +---------- <root>/current -+
+```
+
+Caddy is the only part that knows a host name or holds a certificate.
+nginx behind it knows only which of its ports a request arrived on, and
+serves accordingly. The rsync export is not proxied at all — it is its own
+protocol on its own port, and it reads the same `current` symlink.
+
+Both file servers resolve that symlink per request or per connection, so
+a publish switches what they serve without either of them being told, and
+neither can be caught halfway.
+
+## Not serving a registry that is not there
+
+The registry root is a mount, and its fstab entry says `nofail` so that a
+volume which does not appear delays a boot instead of stopping it. That
+leaves one failure mode worth designing against: a boot without the
+volume, and an empty directory where the registry should be. Serving
+*that* would tell every mirror that an established registry lost
+everything.
+
+So both file-serving units — the nginx container and the rsync socket —
+carry `RequiresMountsFor=` on the registry root and an
+`AssertPathIsMountPoint=` on top, and fail to start rather than serve an
+empty directory. Both are systemd units for exactly that reason:
+containers here are started by units running `docker run` in the
+foreground, not by Docker's restart policy, because a unit can be ordered
+after a mount, can fail visibly, and can have a notification hung off it.
+
+The proxy is the deliberate exception: it serves no files, and keeping it
+up when the tree is gone means clients get a 502 and the certificates
+keep being renewed.
 
 `registry_storage` writes to a block device. It creates a filesystem only
 on a device a low-level probe finds completely empty, and adopts a device

@@ -1,0 +1,110 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# How the public MCUHome registry is served: the three host names, what
+# each of them is allowed to answer with, and the limits on the rsync
+# export.
+#
+# Everything here is public. The host names are in DNS, the ports are
+# behind the loopback address, and the limits are numbers anyone can
+# measure from outside. What is *not* here is anything that is true of
+# one particular machine — which addresses the sites bind, and the
+# credentials for the mirror-sync host — because that belongs to the
+# inventory that describes the machine, not to this repository.
+#
+# Values are spelled out even where they match a role default: this file
+# is what the running registry is, and a changed default in a role must
+# not quietly change a live server.
+
+# --- the web server -------------------------------------------------------
+
+# Pinned, per the policy stated at the top of this file: the version this
+# deployment was validated against, not the role's floating default.
+registry_web_image: docker.io/library/nginx:1.30.4-alpine
+
+registry_web_listen_address: "127.0.0.1"
+registry_web_tree_port: 8080
+registry_web_bootstrap_port: 8081
+registry_web_mirror_sync_port: 8082
+
+registry_web_bootstrap_enabled: true
+registry_web_mirror_sync_enabled: true
+
+# Directory listings on the mirror. The registry is a plain file tree,
+# the landing page links into it, and there is nothing in it that is not
+# published on purpose.
+registry_web_autoindex: true
+
+# What the bootstrap host answers at "/": nothing. It serves the
+# documents a client needs to find a mirror, and a browser that arrives
+# there is looking for the pages, which live on the mirror. Set this to
+# the mirror's URL if that 404 turns out to be the wrong answer for
+# people.
+registry_web_bootstrap_redirect: ""
+
+registry_web_immutable_max_age: 31536000
+registry_web_default_max_age: 300
+
+# --- the reverse proxy ----------------------------------------------------
+
+# Pinned, per the policy stated at the top of this file: the version this
+# deployment was validated against, not the role's floating default.
+registry_proxy_image: docker.io/library/caddy:2.11.4-alpine
+
+# No HTTP/3: it needs UDP 443, and the host firewall opens TCP only.
+registry_proxy_http3: false
+registry_proxy_hsts: false
+
+# The public virtual hosts. The addresses they bind are a property of the
+# machine and come from its inventory; so do the mirror-sync credentials,
+# which are credentials and are not published anywhere.
+#
+# This list is deliberately named "public": a machine that also answers
+# on an internal name adds that site in its own inventory and hands the
+# role both lists together.
+registry_proxy_public_sites:
+  # The mirror: the whole registry tree, including the browsable pages.
+  - name: mirror-1.packages.mcuhome.org
+    bind: "{{ registry_proxy_public_addresses }}"
+    upstream: "127.0.0.1:{{ registry_web_tree_port }}"
+    tls: acme
+
+  # Dump distribution for official mirrors. Not advertised, and behind
+  # per-mirror credentials that live in the machine's inventory. With
+  # none configured this host answers 403 to everybody, which is the
+  # right state for a host whose credentials are handed out one at a
+  # time.
+  - name: mirror-sync.packages.mcuhome.org
+    bind: "{{ registry_proxy_public_addresses }}"
+    upstream: "127.0.0.1:{{ registry_web_mirror_sync_port }}"
+    tls: acme
+    auth: basic
+    realm: MCUHome mirror sync
+    users: "{{ registry_mirror_sync_users | default([]) }}"
+
+  # The bootstrap host. Configured, but the name still resolves to the
+  # old host, so asking a certificate authority for a certificate could
+  # only produce failed validations. It runs on Caddy's own local CA
+  # until the DNS record moves; switching "internal" to "acme" and
+  # restarting is the cutover.
+  - name: packages.mcuhome.org
+    bind: "{{ registry_proxy_public_addresses }}"
+    upstream: "127.0.0.1:{{ registry_web_bootstrap_port }}"
+    tls: internal
+
+# --- the rsync export -----------------------------------------------------
+
+# rsync://mirror-1.packages.mcuhome.org/registry/
+registry_rsync_module: registry
+registry_rsync_comment: MCUHome package registry, read-only
+
+# Four transfers at 5 MiB/s each — the limit is in KiB/s, because the
+# daemon form of rsync's --bwlimit takes a plain integer. 20 MiB/s if all
+# four are busy, which the uplink carries and which still lets one mirror
+# pull a half-gigabyte package in a couple of minutes. It is a ceiling
+# per connection, not a traffic budget: nothing here watches the monthly
+# total.
+registry_rsync_max_connections: 4
+registry_rsync_bwlimit: 5120
+registry_rsync_timeout: 600

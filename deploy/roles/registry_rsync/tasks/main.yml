@@ -1,0 +1,133 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The anonymous read-only rsync export of the registry: a native daemon,
+# started per connection by a systemd socket unit.
+#
+# Native rather than containerised on purpose. It needs to chroot into
+# the served tree and to be reachable on the host's own addresses, and
+# both of those are things a container would have to be handed back one
+# by one until nothing of the container was left.
+#
+# It expects the registry_storage role (or an equivalent layout) to have
+# run.
+
+- name: Check the rsync export settings
+  ansible.builtin.assert:
+    that:
+      - registry_root | default('', true) is match('^/.+')
+      - registry_rsync_module | default('', true) is match('^[A-Za-z0-9._-]+$')
+      - registry_rsync_max_connections | int >= 1
+      - registry_rsync_bwlimit | string is match('^[0-9]*$')
+      - registry_rsync_timeout | int >= 0
+      # An empty string among the addresses is what an inventory value
+      # that was never filled in looks like, and it would turn into a
+      # ListenStream= nothing can bind.
+      - registry_rsync_listen_addresses | select('eq', '') | list | length == 0
+    fail_msg: >-
+      registry_root must be an absolute path, registry_rsync_module a
+      plain name, registry_rsync_max_connections at least 1, and
+      registry_rsync_bwlimit a whole number of KiB/s — the daemon form of
+      --bwlimit takes an integer and rejects the k, m and g suffixes a
+      client may use. Zero or empty means no limit.
+    quiet: true
+
+- name: Install rsync
+  ansible.builtin.apt:
+    name: "{{ registry_rsync_packages }}"
+    state: present
+  when: registry_rsync_packages | length > 0
+
+- name: Create the configuration directory
+  ansible.builtin.file:
+    path: "{{ registry_rsync_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write the rsync export configuration
+  ansible.builtin.template:
+    src: rsyncd.conf.j2
+    dest: "{{ registry_rsync_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Write the rsync export socket
+  ansible.builtin.template:
+    src: socket.j2
+    dest: /etc/systemd/system/{{ registry_rsync_service }}.socket
+    owner: root
+    group: root
+    mode: "0644"
+  register: registry_rsync_socket
+
+- name: Write the rsync export unit
+  ansible.builtin.template:
+    src: service.j2
+    dest: /etc/systemd/system/{{ registry_rsync_service }}@.service
+    owner: root
+    group: root
+    mode: "0644"
+
+# The rsync package ships a service and a socket of its own. Both want
+# port 873, and whichever wins a boot decides what the world sees.
+- name: Look for the packaged rsync units
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - list-unit-files
+      - --no-legend
+      - rsync.service
+      - rsync.socket
+  register: registry_rsync_packaged
+  changed_when: false
+
+- name: Switch the packaged rsync units off
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop:
+    - rsync.service
+    - rsync.socket
+  when:
+    - registry_rsync_disable_packaged_units | bool
+    - item in registry_rsync_packaged.stdout
+
+- name: Enable the rsync export
+  ansible.builtin.systemd_service:
+    name: "{{ registry_rsync_service }}.socket"
+    daemon_reload: true
+    enabled: true
+    state: started
+
+# Deliberately not a handler: the check below has to run against the
+# socket that was just written. The per-connection unit and the daemon
+# configuration need no restart — the next connection reads both.
+- name: Restart the rsync export socket for the new configuration  # noqa: no-handler
+  ansible.builtin.systemd_service:
+    name: "{{ registry_rsync_service }}.socket"
+    state: restarted
+  when: registry_rsync_socket is changed
+
+# Proof that the export works on this server, done the way a mirror does
+# it: connect, and ask the module what it has. It exercises the socket,
+# the per-connection unit, the chroot into the docroot symlink and the
+# module's own settings in one go.
+- name: Check the export answers
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_rsync_binary }}"
+      - --list-only
+      - --contimeout=10
+      - rsync://{{ registry_rsync_probe_address }}:{{ registry_rsync_port }}/{{ registry_rsync_module }}/
+  vars:
+    registry_rsync_probe_address: >-
+      {{ ('[' ~ registry_rsync_listen_addresses[0] ~ ']'
+          if ':' in registry_rsync_listen_addresses[0]
+          else registry_rsync_listen_addresses[0])
+         if registry_rsync_listen_addresses | length > 0 else 'localhost' }}
+  changed_when: false

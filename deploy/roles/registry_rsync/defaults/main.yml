@@ -1,0 +1,78 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the registry_rsync role. See README.md next to this file
+# for what the role does with them.
+
+# Where the registry is mounted. Shared with every other registry role,
+# so it deliberately carries no role prefix.
+registry_root: /srv/registry  # noqa: var-naming[no-role-prefix]
+
+# The module name, i.e. the path in rsync://<host>/<module>/. Short,
+# because every mirror operator types it.
+registry_rsync_module: registry
+registry_rsync_comment: packagetool registry, read-only
+
+# The addresses the export listens on, as a list. An empty list means
+# every address the host has, which is rarely what a server with a
+# separate administrative address wants.
+registry_rsync_listen_addresses: []
+registry_rsync_port: 873
+
+# How much of the machine a public export may take. Both bounds are
+# needed and neither replaces the other: the connection count bounds how
+# many transfers run at once, the bandwidth limit bounds what one of them
+# costs. The worst case is their product, and that is the number worth
+# comparing against the machine's uplink and its traffic budget.
+#
+# The limit is not an rsyncd.conf setting — there is no such parameter.
+# It is the daemon's own --bwlimit, which rsync treats as a ceiling a
+# client cannot raise: a client asking for more is clamped, a client
+# asking for less keeps its own value.
+#
+# In KiB/s, and a whole number. The daemon form of --bwlimit takes an
+# integer and nothing else: the k/m/g suffixes and fractions a client may
+# use are rejected outright ("invalid numeric value (in daemon mode)").
+# 5120 is 5 MiB/s. Zero, or empty, means no limit.
+registry_rsync_max_connections: 4
+registry_rsync_bwlimit: 5120
+
+# I/O timeout in seconds, imposed on the client. Bounds how long a dead
+# connection keeps one of the connection slots above.
+registry_rsync_timeout: 600
+
+# The account transfers run as, after the daemon has chrooted. Nothing in
+# a public registry is secret, but nothing is served as root either.
+registry_rsync_uid: nobody
+registry_rsync_gid: nogroup
+
+# Options a client may not use. On a download-only module a client's
+# --delete never reaches the daemon at all — the deletions happen purely
+# on the client's own side, after comparing against the sender's file
+# list — so refusing "delete*" here changes nothing for the pull
+# direction; it is kept only as belt-and-suspenders in case that ever
+# stops being true.
+registry_rsync_refuse_options: delete* remove-source-files
+
+# File patterns rsync should not spend CPU compressing. Package files are
+# compressed already.
+registry_rsync_dont_compress: "*.zst *.gz *.xz *.bz2 *.zip *.7z"
+
+# Where the generated configuration goes on the host.
+registry_rsync_config_dir: /etc/packagetool
+registry_rsync_config_path: /etc/packagetool/rsyncd.conf
+registry_rsync_lock_file: /run/packagetool-rsyncd.lock
+
+# The units. A socket and a per-connection service, the way the rsync
+# project's own units do it.
+registry_rsync_service: packagetool-rsyncd
+
+# Whether to switch the units the rsync package ships off. Two daemons on
+# the same port is a race over who gets it; this role assumes it is the
+# one exporting the registry.
+registry_rsync_disable_packaged_units: true
+
+registry_rsync_binary: /usr/bin/rsync
+registry_rsync_packages:
+  - rsync

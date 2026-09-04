@@ -1,0 +1,68 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the registry_web role. See README.md next to this file for
+# what the role does with them.
+
+# Where the registry is mounted. Shared with every other registry role,
+# so it deliberately carries no role prefix; all of them have to be given
+# the same value, and one name for it is the point.
+registry_root: /srv/registry  # noqa: var-naming[no-role-prefix]
+
+# The image the web server runs from. A floating tag is pulled once and
+# then kept: nothing here pulls again on its own, so a running server does
+# not change version because a tag moved. Pin a digest
+# (nginx@sha256:...) if you want that in writing.
+registry_web_image: docker.io/library/nginx:stable-alpine
+
+# The address the vhosts listen on. Nothing but the reverse proxy is
+# meant to reach them, so the default is the loopback address.
+registry_web_listen_address: "127.0.0.1"
+
+# One port per vhost. The full tree, the bootstrap subset, and the dump
+# distribution are separate servers rather than locations of one server:
+# a request that reaches the wrong port then gets the wrong *server*,
+# which serves a different tree, instead of slipping past a path rule.
+registry_web_tree_port: 8080
+registry_web_bootstrap_port: 8081
+registry_web_mirror_sync_port: 8082
+
+# Which of the three vhosts exist. A host that is only a mirror needs
+# neither of the two extra ones.
+registry_web_bootstrap_enabled: true
+registry_web_mirror_sync_enabled: true
+
+# Directory listings for the full tree. A registry is a plain file tree
+# and listing it gives away nothing that is not already public, but a
+# role does not switch that on for somebody else's server.
+registry_web_autoindex: false
+
+# What the bootstrap vhost answers at "/". Empty means 404, which is the
+# honest answer: the bootstrap host serves documents, not pages. Set it
+# to a URL to redirect a browser to the mirror that has the pages.
+registry_web_bootstrap_redirect: ""
+
+# Cache lifetimes. The long one is for files that can never change under
+# their name — package files, content-named index parts, archived key
+# sets; the short one is the fallback for everything the rules below do
+# not name. The signed head documents are always revalidated instead.
+registry_web_immutable_max_age: 31536000
+registry_web_default_max_age: 300
+
+# Where the generated configuration goes on the host.
+registry_web_config_dir: /etc/packagetool
+registry_web_config_path: /etc/packagetool/nginx.conf
+
+# The systemd unit and the container it runs.
+registry_web_service: packagetool-web
+registry_web_container: packagetool-web
+
+# Check the generated configuration with the image's own nginx before it
+# is written. Costs one container start per run and is the difference
+# between a broken file on disk and a run that stops with the error.
+registry_web_validate_config: true
+
+# The docker client. A full path, because systemd units need one.
+registry_web_docker: /usr/bin/docker
+registry_web_docker_service: docker.service
