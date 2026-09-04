@@ -1,0 +1,51 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Finds out what, if anything, is mounted at the registry root, and
+# refuses to go on if it is not the registry subvolume.
+#
+# This is what keeps the run that follows honest. The registry subvolume
+# cannot be mounted before it exists, so the role mounts the volume root
+# at the same place for the moment it takes to create it. If a run is
+# interrupted in that moment, the volume root stays mounted there — and
+# creating the tree on the volume root instead of inside the registry
+# subvolume would be exactly the layout mistake this role exists to
+# avoid. Checking which subvolume is mounted, rather than only whether
+# something is, turns that into a clean stop.
+
+- name: Look at the registry root
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - --noheadings
+      - --output
+      - SOURCE,FSTYPE,OPTIONS
+      - --mountpoint
+      - "{{ registry_root }}"
+  register: registry_storage_findmnt
+  changed_when: false
+  check_mode: false
+  # 1 is findmnt's "nothing is mounted there", which is a normal state
+  # here, not a failure.
+  failed_when: registry_storage_findmnt.rc not in [0, 1]
+
+- name: Remember what is mounted at the registry root
+  ansible.builtin.set_fact:
+    registry_storage_mounted: "{{ registry_storage_findmnt.rc == 0 }}"
+    registry_storage_mounted_subvol: >-
+      {{ (registry_storage_findmnt.stdout | regex_search('subvol=[^,]+')
+          | default('', true)) | replace('subvol=', '') | trim }}
+
+- name: Check the registry root carries the registry subvolume
+  ansible.builtin.assert:
+    that:
+      - registry_storage_mounted_subvol == '/' ~ registry_storage_subvolume
+    fail_msg: >-
+      Something other than the {{ registry_storage_subvolume }} subvolume
+      is mounted at {{ registry_root }} (findmnt reports
+      '{{ registry_storage_findmnt.stdout | trim }}'). If a previous run
+      was interrupted, this is the volume root left behind: unmount
+      {{ registry_root }} and run again. Nothing was changed.
+    quiet: true
+  when: registry_storage_mounted | bool

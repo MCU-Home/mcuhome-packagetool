@@ -1,0 +1,45 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Storage layout for a packagetool registry: a btrfs filesystem on a
+# dedicated block device, one subvolume that carries the registry, and
+# the tree inside it that the publish mechanics and the servers expect.
+#
+# The role is written so that it can be run again at any time. It creates
+# a filesystem only on a device that carries nothing at all, and every
+# step that could destroy data either checks first or is not done here.
+#
+# Check mode is not supported: on a device that has no filesystem yet,
+# every step after the one that would create it has nothing to look at,
+# so a dry run would report on check mode rather than on the server.
+
+- name: Check the storage settings
+  ansible.builtin.assert:
+    that:
+      - registry_storage_device | default('', true) | length > 0
+      - registry_root | default('', true) is match('^/.+')
+      - registry_storage_subvolume | default('', true) is match('^[^/]+$')
+      - not (registry_storage_mount_options is search('subvol'))
+    fail_msg: >-
+      registry_storage_device must name a block device, registry_root must
+      be an absolute path, registry_storage_subvolume must be a plain name
+      without a slash, and registry_storage_mount_options must not contain
+      a subvol option — the role adds that itself.
+    quiet: true
+
+- name: Prepare the filesystem
+  ansible.builtin.include_tasks: filesystem.yml
+
+- name: Look at what is mounted at the registry root
+  ansible.builtin.include_tasks: mount-state.yml
+
+- name: Create the registry subvolume
+  ansible.builtin.include_tasks: subvolume.yml
+  when: not registry_storage_mounted
+
+- name: Mount the registry subvolume
+  ansible.builtin.include_tasks: mount.yml
+
+- name: Create the tree inside the registry subvolume
+  ansible.builtin.include_tasks: layout.yml

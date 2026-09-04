@@ -1,0 +1,79 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Creates the registry subvolume on the volume root.
+#
+# The subvolume has to exist before it can be mounted, and it lives on
+# the volume root, which nothing mounts permanently — mounting the volume
+# root is what this role is meant to avoid, so that the same volume can
+# carry other data later. So the volume root is mounted at the registry
+# root for the length of this file and unmounted again, whether the
+# tasks in between worked or not.
+#
+# Only reached when nothing is mounted at the registry root; the file
+# before this one established that.
+
+- name: Create the mount point
+  ansible.builtin.file:
+    path: "{{ registry_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create the registry subvolume on the volume root
+  block:
+
+    - name: Mount the volume root
+      ansible.builtin.command:
+        argv:
+          - mount
+          - -t
+          - btrfs
+          - -o
+          - subvolid=5
+          - "UUID={{ registry_storage_uuid }}"
+          - "{{ registry_root }}"
+      changed_when: true
+
+    - name: Look for the registry subvolume
+      ansible.builtin.stat:
+        path: "{{ registry_root }}/{{ registry_storage_subvolume }}"
+      register: registry_storage_subvol_stat
+
+    - name: Create the registry subvolume
+      ansible.builtin.command:
+        argv:
+          - btrfs
+          - subvolume
+          - create
+          - "{{ registry_root }}/{{ registry_storage_subvolume }}"
+      when: not registry_storage_subvol_stat.stat.exists
+      changed_when: true
+
+  always:
+
+    # Asking again rather than unmounting unconditionally: if the mount
+    # above is what failed, an unmount that fails too would bury the real
+    # error under a second one.
+    - name: Look at the registry root again
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --noheadings
+          - --output
+          - SOURCE
+          - --mountpoint
+          - "{{ registry_root }}"
+      register: registry_storage_findmnt_after
+      changed_when: false
+      failed_when: registry_storage_findmnt_after.rc not in [0, 1]
+
+    - name: Unmount the volume root again
+      ansible.builtin.command:
+        argv:
+          - umount
+          - "{{ registry_root }}"
+      when: registry_storage_findmnt_after.rc == 0
+      changed_when: true

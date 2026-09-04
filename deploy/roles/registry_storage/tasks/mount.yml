@@ -1,0 +1,95 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Writes the fstab entry for the registry subvolume and mounts it.
+#
+# fstab rather than a mount unit, because fstab is where an operator
+# looks first and systemd generates the unit from it anyway. The entry
+# names the filesystem by UUID: that is the filesystem's own identity and
+# survives the volume being attached under a different device name.
+#
+# The mount is not remounted automatically when the options change. A
+# subvol= cannot be changed by a remount at all, and the rest is not
+# worth unmounting a live registry for: the run says what is different
+# and leaves the decision to the operator.
+
+- name: Create the mount point
+  ansible.builtin.file:
+    path: "{{ registry_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Put the registry mount into /etc/fstab
+  ansible.builtin.blockinfile:
+    path: /etc/fstab
+    marker: "# {mark} registry_storage {{ registry_root }}"
+    # Folded, so the six fstab fields can be read one below the other
+    # here and still end up on the single line fstab wants.
+    block: >-
+      UUID={{ registry_storage_uuid }}
+      {{ registry_root }}
+      btrfs
+      subvol={{ registry_storage_subvolume }},{{ registry_storage_mount_options }}
+      0 0
+    owner: root
+    group: root
+    mode: "0644"
+  register: registry_storage_fstab
+
+# systemd builds a mount unit out of every fstab entry, and it only
+# rereads fstab when it is told to. Without this it would not know about
+# the registry until the next reboot, and a daemon-reload at an awkward
+# moment could take a mount it does not know about down with it.
+- name: Let systemd read the new fstab entry
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - registry_storage_fstab is changed
+    - ansible_facts.service_mgr | default('') == 'systemd'
+
+- name: Mount the registry subvolume
+  ansible.builtin.command:
+    argv:
+      - mount
+      - "{{ registry_root }}"
+  when: not registry_storage_mounted
+  changed_when: true
+
+- name: Look at the registry root once more
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - --noheadings
+      - --output
+      - SOURCE,FSTYPE,OPTIONS
+      - --mountpoint
+      - "{{ registry_root }}"
+  register: registry_storage_mount_check
+  changed_when: false
+  failed_when: registry_storage_mount_check.rc != 0
+
+- name: Check the registry subvolume is the thing that is mounted
+  ansible.builtin.assert:
+    that:
+      - registry_storage_mount_check.stdout is search('btrfs')
+      - registry_storage_mount_check.stdout is
+        search('subvol=/' ~ registry_storage_subvolume ~ '(,|$)')
+    fail_msg: >-
+      {{ registry_root }} is not the {{ registry_storage_subvolume }}
+      subvolume: findmnt reports
+      '{{ registry_storage_mount_check.stdout | trim }}'.
+    quiet: true
+
+- name: Report an fstab entry the running mount does not match
+  ansible.builtin.debug:
+    msg: >-
+      The fstab entry for {{ registry_root }} changed while the
+      filesystem was already mounted. The running mount still uses the
+      options it was mounted with; unmount and mount it again when it is
+      convenient.
+  when:
+    - registry_storage_fstab is changed
+    - registry_storage_mounted | bool

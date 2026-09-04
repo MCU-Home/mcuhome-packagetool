@@ -51,6 +51,7 @@ exactly as much as the original.
 | `build-tools/` | The build environment's host-tool packages, one per platform, plus the meta package standing for the family |
 | `mcuhome/` | The publishing tool — keys, signed documents, sources, catalogue |
 | `tests/` | The suite, and the fixed source directories it verifies, one per outcome |
+| `deploy/` | Ansible roles and material for hosting a packagetool registry; details in `deploy/README.md` |
 | `.github/` | The publish, refresh and check workflows |
 
 ## Development — how to work on this repository

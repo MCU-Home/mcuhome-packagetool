@@ -1,0 +1,24 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the registry_snapshot role. See README.md next to this
+# file for what the role does with them.
+
+# Where the registry is mounted. Shared with the registry_storage role
+# and with everything else that serves the registry, so it deliberately
+# carries no role prefix; every one of them has to be given the same
+# value, and one name for it is the point. Hence the exception from the
+# linter's role-prefix rule.
+registry_root: /srv/registry  # noqa: var-naming[no-role-prefix]
+
+# Retention. A snapshot is deleted only when both bounds have let go of
+# it: it is not among the newest registry_snapshot_keep_count, and it is
+# older than registry_snapshot_keep_days days.
+registry_snapshot_keep_count: 10
+registry_snapshot_keep_days: 7
+
+# Where the role puts the script and its settings file.
+registry_snapshot_script_path: /usr/local/sbin/packagetool-snapshot
+registry_snapshot_config_dir: /etc/packagetool
+registry_snapshot_config_path: /etc/packagetool/snapshot.conf

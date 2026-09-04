@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# packagetool-snapshot — publish the registry working tree.
+#
+# One run does three things, in this order:
+#
+#   1. create a read-only btrfs snapshot of the working tree, named
+#      snapshot-<ISO 8601 basic, UTC>, in the snapshot area;
+#   2. point the served docroot symlink "current" at that snapshot with a
+#      rename, so the switch is atomic and no client ever sees a tree
+#      that is half published;
+#   3. delete snapshots that both retention bounds have let go of.
+#
+# Retention keeps a snapshot while EITHER bound still covers it: it is
+# among the newest <keep count>, or it is younger than <keep days>. Only
+# a snapshot that neither bound covers is deleted, and the snapshot the
+# docroot points at is never deleted.
+#
+# The layout below is fixed rather than configurable, because the web
+# server, the rsync export, the publish pipeline and the mirror export
+# all have to agree on it; only the root is configurable.
+#
+#   <root>/working        the working tree, a btrfs subvolume, never served
+#   <root>/snapshots/     the read-only snapshots, one per publish
+#   <root>/mirror-sync/   dumps for official mirrors
+#   <root>/current        symlink to the snapshot that is served
+#
+# The timestamp in a snapshot name is ISO 8601 basic format in UTC
+# (20260904T093000Z), not the extended one: the name ends up in file
+# names, URLs and rsync arguments, and a colon is awkward in all three.
+# It sorts chronologically as plain text, which is what retention uses.
+#
+# Exit codes:
+#   0  success
+#   1  usage error
+#   2  precondition not met: configuration, layout, or missing tools
+#   3  the snapshot could not be created
+#   4  the docroot could not be switched
+#   5  snapshot and switch succeeded, retention did not
+#   6  another run holds the lock
+#
+# Everything the run does goes to stdout, everything that went wrong or
+# was deliberately left alone goes to stderr.
+
+set -euo pipefail
+
+readonly PROGRAM_NAME=packagetool-snapshot
+
+readonly EXIT_USAGE=1
+readonly EXIT_PRECONDITION=2
+readonly EXIT_SNAPSHOT=3
+readonly EXIT_FLIP=4
+readonly EXIT_RETENTION=5
+readonly EXIT_LOCKED=6
+
+readonly DEFAULT_CONFIG_FILE=/etc/packagetool/snapshot.conf
+readonly SNAPSHOT_PREFIX=snapshot-
+readonly SNAPSHOT_NAME_PATTERN='^snapshot-[0-9]{8}T[0-9]{6}Z$'
+readonly SECONDS_PER_DAY=86400
+
+# Settings, in the order they are applied: these built-in values, then
+# the configuration file, then the command line. The names are the ones
+# the Ansible roles use, so a configuration file and a playbook say the
+# same thing in the same words.
+registry_root=/srv/registry
+registry_snapshot_keep_count=10
+registry_snapshot_keep_days=7
+
+config_file=$DEFAULT_CONFIG_FILE
+config_file_given=false
+dry_run=false
+quiet=false
+
+opt_root=
+opt_keep_count=
+opt_keep_days=
+
+working_dir=
+snapshots_dir=
+current_link=
+lock_file=
+
+# Removed by the exit trap if a switch was interrupted between creating
+# the replacement symlink and renaming it over the docroot.
+tmp_link=
+
+err() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+say() {
+  if [ "$quiet" = false ]; then
+    printf '%s\n' "$*"
+  fi
+}
+
+die() {
+  local code=$1
+  shift
+  err "$*"
+  exit "$code"
+}
+
+cleanup() {
+  if [ -n "$tmp_link" ] && [ -L "$tmp_link" ]; then
+    rm -f "$tmp_link"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: packagetool-snapshot [OPTIONS]
+
+Snapshots the registry working tree, points the served docroot at the new
+snapshot, and applies the retention bounds.
+
+Options:
+  --config PATH    settings file to read (default /etc/packagetool/snapshot.conf)
+  --root PATH      registry root (default /srv/registry)
+  --keep-count N   keep at least the newest N snapshots (default 10)
+  --keep-days D    keep every snapshot younger than D days (default 7)
+  --dry-run        report what a run would do; changes nothing, takes no lock
+  --quiet          report only problems
+  --help           this text
+
+Exit codes: 0 success, 1 usage, 2 precondition, 3 snapshot, 4 switch,
+5 retention, 6 locked.
+EOF
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+    --config)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--config needs a path"
+      config_file=$2
+      config_file_given=true
+      shift 2
+      ;;
+    --root)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--root needs a path"
+      opt_root=$2
+      shift 2
+      ;;
+    --keep-count)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--keep-count needs a number"
+      opt_keep_count=$2
+      shift 2
+      ;;
+    --keep-days)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--keep-days needs a number"
+      opt_keep_days=$2
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --quiet)
+      quiet=true
+      shift
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "$EXIT_USAGE" "unknown option $1"
+      ;;
+    esac
+  done
+}
+
+load_config() {
+  if [ "$config_file_given" = true ] && [ ! -r "$config_file" ]; then
+    die "$EXIT_PRECONDITION" "cannot read the settings file $config_file"
+  fi
+  if [ -r "$config_file" ]; then
+    # A root-owned shell fragment, read the way the files under
+    # /etc/default are read.
+    # shellcheck source=/dev/null
+    . "$config_file"
+  fi
+
+  if [ -n "$opt_root" ]; then
+    registry_root=$opt_root
+  fi
+  if [ -n "$opt_keep_count" ]; then
+    registry_snapshot_keep_count=$opt_keep_count
+  fi
+  if [ -n "$opt_keep_days" ]; then
+    registry_snapshot_keep_days=$opt_keep_days
+  fi
+}
+
+validate_config() {
+  case $registry_root in
+  /*) ;;
+  *) die "$EXIT_PRECONDITION" "the registry root must be an absolute path, not '$registry_root'" ;;
+  esac
+  # A trailing slash would show up in every message and in the docroot
+  # symlink target.
+  while [ "$registry_root" != / ] && [ "${registry_root%/}" != "$registry_root" ]; do
+    registry_root=${registry_root%/}
+  done
+  if [ "$registry_root" = / ]; then
+    die "$EXIT_PRECONDITION" "the registry root must not be /"
+  fi
+
+  if ! [[ $registry_snapshot_keep_count =~ ^[0-9]+$ ]] ||
+    [ "$registry_snapshot_keep_count" -lt 1 ]; then
+    die "$EXIT_PRECONDITION" \
+      "the snapshot count to keep must be a whole number of at least 1, not '$registry_snapshot_keep_count'"
+  fi
+  if ! [[ $registry_snapshot_keep_days =~ ^[0-9]+$ ]]; then
+    die "$EXIT_PRECONDITION" \
+      "the number of days to keep must be a whole number, not '$registry_snapshot_keep_days'"
+  fi
+
+  working_dir=$registry_root/working
+  snapshots_dir=$registry_root/snapshots
+  current_link=$registry_root/current
+  lock_file=$registry_root/.snapshot.lock
+}
+
+check_preconditions() {
+  local tool
+  for tool in btrfs date find flock ln mv readlink; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      die "$EXIT_PRECONDITION" "$tool is not installed"
+    fi
+  done
+
+  if [ ! -d "$registry_root" ]; then
+    die "$EXIT_PRECONDITION" "the registry root $registry_root does not exist"
+  fi
+  if ! btrfs subvolume show "$working_dir" >/dev/null 2>&1; then
+    die "$EXIT_PRECONDITION" \
+      "$working_dir is not a btrfs subvolume — set the registry storage up first"
+  fi
+  if [ ! -d "$snapshots_dir" ]; then
+    die "$EXIT_PRECONDITION" "the snapshot area $snapshots_dir does not exist"
+  fi
+  if [ -e "$current_link" ] && [ ! -L "$current_link" ]; then
+    die "$EXIT_PRECONDITION" \
+      "$current_link exists and is not a symlink — refusing to replace it"
+  fi
+}
+
+take_lock() {
+  # Own file descriptor rather than a wrapper process: the lock is held
+  # for as long as this script runs and is released when it ends, however
+  # it ends.
+  exec 9>"$lock_file" || die "$EXIT_PRECONDITION" "cannot open the lock file $lock_file"
+  if ! flock -n 9; then
+    die "$EXIT_LOCKED" "another $PROGRAM_NAME run is working on $registry_root"
+  fi
+}
+
+# Prints a snapshot name that is not taken yet. Two runs in the same
+# second are the only way to collide, so waiting a second is enough.
+pick_snapshot_name() {
+  local name
+  for _ in 1 2 3; do
+    name=$SNAPSHOT_PREFIX$(date -u +%Y%m%dT%H%M%SZ)
+    if [ ! -e "$snapshots_dir/$name" ]; then
+      printf '%s' "$name"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# The epoch second a snapshot name stands for.
+snapshot_epoch() {
+  local name=$1 stamp
+  stamp=${name#"$SNAPSHOT_PREFIX"}
+  date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2} ${stamp:9:2}:${stamp:11:2}:${stamp:13:2} UTC" +%s
+}
+
+# The docroot switch. A symlink cannot be repointed in place, so the
+# replacement is built next to it and renamed over it: rename(2) is
+# atomic, so every reader sees either the old snapshot or the new one.
+flip_docroot() {
+  local name=$1
+  tmp_link=$registry_root/.current.$$
+  rm -f "$tmp_link"
+  if ! ln -s "snapshots/$name" "$tmp_link"; then
+    return 1
+  fi
+  if ! mv -T "$tmp_link" "$current_link"; then
+    rm -f "$tmp_link"
+    return 1
+  fi
+  tmp_link=
+  [ "$(readlink "$current_link")" = "snapshots/$name" ]
+}
+
+# Deletes the snapshots that neither retention bound covers. The name of
+# the snapshot this run is about to create is passed in during a dry run,
+# where it is not on disk yet but does shift the newest-N window.
+run_retention() {
+  local pending=${1:-}
+  local -a names=() unexpected=()
+  local name
+
+  while IFS= read -r name; do
+    if [[ $name =~ $SNAPSHOT_NAME_PATTERN ]]; then
+      names+=("$name")
+    else
+      unexpected+=("$name")
+    fi
+  done < <(find "$snapshots_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+
+  if [ ${#unexpected[@]} -gt 0 ]; then
+    err "leaving ${#unexpected[@]} entries in $snapshots_dir alone, they are not named like a snapshot: ${unexpected[*]}"
+  fi
+  if [ -n "$pending" ]; then
+    names+=("$pending")
+  fi
+
+  local total=${#names[@]}
+  local unprotected=0
+  if [ "$total" -gt "$registry_snapshot_keep_count" ]; then
+    unprotected=$((total - registry_snapshot_keep_count))
+  fi
+
+  local now cutoff
+  now=$(date -u +%s)
+  cutoff=$((now - registry_snapshot_keep_days * SECONDS_PER_DAY))
+
+  local served=
+  if [ -L "$current_link" ]; then
+    served=$(basename "$(readlink "$current_link")")
+  fi
+
+  local failures=0 deleted=0 index epoch
+  for ((index = 0; index < unprotected; index++)); do
+    name=${names[index]}
+    if ! epoch=$(snapshot_epoch "$name" 2>/dev/null); then
+      err "keeping $name: its name carries no readable timestamp"
+      continue
+    fi
+    if [ "$epoch" -ge "$cutoff" ]; then
+      continue
+    fi
+    if [ "$name" = "$served" ]; then
+      err "keeping $name although both retention bounds have let it go: it is the snapshot being served"
+      continue
+    fi
+    if [ "$dry_run" = true ]; then
+      say "would delete snapshots/$name"
+      deleted=$((deleted + 1))
+      continue
+    fi
+    if btrfs subvolume delete "$snapshots_dir/$name" >/dev/null; then
+      say "deleted snapshots/$name"
+      deleted=$((deleted + 1))
+    else
+      err "could not delete snapshots/$name"
+      failures=$((failures + 1))
+    fi
+  done
+
+  local remaining=$((total - deleted))
+  if [ "$remaining" -eq 1 ]; then
+    say "kept 1 snapshot"
+  else
+    say "kept $remaining snapshots"
+  fi
+  [ "$failures" -eq 0 ]
+}
+
+main() {
+  trap cleanup EXIT
+  parse_args "$@"
+  load_config
+  validate_config
+  check_preconditions
+
+  local name
+  if ! name=$(pick_snapshot_name); then
+    die "$EXIT_SNAPSHOT" "a snapshot for the current second already exists in $snapshots_dir"
+  fi
+
+  if [ "$dry_run" = true ]; then
+    say "would create snapshots/$name"
+    say "would point current at snapshots/$name"
+    if ! run_retention "$name"; then
+      exit "$EXIT_RETENTION"
+    fi
+    exit 0
+  fi
+
+  take_lock
+
+  if ! btrfs subvolume snapshot -r "$working_dir" "$snapshots_dir/$name" >/dev/null; then
+    die "$EXIT_SNAPSHOT" "could not snapshot $working_dir"
+  fi
+  # Force a transaction commit, so the new snapshot survives a crash and
+  # can be sent to a mirror without waiting for the next commit.
+  if ! btrfs filesystem sync "$registry_root" >/dev/null; then
+    die "$EXIT_SNAPSHOT" "could not commit the new snapshot to disk"
+  fi
+  say "created snapshots/$name"
+
+  if ! flip_docroot "$name"; then
+    die "$EXIT_FLIP" "could not point $current_link at snapshots/$name"
+  fi
+  say "current -> snapshots/$name"
+
+  if ! run_retention; then
+    exit "$EXIT_RETENTION"
+  fi
+}
+
+main "$@"

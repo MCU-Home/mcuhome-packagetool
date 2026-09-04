@@ -1,0 +1,63 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Installs packagetool-snapshot, the command that publishes the registry
+# working tree: a read-only snapshot, an atomic switch of the served
+# docroot, and the retention bounds.
+#
+# The role installs the command and its settings; it never runs it for
+# real. Publishing is a deliberate act, and the run that triggers it is
+# the publish pipeline, not a configuration run.
+#
+# It expects the registry_storage role to have run: the script checks the
+# layout it is pointed at and refuses to work on anything else.
+
+- name: Check the retention bounds
+  ansible.builtin.assert:
+    that:
+      - registry_snapshot_keep_count | int >= 1
+      - registry_snapshot_keep_days | int >= 0
+      - registry_root | default('', true) is match('^/.+')
+    fail_msg: >-
+      registry_snapshot_keep_count must be at least 1,
+      registry_snapshot_keep_days at least 0, and registry_root must be
+      an absolute path.
+    quiet: true
+
+- name: Create the settings directory
+  ansible.builtin.file:
+    path: "{{ registry_snapshot_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the snapshot command
+  ansible.builtin.copy:
+    src: packagetool-snapshot
+    dest: "{{ registry_snapshot_script_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the snapshot settings
+  ansible.builtin.template:
+    src: snapshot.conf.j2
+    dest: "{{ registry_snapshot_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# Proof that what was just installed works on this server: a dry run
+# reads the settings file, checks the layout, and reports what a real run
+# would do — without creating, switching or deleting anything.
+- name: Check the installed command accepts the layout
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_snapshot_script_path }}"
+      - --config
+      - "{{ registry_snapshot_config_path }}"
+      - --dry-run
+      - --quiet
+  changed_when: false

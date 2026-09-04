@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Functional test for packagetool-snapshot, against a real btrfs
+# filesystem in a loopback image that this script creates and throws away
+# again. Nothing outside its own temporary directory and its own loop
+# device is touched.
+#
+# What is checked: the snapshot is taken and is read-only, the working
+# tree and the served tree are independent afterwards, the docroot
+# symlink is switched to the new snapshot and stays a relative link, the
+# lock keeps a second run out, both retention bounds hold on their own
+# and together, the served snapshot is never deleted, entries that are
+# not snapshots are left alone, and the documented exit codes come out.
+#
+# Needs root, btrfs-progs and loop devices; exits 77 ("skipped") without
+# them.
+#
+#   sudo deploy/tests/registry-snapshot
+
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+tool="$here/../roles/registry_snapshot/files/packagetool-snapshot"
+
+failures=0
+checks=0
+
+note() { printf '%s\n' "$*"; }
+ok() {
+  checks=$((checks + 1))
+  printf '  ok    %s\n' "$1"
+}
+bad() {
+  checks=$((checks + 1))
+  failures=$((failures + 1))
+  printf '  FAIL  %s\n' "$1" >&2
+}
+same() {
+  if [ "$2" = "$3" ]; then
+    ok "$1"
+  else
+    bad "$1: expected '$3', got '$2'"
+  fi
+}
+true_that() {
+  if [ "$2" = true ]; then
+    ok "$1"
+  else
+    bad "$1"
+  fi
+}
+
+skip() {
+  printf 'SKIP: %s\n' "$*" >&2
+  exit 77
+}
+
+# --- prerequisites ---------------------------------------------------
+
+[ -x "$tool" ] || skip "$tool is not there or not executable"
+[ "$(id -u)" -eq 0 ] || skip "needs root: it creates a loop device and mounts a filesystem"
+for binary in mkfs.btrfs btrfs losetup mount umount findmnt flock; do
+  command -v "$binary" >/dev/null 2>&1 || skip "$binary is not installed"
+done
+
+# --- a throwaway btrfs filesystem ------------------------------------
+
+work_dir=""
+loop_device=""
+mount_point=""
+
+# Invoked by the EXIT trap below, not from anywhere in the flow.
+# shellcheck disable=SC2317
+cleanup() {
+  if [ -n "$mount_point" ] && findmnt --mountpoint "$mount_point" >/dev/null 2>&1; then
+    umount "$mount_point" || true
+  fi
+  if [ -n "$loop_device" ] && [ -b "$loop_device" ]; then
+    losetup -d "$loop_device" || true
+  fi
+  if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
+    rm -rf "$work_dir"
+  fi
+}
+trap cleanup EXIT
+
+work_dir="$(mktemp -d)"
+mount_point="$work_dir/mnt"
+mkdir -p "$mount_point"
+truncate -s 1G "$work_dir/image"
+loop_device="$(losetup --find --show "$work_dir/image")"
+mkfs.btrfs --label registry-test "$loop_device" >/dev/null
+mount -o noatime "$loop_device" "$mount_point"
+note "btrfs on $loop_device, mounted at $mount_point"
+
+# Builds a registry root of the shape the storage role produces.
+make_registry() {
+  local root=$1
+  mkdir -p "$root"
+  btrfs subvolume create "$root/working" >/dev/null
+  mkdir -p "$root/snapshots" "$root/mirror-sync" "$root/placeholder"
+  ln -s placeholder "$root/current"
+  cat >"$root/snapshot.conf" <<EOF
+registry_root='$root'
+registry_snapshot_keep_count=10
+registry_snapshot_keep_days=7
+EOF
+}
+
+# A read-only snapshot under a name of our choosing, so retention can be
+# shown against snapshots of any age.
+make_snapshot() {
+  local root=$1 name=$2
+  btrfs subvolume snapshot -r "$root/working" "$root/snapshots/$name" >/dev/null
+}
+
+stamp_ago() {
+  date -u -d "$1" +%Y%m%dT%H%M%SZ
+}
+
+snapshot_count() {
+  find "$1/snapshots" -mindepth 1 -maxdepth 1 | wc -l
+}
+
+out=""
+err=""
+rc=0
+run_tool() {
+  out="$work_dir/stdout"
+  err="$work_dir/stderr"
+  set +e
+  "$tool" "$@" >"$out" 2>"$err"
+  rc=$?
+  set -e
+}
+
+# --- a first publish -------------------------------------------------
+
+note "first publish"
+registry="$mount_point/registry"
+make_registry "$registry"
+echo "index one" >"$registry/working/index.html"
+
+run_tool --config "$registry/snapshot.conf"
+same "exit code" "$rc" 0
+target="$(readlink "$registry/current")"
+case $target in
+snapshots/snapshot-*) ok "docroot points at the new snapshot ($target)" ;;
+*) bad "docroot points at '$target'" ;;
+esac
+case $target in
+/*) bad "docroot target is absolute" ;;
+*) ok "docroot target is relative" ;;
+esac
+same "served content" "$(cat "$registry/current/index.html")" "index one"
+same "snapshots on disk" "$(snapshot_count "$registry")" 1
+
+if echo "tampered" 2>/dev/null >"$registry/current/index.html"; then
+  bad "the snapshot is read-only"
+else
+  ok "the snapshot is read-only"
+fi
+
+# --- the working tree and the served tree are independent ------------
+
+note "second publish"
+echo "index two" >"$registry/working/index.html"
+same "served content is still the old one" "$(cat "$registry/current/index.html")" "index one"
+
+first_target="$target"
+run_tool --config "$registry/snapshot.conf"
+same "exit code" "$rc" 0
+target="$(readlink "$registry/current")"
+if [ "$target" != "$first_target" ]; then
+  ok "docroot moved to the newer snapshot"
+else
+  bad "docroot did not move"
+fi
+same "served content is the new one" "$(cat "$registry/current/index.html")" "index two"
+same "snapshots on disk" "$(snapshot_count "$registry")" 2
+same "the older snapshot still has the older content" \
+  "$(cat "$registry/$first_target/index.html")" "index one"
+
+# --- one run at a time -----------------------------------------------
+
+note "lock"
+exec 8>"$registry/.snapshot.lock"
+flock -n 8
+run_tool --config "$registry/snapshot.conf"
+same "exit code while the lock is held" "$rc" 6
+same "snapshots on disk are unchanged" "$(snapshot_count "$registry")" 2
+exec 8>&-
+
+# --- retention: the count bound alone --------------------------------
+
+note "retention, everything older than the day bound"
+old="$mount_point/old"
+make_registry "$old"
+for index in $(seq 1 15); do
+  make_snapshot "$old" "snapshot-$(stamp_ago "$((index + 30)) days ago")"
+done
+run_tool --config "$old/snapshot.conf"
+same "exit code" "$rc" 0
+same "the newest ten survive, the run's own snapshot included" "$(snapshot_count "$old")" 10
+same "the docroot is one of them" \
+  "$([ -d "$old/$(readlink "$old/current")" ] && echo yes)" yes
+if grep -q "^deleted snapshots/" "$out"; then
+  ok "the run reports what it deleted"
+else
+  bad "the run did not report any deletion"
+fi
+
+# --- retention: the day bound alone ----------------------------------
+
+note "retention, more than the count bound but all younger than the day bound"
+young="$mount_point/young"
+make_registry "$young"
+for index in $(seq 1 15); do
+  make_snapshot "$young" "snapshot-$(stamp_ago "$((index * 3)) hours ago")"
+done
+run_tool --config "$young/snapshot.conf"
+same "exit code" "$rc" 0
+same "nothing is deleted while the day bound covers it" "$(snapshot_count "$young")" 16
+
+# --- retention: both bounds together ---------------------------------
+
+note "retention, old snapshots but fewer than the count bound"
+few="$mount_point/few"
+make_registry "$few"
+for index in $(seq 1 5); do
+  make_snapshot "$few" "snapshot-$(stamp_ago "$((index + 300)) days ago")"
+done
+run_tool --config "$few/snapshot.conf"
+same "exit code" "$rc" 0
+same "nothing is deleted while the count bound covers it" "$(snapshot_count "$few")" 6
+
+# --- retention: the served snapshot is never deleted -----------------
+
+note "retention, the docroot pointing at a snapshot beyond both bounds"
+served="$mount_point/served"
+make_registry "$served"
+for index in $(seq 1 12); do
+  make_snapshot "$served" "snapshot-$(stamp_ago "$((index + 90)) days ago")"
+done
+mapfile -t existing < <(find "$served/snapshots" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+oldest="${existing[0]}"
+rm "$served/current"
+ln -s "snapshots/$oldest" "$served/current"
+# A dry run, because a real run switches the docroot to the new snapshot
+# before retention gets to look at it — the guard only ever matters for a
+# docroot that was moved back by hand.
+run_tool --config "$served/snapshot.conf" --dry-run
+same "exit code" "$rc" 0
+if grep -q "would delete snapshots/$oldest\$" "$out"; then
+  bad "the served snapshot was up for deletion"
+else
+  ok "the served snapshot was left alone"
+fi
+if grep -q "it is the snapshot being served" "$err"; then
+  ok "the run says why it kept it"
+else
+  bad "the run did not say why it kept it"
+fi
+if grep -q "^would delete snapshots/" "$out"; then
+  ok "other snapshots beyond both bounds were still up for deletion"
+else
+  bad "the dry run proposed no deletion at all"
+fi
+same "a dry run changes nothing" "$(snapshot_count "$served")" 12
+
+# --- entries that are not snapshots ----------------------------------
+
+note "an entry in the snapshot area that is not a snapshot"
+mixed="$mount_point/mixed"
+make_registry "$mixed"
+for index in $(seq 1 12); do
+  make_snapshot "$mixed" "snapshot-$(stamp_ago "$((index + 60)) days ago")"
+done
+mkdir "$mixed/snapshots/not-a-snapshot"
+run_tool --config "$mixed/snapshot.conf"
+same "exit code" "$rc" 0
+true_that "the foreign entry is still there" \
+  "$([ -d "$mixed/snapshots/not-a-snapshot" ] && echo true || echo false)"
+if grep -q "not-a-snapshot" "$err"; then
+  ok "the run names the foreign entry"
+else
+  bad "the run says nothing about the foreign entry"
+fi
+
+# --- retention bounds from the command line --------------------------
+
+note "retention bounds from the command line"
+run_tool --config "$mixed/snapshot.conf" --keep-count 2 --keep-days 0
+same "exit code" "$rc" 0
+same "the command line overrides the settings file" "$(snapshot_count "$mixed")" 3
+
+# --- exit codes ------------------------------------------------------
+
+note "exit codes"
+run_tool --config "$registry/snapshot.conf" --nonsense
+same "unknown option" "$rc" 1
+run_tool --config "$work_dir/there-is-no-such-file"
+same "settings file that is not there" "$rc" 2
+run_tool --root "$work_dir/not-a-registry"
+same "registry root that is not there" "$rc" 2
+run_tool --root "$mount_point" --config "$registry/snapshot.conf"
+same "a root without a working subvolume" "$rc" 2
+run_tool --config "$registry/snapshot.conf" --keep-count 0
+same "a count bound below one" "$rc" 2
+
+# --- result ----------------------------------------------------------
+
+note ""
+if [ "$failures" -eq 0 ]; then
+  note "$checks checks, all passed"
+  exit 0
+fi
+note "$checks checks, $failures failed"
+exit 1

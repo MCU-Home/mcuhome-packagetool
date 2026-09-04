@@ -1,0 +1,27 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The values the public MCUHome registry is run with.
+#
+# Everything here is deliberately spelled out even where it matches the
+# role default: this file is what the running registry is, and a changed
+# default in a role must not quietly change a live server. Everything
+# that is a property of one particular machine — which block device, for
+# instance — is not here; it belongs to the inventory that describes that
+# machine.
+
+# Where the registry is mounted.
+registry_root: /srv/registry
+
+# The subvolume that carries the registry. The volume can grow other
+# subvolumes later without any of them being served by accident.
+registry_storage_subvolume: "@registry"
+registry_storage_label: registry
+registry_storage_mount_options: >-
+  noatime,compress=zstd:3,nodev,nosuid,nofail,x-systemd.device-timeout=15s
+
+# Retention: at least the last ten publishes, and at least a week of
+# them. A snapshot has to fall outside both before it is deleted.
+registry_snapshot_keep_count: 10
+registry_snapshot_keep_days: 7

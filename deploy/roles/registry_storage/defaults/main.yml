@@ -1,0 +1,61 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the registry_storage role. See README.md next to this file
+# for what the role does with them.
+
+# The block device the registry filesystem lives on. Required — the role
+# refuses to run without it. Use a stable name (/dev/disk/by-id/...), not
+# a kernel name like /dev/sdb, which can change between boots.
+registry_storage_device: ""
+
+# Where the registry subvolume is mounted. This is the path everything
+# else in a packagetool deployment refers to, so it deliberately carries
+# no role prefix: the snapshot role, the web server and the rsync export
+# all have to be given the same value, and one name for it is the point.
+# Hence the exception from the linter's role-prefix rule.
+registry_root: /srv/registry  # noqa: var-naming[no-role-prefix]
+
+# Name of the subvolume that carries the registry. It is this subvolume
+# that gets mounted, never the volume root, so the same volume can carry
+# other subvolumes later on.
+registry_storage_subvolume: "@registry"
+
+# Filesystem label, used only when the role creates the filesystem.
+registry_storage_label: registry
+
+# Mount options for the registry subvolume. The subvol= option is added
+# by the role and must not be listed here.
+#
+#   noatime         a read from a mirror or a client should not write
+#   compress=zstd:3 the index documents and pages compress well; btrfs
+#                   skips data it finds incompressible, so the already
+#                   compressed package files cost little
+#   nodev,nosuid    nothing under the registry root is ever a device or
+#                   a program to execute
+#   nofail          a missing volume must not stop the server from
+#                   booting: without it, systemd drops into emergency
+#                   mode and there is no way in over the network
+#   x-systemd.device-timeout
+#                   how long boot waits for the device before nofail
+#                   takes effect
+registry_storage_mount_options: >-
+  noatime,compress=zstd:3,nodev,nosuid,nofail,x-systemd.device-timeout=15s
+
+# Owner and group of the registry tree. Root by default; set it to the
+# account that runs the publish pipeline if that account is not root.
+registry_storage_owner: root
+registry_storage_group: root
+
+# Whether the role may create a filesystem on a device that carries none.
+# A device that carries anything at all — a filesystem, a partition
+# table, an LVM or RAID signature — is never written to, whatever this is
+# set to. Set it to false to refuse even an empty device, for instance
+# when the filesystem is created outside Ansible.
+registry_storage_format_if_empty: true
+
+# Packages the role installs before it touches the device. Set to an
+# empty list if package installation is managed elsewhere.
+registry_storage_packages:
+  - btrfs-progs

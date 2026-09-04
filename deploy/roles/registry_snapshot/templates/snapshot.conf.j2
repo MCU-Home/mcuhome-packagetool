@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# Settings for packagetool-snapshot. The file is read as a shell
+# fragment, the way the files under /etc/default are, and the names are
+# the ones the Ansible roles use. Command-line options override what is
+# set here.
+
+registry_root={{ registry_root | quote }}
+registry_snapshot_keep_count={{ registry_snapshot_keep_count | int }}
+registry_snapshot_keep_days={{ registry_snapshot_keep_days | int }}

@@ -1,0 +1,79 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The tree inside the registry subvolume. Its shape is fixed, because the
+# web server, the rsync export, the publish pipeline and the mirror
+# export all have to agree on it:
+#
+#   working/       the working tree, a subvolume of its own, never served
+#   snapshots/     the read-only snapshots, one per publish
+#   mirror-sync/   dumps for official mirrors, filled by the mirror export
+#   placeholder/   an empty directory, only ever the docroot before the
+#                  first publish
+#   current        symlink to the directory that is served
+#
+# "working" is a subvolume rather than a plain directory because a
+# snapshot can only be taken of a subvolume. "current" exists from the
+# start so the servers have a valid docroot before anything is published;
+# an existing one is never touched, because it is what a running registry
+# is being served from.
+
+- name: Set owner and permissions on the registry root
+  ansible.builtin.file:
+    path: "{{ registry_root }}"
+    state: directory
+    owner: "{{ registry_storage_owner }}"
+    group: "{{ registry_storage_group }}"
+    mode: "0755"
+
+- name: Create the working subvolume
+  ansible.builtin.command:
+    argv:
+      - btrfs
+      - subvolume
+      - create
+      - "{{ registry_root }}/working"
+    creates: "{{ registry_root }}/working"
+
+- name: Set owner and permissions on the tree
+  ansible.builtin.file:
+    path: "{{ registry_root }}/{{ item }}"
+    state: directory
+    owner: "{{ registry_storage_owner }}"
+    group: "{{ registry_storage_group }}"
+    mode: "0755"
+  loop:
+    - working
+    - snapshots
+    - mirror-sync
+    - placeholder
+
+- name: Look at the docroot symlink
+  ansible.builtin.stat:
+    path: "{{ registry_root }}/current"
+    follow: false
+  register: registry_storage_current
+
+- name: Check the docroot is a symlink
+  ansible.builtin.assert:
+    that:
+      - registry_storage_current.stat.islnk | default(false)
+    fail_msg: >-
+      {{ registry_root }}/current exists and is not a symlink. The
+      publish mechanics switch the served tree by replacing that symlink,
+      so it cannot be a directory. Nothing was changed.
+    quiet: true
+  when: registry_storage_current.stat.exists
+
+# Relative on purpose: the target is resolved next to the symlink, so the
+# tree keeps working wherever it is mounted or copied to.
+- name: Point the docroot at the empty placeholder
+  ansible.builtin.file:
+    src: placeholder
+    dest: "{{ registry_root }}/current"
+    state: link
+    owner: "{{ registry_storage_owner }}"
+    group: "{{ registry_storage_group }}"
+    follow: false
+  when: not registry_storage_current.stat.exists

@@ -1,0 +1,127 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Makes sure the device carries a btrfs filesystem — and refuses to touch
+# it if it carries anything else.
+#
+# The rule this file implements: a filesystem is created only on a device
+# that a low-level probe finds completely empty. A device with a
+# filesystem, a partition table, or an LVM or RAID signature on it is
+# left exactly as it is and the run stops. An existing btrfs filesystem
+# is adopted as it is; the role adds a subvolume to it and never
+# reformats.
+
+- name: Install the btrfs tools
+  ansible.builtin.package:
+    name: "{{ registry_storage_packages }}"
+    state: present
+  when: registry_storage_packages | length > 0
+
+- name: Look at the block device
+  ansible.builtin.stat:
+    path: "{{ registry_storage_device }}"
+    follow: true
+  register: registry_storage_device_stat
+
+- name: Check the device exists and is a block device
+  ansible.builtin.assert:
+    that:
+      - registry_storage_device_stat.stat.exists
+      - registry_storage_device_stat.stat.isblk | default(false)
+    fail_msg: >-
+      {{ registry_storage_device }} is not a block device on this server.
+      Nothing was changed.
+    quiet: true
+
+# blkid -p is the low-level probe: it reads the device itself instead of
+# the cache, and reports filesystems, partition tables and container
+# signatures alike. It exits 2 when it finds nothing, which is the only
+# result that allows this role to write to the device.
+- name: Probe the device for anything already on it
+  ansible.builtin.command:
+    argv:
+      - blkid
+      - -p
+      - -o
+      - export
+      - "{{ registry_storage_device }}"
+  register: registry_storage_probe
+  changed_when: false
+  check_mode: false
+  failed_when: registry_storage_probe.rc not in [0, 2]
+
+- name: Sort out what the probe found
+  ansible.builtin.set_fact:
+    registry_storage_found_fs: >-
+      {{ (registry_storage_probe.stdout_lines | select('match', '^TYPE=')
+          | list | first | default('=')).split('=', 1)[1] }}
+    registry_storage_found_pt: >-
+      {{ (registry_storage_probe.stdout_lines | select('match', '^PTTYPE=')
+          | list | first | default('=')).split('=', 1)[1] }}
+
+- name: Refuse to touch a device that carries data
+  ansible.builtin.assert:
+    that:
+      - registry_storage_found_pt | length == 0
+      - registry_storage_found_fs in ['', 'btrfs']
+    fail_msg: >-
+      {{ registry_storage_device }} already carries data — the probe
+      reports the filesystem type '{{ registry_storage_found_fs }}' and
+      the partition table type '{{ registry_storage_found_pt }}'. This
+      role only ever creates a filesystem on a device that carries
+      nothing at all, and it only adopts an existing btrfs filesystem.
+      Nothing was changed — wipe the device by hand if that is really
+      what you want, or point registry_storage_device somewhere else.
+    quiet: true
+
+- name: Check a filesystem may be created
+  ansible.builtin.assert:
+    that:
+      - registry_storage_format_if_empty | bool
+    fail_msg: >-
+      {{ registry_storage_device }} carries no filesystem and
+      registry_storage_format_if_empty is false, so this role will not
+      create one. Nothing was changed.
+    quiet: true
+  when: registry_storage_found_fs | length == 0
+
+# No --force on purpose: mkfs.btrfs refuses to overwrite an existing
+# filesystem without it, which is the second net under the probe above.
+- name: Create the btrfs filesystem
+  ansible.builtin.command:
+    argv:
+      - mkfs.btrfs
+      - --label
+      - "{{ registry_storage_label }}"
+      - "{{ registry_storage_device }}"
+  when: registry_storage_found_fs | length == 0
+  changed_when: true
+
+- name: Read the filesystem UUID
+  ansible.builtin.command:
+    argv:
+      - blkid
+      - -o
+      - value
+      - -s
+      - UUID
+      - "{{ registry_storage_device }}"
+  register: registry_storage_uuid_probe
+  changed_when: false
+
+- name: Remember the filesystem UUID
+  ansible.builtin.set_fact:
+    registry_storage_uuid: "{{ registry_storage_uuid_probe.stdout | trim }}"
+
+# The UUID, not the device name, is what goes into /etc/fstab: it is the
+# filesystem's own identity and stays right even if the device is
+# attached somewhere else.
+- name: Check the filesystem UUID looks like one
+  ansible.builtin.assert:
+    that:
+      - registry_storage_uuid is match('^[0-9a-fA-F-]{36}$')
+    fail_msg: >-
+      Could not read a filesystem UUID from
+      {{ registry_storage_device }}.
+    quiet: true
