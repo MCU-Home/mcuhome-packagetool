@@ -1,0 +1,29 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the mirror_sync role. See README.md next to this file for
+# what the role does with them.
+
+# Where the registry is mounted. Shared with every other registry role,
+# so it deliberately carries no role prefix; all of them have to be given
+# the same value, and one name for it is the point. Hence the exception
+# from the linter's role-prefix rule.
+registry_root: /srv/registry  # noqa: var-naming[no-role-prefix]
+
+# Where the command and its settings go.
+mirror_sync_script_path: /usr/local/sbin/packagetool-mirror-sync
+mirror_sync_config_dir: /etc/packagetool
+mirror_sync_config_path: /etc/packagetool/mirror-sync.conf
+
+# There is deliberately no retention setting here. A dump is worth
+# keeping exactly as long as the snapshot it carries and the snapshot it
+# starts from both exist — anything else is a file no mirror could apply
+# — so the snapshot retention decides the dump retention, and the two
+# cannot be configured into disagreeing with each other.
+
+# Packages the role installs. Set to an empty list if package
+# installation is managed elsewhere.
+mirror_sync_packages:
+  - btrfs-progs
+  - jq

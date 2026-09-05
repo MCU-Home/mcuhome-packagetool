@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Functional test for packagetool-mirror-sync, against two real btrfs
+# filesystems in loopback images this script creates and throws away
+# again: one standing in for the registry, one for a mirror.
+#
+# What is checked: a full dump of the newest snapshot and a difference
+# per snapshot after the first; the chain index naming them with the
+# right parents, in order, with hashes that match the bytes on disk; only
+# the newest full dump kept; a difference dropped when the snapshot it
+# starts from is deleted, leaving the chain contiguous; a middle
+# snapshot disappearing instead of the oldest one, which must never get
+# a surviving dump relabelled with a parent it was not actually sent
+# against; a dry run changing nothing; and — the point of all of it — a
+# mirror that takes the full dump and then applies a difference with
+# btrfs receive ending up with exactly the origin's tree.
+#
+# Needs root, btrfs-progs and loop devices; exits 77 ("skipped") without
+# them.
+#
+#   sudo deploy/tests/mirror-sync
+
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+tool="$here/../roles/mirror_sync/files/packagetool-mirror-sync"
+
+failures=0
+checks=0
+
+note() { printf '%s\n' "$*"; }
+ok() {
+  checks=$((checks + 1))
+  printf '  ok    %s\n' "$1"
+}
+bad() {
+  checks=$((checks + 1))
+  failures=$((failures + 1))
+  printf '  FAIL  %s\n' "$1" >&2
+}
+same() {
+  if [ "$2" = "$3" ]; then
+    ok "$1"
+  else
+    bad "$1: expected '$3', got '$2'"
+  fi
+}
+true_that() {
+  if [ "$2" = true ]; then
+    ok "$1"
+  else
+    bad "$1"
+  fi
+}
+
+skip() {
+  printf 'SKIP: %s\n' "$*" >&2
+  exit 77
+}
+
+# --- prerequisites ---------------------------------------------------
+
+[ -x "$tool" ] || skip "$tool is not there or not executable"
+[ "$(id -u)" -eq 0 ] || skip "needs root: it creates loop devices and mounts filesystems"
+for binary in mkfs.btrfs btrfs losetup mount umount findmnt flock jq sha256sum; do
+  command -v "$binary" >/dev/null 2>&1 || skip "$binary is not installed"
+done
+
+# --- two throwaway btrfs filesystems ---------------------------------
+
+work_dir=""
+declare -a loop_devices=()
+declare -a mount_points=()
+
+# Invoked by the EXIT trap below, not from anywhere in the flow.
+# shellcheck disable=SC2317,SC2329
+cleanup() {
+  local index point device
+  for ((index = ${#mount_points[@]} - 1; index >= 0; index--)); do
+    point="${mount_points[index]}"
+    findmnt --mountpoint "$point" >/dev/null 2>&1 && umount "$point" || true
+  done
+  for device in ${loop_devices[@]+"${loop_devices[@]}"}; do
+    [ -b "$device" ] && losetup -d "$device" || true
+  done
+  [ -n "$work_dir" ] && [ -d "$work_dir" ] && rm -rf "$work_dir"
+  return 0
+}
+trap cleanup EXIT
+
+work_dir="$(mktemp -d)"
+
+# Sets made_mount rather than printing it: the loop device and the mount
+# point have to be recorded for the cleanup trap, and a command
+# substitution would record them in a subshell that is gone by the time
+# the trap runs.
+made_mount=""
+make_filesystem() {
+  local name=$1 point="$work_dir/$1" device
+  mkdir -p "$point"
+  truncate -s 1G "$work_dir/$name.image"
+  device="$(losetup --find --show "$work_dir/$name.image")"
+  loop_devices+=("$device")
+  mkfs.btrfs --label "$name" "$device" >/dev/null
+  mount -o noatime "$device" "$point"
+  mount_points+=("$point")
+  made_mount="$point"
+}
+
+make_filesystem origin
+origin_mount="$made_mount"
+make_filesystem mirror
+mirror_mount="$made_mount"
+note "origin at $origin_mount, mirror at $mirror_mount"
+
+registry="$origin_mount/registry"
+mkdir -p "$registry"
+btrfs subvolume create "$registry/working" >/dev/null
+mkdir -p "$registry/snapshots" "$registry/mirror-sync" "$registry/placeholder"
+ln -s placeholder "$registry/current"
+cat >"$registry/mirror-sync.conf" <<EOF
+registry_root='$registry'
+EOF
+
+dumps="$registry/mirror-sync"
+index="$dumps/index.json"
+
+# A read-only snapshot under a name of our choosing, so the chain can be
+# shown without waiting a second between publishes.
+take_snapshot() {
+  local root=$1 offset=$2 name
+  name="snapshot-$(date -u -d "$offset" +%Y%m%dT%H%M%SZ)"
+  btrfs subvolume snapshot -r "$root/working" "$root/snapshots/$name" >/dev/null
+  btrfs filesystem sync "$root" >/dev/null
+  printf '%s' "$name"
+}
+
+out=""
+err=""
+rc=0
+run_tool() {
+  out="$work_dir/stdout"
+  err="$work_dir/stderr"
+  set +e
+  "$tool" "$@" >"$out" 2>"$err"
+  rc=$?
+  set -e
+}
+
+dump_count() {
+  find "$dumps" -mindepth 1 -maxdepth 1 -type f -name "*.btrfs.dump" | wc -l
+}
+
+# --- one snapshot: a full dump and an empty chain --------------------
+
+note "one snapshot"
+echo "one" >"$registry/working/index.html"
+first="$(take_snapshot "$registry" "3 days ago")"
+
+run_tool --config "$registry/mirror-sync.conf"
+same "exit code" "$rc" 0
+true_that "the full dump is there" \
+  "$([ -f "$dumps/full-${first#snapshot-}.btrfs.dump" ] && echo true || echo false)"
+same "dumps on disk" "$(dump_count)" 1
+true_that "the chain index is valid JSON" \
+  "$(jq -e . "$index" >/dev/null 2>&1 && echo true || echo false)"
+same "the full dump names the newest snapshot" "$(jq -r '.full.snapshot' "$index")" "$first"
+same "the full dump has no parent" "$(jq -r '.full.parent' "$index")" null
+same "the chain is empty" "$(jq -r '.chain | length' "$index")" 0
+same "the recorded hash is the file's" \
+  "$(jq -r '.full.sha256' "$index")" \
+  "$(sha256sum "$dumps/$(jq -r '.full.file' "$index")" | cut -d' ' -f1)"
+same "the recorded size is the file's" \
+  "$(jq -r '.full.size' "$index")" \
+  "$(stat -c%s "$dumps/$(jq -r '.full.file' "$index")")"
+
+# --- a second snapshot: one difference -------------------------------
+
+note "a second snapshot"
+echo "two" >"$registry/working/index.html"
+second="$(take_snapshot "$registry" "2 days ago")"
+first_full="$dumps/full-${first#snapshot-}.btrfs.dump"
+
+run_tool --config "$registry/mirror-sync.conf"
+same "exit code" "$rc" 0
+same "the chain has one difference" "$(jq -r '.chain | length' "$index")" 1
+same "it is the new snapshot" "$(jq -r '.chain[0].snapshot' "$index")" "$second"
+same "it starts from the first one" "$(jq -r '.chain[0].parent' "$index")" "$first"
+same "the full dump moved to the newest snapshot" "$(jq -r '.full.snapshot' "$index")" "$second"
+true_that "the previous full dump is gone" \
+  "$([ ! -e "$first_full" ] && echo true || echo false)"
+same "dumps on disk: one full, one difference" "$(dump_count)" 2
+
+# --- a mirror bootstraps from the full dump --------------------------
+
+note "a mirror takes the full dump"
+mkdir -p "$mirror_mount/received"
+btrfs receive -f "$dumps/$(jq -r '.full.file' "$index")" "$mirror_mount/received" >/dev/null
+same "the mirror has the snapshot" \
+  "$([ -d "$mirror_mount/received/$second" ] && echo yes)" yes
+same "and its content" "$(cat "$mirror_mount/received/$second/index.html")" two
+
+# --- a third snapshot, and the mirror catches up ---------------------
+
+note "a third snapshot"
+echo "three" >"$registry/working/index.html"
+echo "extra" >"$registry/working/added.txt"
+third="$(take_snapshot "$registry" "1 day ago")"
+
+run_tool --config "$registry/mirror-sync.conf"
+same "exit code" "$rc" 0
+same "the chain has two differences" "$(jq -r '.chain | length' "$index")" 2
+same "in order" "$(jq -r '[.chain[].snapshot] | join(",")' "$index")" "$second,$third"
+same "contiguous" "$(jq -r '.chain[1].parent' "$index")" "$second"
+same "the full dump is the newest snapshot" "$(jq -r '.full.snapshot' "$index")" "$third"
+same "every recorded hash matches its file" \
+  "$(jq -r '[(.full), (.chain[])] | .[] | "\(.file) \(.sha256)"' "$index" |
+    while read -r file digest; do
+      [ "$(sha256sum "$dumps/$file" | cut -d' ' -f1)" = "$digest" ] || echo "$file"
+    done | wc -l)" 0
+
+note "the mirror applies the difference it is missing"
+difference="$(jq -r '.chain[] | select(.snapshot == "'"$third"'") | .file' "$index")"
+btrfs receive -f "$dumps/$difference" "$mirror_mount/received" >/dev/null
+same "the mirror has the new snapshot" \
+  "$([ -d "$mirror_mount/received/$third" ] && echo yes)" yes
+if diff -r "$registry/snapshots/$third" "$mirror_mount/received/$third" >/dev/null; then
+  ok "the mirror's tree is the origin's tree"
+else
+  bad "the mirror's tree differs from the origin's"
+fi
+same "the mirror kept the older snapshot too" \
+  "$(cat "$mirror_mount/received/$second/index.html")" two
+
+# --- a dry run changes nothing ---------------------------------------
+
+note "dry run"
+before="$(sha256sum "$index" | cut -d' ' -f1)"
+before_count="$(dump_count)"
+run_tool --config "$registry/mirror-sync.conf" --dry-run
+same "exit code" "$rc" 0
+same "the index is untouched" "$(sha256sum "$index" | cut -d' ' -f1)" "$before"
+same "no dump was added or removed" "$(dump_count)" "$before_count"
+
+# --- retention follows the snapshots ---------------------------------
+
+note "the oldest snapshot is deleted"
+btrfs subvolume delete "$registry/snapshots/$first" >/dev/null
+run_tool --config "$registry/mirror-sync.conf"
+same "exit code" "$rc" 0
+same "the difference that started from it is gone" \
+  "$([ -e "$dumps/$second.btrfs.dump" ] && echo present || echo gone)" gone
+same "the chain is what is left" "$(jq -r '[.chain[].snapshot] | join(",")' "$index")" "$third"
+same "and it still starts from a snapshot that exists" \
+  "$([ -d "$registry/snapshots/$(jq -r '.chain[0].parent' "$index")" ] && echo yes)" yes
+same "dumps on disk: one full, one difference" "$(dump_count)" 2
+
+# --- a run that has nothing new to do --------------------------------
+
+note "nothing new"
+before="$(sha256sum "$dumps/$third.btrfs.dump" | cut -d' ' -f1)"
+run_tool --config "$registry/mirror-sync.conf"
+same "exit code" "$rc" 0
+same "an existing dump is not rewritten" \
+  "$(sha256sum "$dumps/$third.btrfs.dump" | cut -d' ' -f1)" "$before"
+
+# --- a file in the dump area that is not a dump ----------------------
+
+note "a foreign file in the dump area"
+echo "not a dump" >"$dumps/README"
+run_tool --config "$registry/mirror-sync.conf"
+same "exit code" "$rc" 0
+true_that "it is still there" \
+  "$([ -f "$dumps/README" ] && echo true || echo false)"
+
+# --- no snapshot at all ----------------------------------------------
+
+note "a registry that has never published"
+empty="$origin_mount/empty"
+mkdir -p "$empty/snapshots" "$empty/mirror-sync"
+run_tool --root "$empty"
+same "exit code" "$rc" 0
+if grep -q "no snapshot to dump" "$out"; then
+  ok "the run says why it did nothing"
+else
+  bad "the run did not say why it did nothing"
+fi
+
+# --- a middle snapshot disappears -------------------------------------
+#
+# Retention only ever prunes the oldest snapshot, one at a time, and the
+# scenario above already covers that: the difference that started from
+# it goes with it, and the chain stays contiguous. A snapshot in the
+# MIDDLE can also disappear — a manual deletion, or a retention run that
+# continued past one it could not delete (still served, or a failed
+# delete). What must never happen: the surviving dump on the far side of
+# the gap getting relabelled with a parent it was never actually sent
+# against, because a mirror trusting that lie hits a btrfs receive error
+# on a chain this index vouched for.
+
+note "a middle snapshot disappears"
+gap_registry="$origin_mount/gap"
+mkdir -p "$gap_registry/snapshots" "$gap_registry/mirror-sync" "$gap_registry/placeholder"
+btrfs subvolume create "$gap_registry/working" >/dev/null
+ln -s placeholder "$gap_registry/current"
+cat >"$gap_registry/mirror-sync.conf" <<EOF
+registry_root='$gap_registry'
+EOF
+gap_dumps="$gap_registry/mirror-sync"
+gap_index="$gap_dumps/index.json"
+
+echo "gap a" >"$gap_registry/working/index.html"
+gap_a="$(take_snapshot "$gap_registry" "6 days ago")"
+echo "gap b" >"$gap_registry/working/index.html"
+gap_b="$(take_snapshot "$gap_registry" "5 days ago")"
+echo "gap c" >"$gap_registry/working/index.html"
+gap_c="$(take_snapshot "$gap_registry" "4 days ago")"
+
+run_tool --config "$gap_registry/mirror-sync.conf"
+same "exit code, healthy chain" "$rc" 0
+same "the chain has two differences" "$(jq -r '.chain | length' "$gap_index")" 2
+same "B really was sent against A" \
+  "$(jq -r '.chain[] | select(.snapshot == "'"$gap_b"'") | .parent' "$gap_index")" "$gap_a"
+same "C really was sent against B" \
+  "$(jq -r '.chain[] | select(.snapshot == "'"$gap_c"'") | .parent' "$gap_index")" "$gap_b"
+
+note "the middle snapshot B is deleted, not by retention but by hand"
+btrfs subvolume delete "$gap_registry/snapshots/$gap_b" >/dev/null
+
+run_tool --config "$gap_registry/mirror-sync.conf"
+same "exit code after B disappears" "$rc" 0
+gap_c_parent="$(jq -r --arg f "$gap_c.btrfs.dump" \
+  '((.chain // []) | map(select(.file == $f)) | .[0].parent) // "dropped"' "$gap_index")"
+if [ "$gap_c_parent" = dropped ]; then
+  ok "C's entry was dropped rather than relabelled"
+  true_that "its dump file is gone too" \
+    "$([ ! -e "$gap_dumps/$gap_c.btrfs.dump" ] && echo true || echo false)"
+  same "the chain ends before C" \
+    "$(jq -r '[.chain[].snapshot] | join(",")' "$gap_index")" ""
+else
+  same "C's entry never claims A is its parent" "$gap_c_parent" "$gap_b"
+  ok "the chain was rebuilt correctly instead of being dropped"
+fi
+if grep -q "a snapshot in between is gone" "$err"; then
+  ok "the run says why it dropped the entry"
+else
+  bad "the run did not explain the drop"
+fi
+
+note "a mirror can still replay the served chain end to end"
+mkdir -p "$mirror_mount/gap-received"
+btrfs receive -f "$gap_dumps/$(jq -r '.full.file' "$gap_index")" "$mirror_mount/gap-received" >/dev/null
+same "the mirror has the newest snapshot from the full dump" \
+  "$([ -d "$mirror_mount/gap-received/$gap_c" ] && echo yes)" yes
+if diff -r "$gap_registry/snapshots/$gap_c" "$mirror_mount/gap-received/$gap_c" >/dev/null; then
+  ok "the mirror's tree matches the origin's after the full dump alone"
+else
+  bad "the mirror's tree differs from the origin's"
+fi
+
+# Whichever way the chain came out (empty, or correctly rebuilt), every
+# difference it still lists has to be genuinely receivable in order —
+# that is the whole point of serving one.
+gap_receive_failed=false
+while IFS= read -r gap_diff_file; do
+  [ -n "$gap_diff_file" ] || continue
+  btrfs receive -f "$gap_dumps/$gap_diff_file" "$mirror_mount/gap-received" >/dev/null ||
+    gap_receive_failed=true
+done < <(jq -r '.chain[].file' "$gap_index")
+true_that "every listed difference applied without error" \
+  "$([ "$gap_receive_failed" = false ] && echo true || echo false)"
+gap_last_snapshot="$(jq -r 'if (.chain | length) > 0 then .chain[-1].snapshot else .full.snapshot end' \
+  "$gap_index")"
+if diff -r "$gap_registry/snapshots/$gap_last_snapshot" \
+  "$mirror_mount/gap-received/$gap_last_snapshot" >/dev/null; then
+  ok "the mirror ends up with exactly what the served chain promises"
+else
+  bad "the mirror's tree does not match the end of the served chain"
+fi
+
+# --- exit codes ------------------------------------------------------
+
+note "exit codes"
+run_tool --config "$registry/mirror-sync.conf" --nonsense
+same "unknown option" "$rc" 1
+run_tool --config "$work_dir/there-is-no-such-file"
+same "settings file that is not there" "$rc" 2
+run_tool --root "$work_dir/not-a-registry"
+same "registry root that is not there" "$rc" 2
+run_tool --root /
+same "the registry root may not be /" "$rc" 2
+
+# --- result ----------------------------------------------------------
+
+note ""
+if [ "$failures" -eq 0 ]; then
+  note "$checks checks, all passed"
+  exit 0
+fi
+note "$checks checks, $failures failed"
+exit 1

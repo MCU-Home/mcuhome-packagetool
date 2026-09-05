@@ -17,7 +17,10 @@ tests/          checks that run on a throwaway filesystem, not on a server
 The HTML pages a registry serves are not here: they are `../pages/`, next
 to the tool, because they are part of what is published rather than part
 of how a server is set up. Putting them into the working tree is the
-publish pipeline's job.
+publish pipeline's job, and `registry_publish` does it out of the
+checkout of this repository it installs on the server — so the tool, the
+reference verifier, the pages and the publishing configuration on a
+running registry are all one version of one tree.
 
 Nothing under `roles/` knows anything about a particular registry: every
 value it needs is a variable. `mcuhome/` is the other half — the settings
@@ -66,6 +69,8 @@ the docroot points at is never deleted.
 | `registry_web` | nginx, in a container, serving the tree on the loopback address: the full tree, the bootstrap subset, the mirror dumps. |
 | `registry_proxy` | Caddy, in a container: TLS, the host names, credentials where they are needed. |
 | `registry_rsync` | the anonymous read-only rsync export, native and started per connection. |
+| `registry_publish` | the publish pipeline: the tool in its own virtual environment, the account that signs, one command from "a release exists upstream" to "the mirror serves it", and the units that run it. |
+| `mirror_sync` | installs `packagetool-mirror-sync`: the btrfs dumps an official mirror follows, and the chain index that says how they fit together. |
 
 Each role has a README of its own next to it.
 
@@ -83,13 +88,47 @@ A playbook using all of them:
       - name: mirror.example.org
         bind: ["203.0.113.10", "2001:db8::10"]
         upstream: "127.0.0.1:8080"
+    registry_publish_version: main
+    registry_publish_publishing_config: /opt/packagetool/checkout/publishing.json
+    registry_publish_anchor: /opt/packagetool/checkout/anchor.json
   roles:
     - role: registry_storage
     - role: registry_snapshot
+    - role: mirror_sync
     - role: registry_web
     - role: registry_proxy
     - role: registry_rsync
+    - role: registry_publish
 ```
+
+`registry_publish` comes last of the registry roles: it calls the
+snapshot and the dump commands, and it is what gives the working tree to
+the account that signs. `registry_storage` deliberately leaves that one
+directory's ownership alone, because the account is created by
+`registry_publish` and cannot exist the first time the storage is laid
+down.
+
+## Publishing
+
+`registry_publish` installs one command and two units. A publish is
+
+```
+sudo systemctl start packagetool-publish.service
+```
+
+which discovers the releases the publishing configuration knows about,
+fetches the ones the registry has not recorded, checks them against the
+checksums the builds published beside them, records and signs them,
+verifies the result with the reference verifier, and only then snapshots,
+flips and generates the mirror dumps. Nothing upstream pushes; the server
+pulls, and the publisher key never leaves it.
+
+The same command with `--refresh` renews the signed documents instead of
+looking for releases and publishes the result the same way. That one is
+on a weekly timer, because expiry is what bounds a frozen mirror: a
+mirror serving a stale but validly signed copy is caught because the copy
+runs out. The timer for the publish is installed and switched off —
+publishing is a deliberate act.
 
 ## How the serving side fits together
 

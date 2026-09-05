@@ -1,0 +1,712 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Functional test for packagetool-publish, one whole publish cycle at a
+# time, against a real btrfs filesystem in a loopback image and a stand-in
+# forge served out of a directory on the loopback address.
+#
+# Nothing here is mocked below the pipeline: the sources are real sources
+# laid down by the tool with keys this run generates, the packages are
+# real files with real checksum sidecars, the signing is real signing, the
+# verification is the reference verifier, and the snapshots are real btrfs
+# snapshots. What is replaced is the forge and the network in front of it,
+# because the one thing a test must not depend on is somebody else's
+# release schedule.
+#
+# What is checked: an empty working tree gets the pages, the anchor and
+# the catalogue and is published; new releases are discovered, fetched,
+# checked against their sidecars, recorded, signed and verified; a family
+# of per-architecture packages gets its meta package once every member is
+# there; a source that is not laid down is reported and skipped rather
+# than failing the run; a second run is a no-op and takes no snapshot; a
+# draft release is ignored; a refresh renews the signed documents and
+# publishes them; an asset that does not match its checksum stops the run
+# with nothing recorded; and the whole repository's releases are asked
+# for exactly once per run however many sources are fed from it.
+#
+# The run creates a system account, so it re-executes itself in a private
+# mount namespace with a throwaway copy of /etc bound over the real one:
+# the machine it runs on is left exactly as it was, whether the run
+# finishes or not.
+#
+# Needs root, btrfs-progs, loop devices, jq, curl and a Python with this
+# repository installed — from $PACKAGETOOL_PYTHON, else the repository's
+# own .venv. Exits 77 ("skipped") without them.
+#
+#   sudo scripts/test registry-publish
+
+set -euo pipefail
+
+self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+here="$(dirname "$self")"
+repo="$(cd "$here/../.." && pwd)"
+tool="$here/../roles/registry_publish/files/packagetool-publish"
+snapshot_tool="$here/../roles/registry_snapshot/files/packagetool-snapshot"
+mirror_sync_tool="$here/../roles/mirror_sync/files/packagetool-mirror-sync"
+python="${PACKAGETOOL_PYTHON:-$repo/.venv/bin/python}"
+
+failures=0
+checks=0
+
+note() { printf '%s\n' "$*"; }
+ok() {
+  checks=$((checks + 1))
+  printf '  ok    %s\n' "$1"
+}
+bad() {
+  checks=$((checks + 1))
+  failures=$((failures + 1))
+  printf '  FAIL  %s\n' "$1" >&2
+}
+same() {
+  if [ "$2" = "$3" ]; then
+    ok "$1"
+  else
+    bad "$1: expected '$3', got '$2'"
+  fi
+}
+true_that() {
+  if [ "$2" = true ]; then
+    ok "$1"
+  else
+    bad "$1"
+  fi
+}
+
+skip() {
+  printf 'SKIP: %s\n' "$*" >&2
+  exit 77
+}
+
+# --- prerequisites ---------------------------------------------------
+
+[ -x "$tool" ] || skip "$tool is not there or not executable"
+[ -x "$snapshot_tool" ] || skip "$snapshot_tool is not there"
+[ -x "$mirror_sync_tool" ] || skip "$mirror_sync_tool is not there"
+[ -x "$python" ] || skip "$python is not there — set PACKAGETOOL_PYTHON or create the .venv"
+[ "$(id -u)" -eq 0 ] || skip "needs root: it creates a loop device, mounts a filesystem and adds an account"
+for binary in mkfs.btrfs btrfs losetup mount umount findmnt flock jq curl setpriv useradd groupadd unshare; do
+  command -v "$binary" >/dev/null 2>&1 || skip "$binary is not installed"
+done
+"$python" -c 'import mcuhome.packagetool' 2>/dev/null ||
+  skip "$python cannot import mcuhome.packagetool — install this repository into it"
+
+# --- a mount namespace of our own ------------------------------------
+#
+# The account this test needs must not land in the passwd file of the
+# machine the test runs on, and neither must the mount. An inherited
+# "already re-executed" flag cannot be trusted for that — a caller who
+# happens to have that variable set would make this bind the throwaway
+# /etc over the real one — so the namespace's own identity is compared
+# instead: the one read here is passed through, and the bind mounts only
+# happen once the identity differs, i.e. the exec really landed
+# somewhere new.
+
+current_mntns="$(readlink /proc/self/ns/mnt)"
+if [ -z "${REGISTRY_PUBLISH_TEST_PARENT_MNTNS:-}" ] ||
+  [ "$REGISTRY_PUBLISH_TEST_PARENT_MNTNS" = "$current_mntns" ]; then
+  export REGISTRY_PUBLISH_TEST_PARENT_MNTNS="$current_mntns"
+  exec unshare --mount --propagation private -- "$self" "$@"
+fi
+
+work_dir=""
+loop_device=""
+declare -a mount_points=()
+server_pid=""
+
+# Invoked by the EXIT trap below, not from anywhere in the flow.
+# shellcheck disable=SC2317,SC2329
+cleanup() {
+  local index point
+  if [ -n "$server_pid" ]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  for ((index = ${#mount_points[@]} - 1; index >= 0; index--)); do
+    point="${mount_points[index]}"
+    findmnt --mountpoint "$point" >/dev/null 2>&1 && umount "$point" || true
+  done
+  if [ -n "$loop_device" ] && [ -b "$loop_device" ]; then
+    losetup -d "$loop_device" || true
+  fi
+  if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
+    rm -rf "$work_dir"
+  fi
+  return 0
+}
+trap cleanup EXIT
+
+work_dir="$(mktemp -d)"
+# mktemp makes it 0700 and root owns it. Everything below is reached by
+# the unprivileged publishing account too — the registry, the keys, the
+# configuration, the stand-in forge — and a directory it cannot walk into
+# would make every one of those a permission error rather than a check.
+chmod 0755 "$work_dir"
+
+# The whole of /etc and not just passwd: useradd rewrites several files
+# there and renames temporary files over them, which a bind-mounted
+# *file* would refuse with EBUSY.
+mkdir -p "$work_dir/etc"
+cp -a /etc/. "$work_dir/etc/" 2>/dev/null || true
+[ -e "$work_dir/etc/passwd" ] || skip "could not copy /etc — the run could not be kept off this machine"
+mount --bind "$work_dir/etc" /etc
+mount_points+=(/etc)
+note "for the length of this run, /etc is a copy in $work_dir/etc"
+
+publisher_user=packagetool-publish
+groupadd --system "$publisher_user"
+useradd --system --no-create-home --shell /usr/sbin/nologin \
+  --gid "$publisher_user" --home-dir /nonexistent "$publisher_user"
+note "publishing account $publisher_user exists inside this namespace only"
+
+# --- the registry ----------------------------------------------------
+
+mount_point="$work_dir/mnt"
+mkdir -p "$mount_point"
+truncate -s 2G "$work_dir/image"
+loop_device="$(losetup --find --show "$work_dir/image")"
+mkfs.btrfs --label registry-test "$loop_device" >/dev/null
+mount -o noatime "$loop_device" "$mount_point"
+mount_points+=("$mount_point")
+
+registry="$mount_point/registry"
+mkdir -p "$registry/snapshots" "$registry/mirror-sync" "$registry/placeholder"
+btrfs subvolume create "$registry/working" >/dev/null
+ln -s placeholder "$registry/current"
+chown "$publisher_user:$publisher_user" "$registry/working"
+install -d -o "$publisher_user" -g "$publisher_user" -m 0700 "$registry/staging"
+
+working="$registry/working"
+note "registry at $registry"
+
+cat >"$work_dir/snapshot.conf" <<EOF
+registry_root='$registry'
+registry_snapshot_keep_count=10
+registry_snapshot_keep_days=7
+EOF
+cat >"$work_dir/mirror-sync.conf" <<EOF
+registry_root='$registry'
+EOF
+
+# The two commands the pipeline calls, wrapped so their settings files
+# are the throwaway ones rather than /etc/packagetool/.
+mkdir -p "$work_dir/bin"
+cat >"$work_dir/bin/packagetool-snapshot" <<EOF
+#!/usr/bin/env bash
+exec "$snapshot_tool" --config "$work_dir/snapshot.conf" "\$@"
+EOF
+cat >"$work_dir/bin/packagetool-mirror-sync" <<EOF
+#!/usr/bin/env bash
+exec "$mirror_sync_tool" --config "$work_dir/mirror-sync.conf" "\$@"
+EOF
+chmod 0755 "$work_dir/bin/packagetool-snapshot" "$work_dir/bin/packagetool-mirror-sync"
+
+# --- keys, anchor and two laid-down sources --------------------------
+
+keys="$work_dir/keys"
+mkdir -p "$keys"
+packagetool() { "$python" -m mcuhome.packagetool "$@"; }
+
+for name in root-1 root-2 root-3 publisher-1; do
+  packagetool keygen --dir "$keys" --name "$name" >/dev/null
+done
+anchor="$work_dir/anchor.json"
+packagetool anchor --threshold 2 --out "$anchor" \
+  --public "$keys/root-1.pub.json" "$keys/root-2.pub.json" "$keys/root-3.pub.json" >/dev/null
+
+for source in sdk tools; do
+  packagetool init \
+    --source "$working/$source" \
+    --root "$keys/root-1.pub.json" "$keys/root-2.pub.json" "$keys/root-3.pub.json" \
+    --threshold 2 \
+    --publisher "$keys/publisher-1.pub.json" \
+    --mirror "https://mirror.example.invalid/$source/" \
+    --root-key "$keys/root-1.pem" "$keys/root-2.pem" \
+    --publisher-key "$keys/publisher-1.pem" >/dev/null
+done
+chown -R "$publisher_user:$publisher_user" "$working"
+
+# Where the pipeline expects the publisher key: readable by the account
+# that signs and by nobody else.
+publisher_keys="$work_dir/publisher-keys"
+install -d -o "$publisher_user" -g "$publisher_user" -m 0500 "$publisher_keys"
+install -o "$publisher_user" -g "$publisher_user" -m 0400 \
+  "$keys/publisher-1.pem" "$publisher_keys/publisher-1.pem"
+
+# --- the stand-in forge ----------------------------------------------
+
+forge="$work_dir/forge"
+mkdir -p "$forge/repos/testowner/testrepo" "$forge/assets"
+requests="$work_dir/requests.log"
+: >"$requests"
+
+cat >"$work_dir/serve.py" <<'EOF'
+import http.server
+import socketserver
+import sys
+
+directory, logfile = sys.argv[1], sys.argv[2]
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *arguments, **keywords):
+        super().__init__(*arguments, directory=directory, **keywords)
+
+    def log_message(self, *arguments):
+        with open(logfile, "a", encoding="utf-8") as sink:
+            sink.write(self.path + "\n")
+
+
+with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+    print(server.server_address[1], flush=True)
+    server.serve_forever()
+EOF
+
+"$python" "$work_dir/serve.py" "$forge" "$requests" >"$work_dir/port" 2>"$work_dir/serve.err" &
+server_pid=$!
+port=""
+for _ in $(seq 1 50); do
+  port="$(head -1 "$work_dir/port" 2>/dev/null || true)"
+  [ -n "$port" ] && break
+  sleep 0.2
+done
+[ -n "$port" ] || skip "the stand-in forge did not start: $(cat "$work_dir/serve.err")"
+base="http://127.0.0.1:$port"
+note "stand-in forge on $base"
+
+# One release asset: a file with content, its checksum sidecar, and the
+# entry the release listing carries for it.
+make_asset() {
+  local tag=$1 name=$2 content=$3
+  mkdir -p "$forge/assets/$tag"
+  printf '%s' "$content" >"$forge/assets/$tag/$name"
+  (cd "$forge/assets/$tag" && sha256sum "$name" >"$name.sha256")
+}
+
+# The release listing, built from a list of "<tag>:<prerelease>:<draft>"
+# entries and whatever assets are on disk for each tag.
+write_releases() {
+  local entry tag prerelease draft
+  local releases='[]'
+  for entry in "$@"; do
+    IFS=: read -r tag prerelease draft <<<"$entry"
+    local assets='[]'
+    local file
+    while IFS= read -r file; do
+      [ -n "$file" ] || continue
+      assets=$(jq -c --arg name "$file" --arg url "$base/assets/$tag/$file" \
+        '. + [{name: $name, browser_download_url: $url}]' <<<"$assets")
+    done < <(find "$forge/assets/$tag" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+      LC_ALL=C sort)
+    releases=$(jq -c --arg tag "$tag" --argjson pre "$prerelease" --argjson draft "$draft" \
+      --argjson assets "$assets" \
+      '. + [{tag_name: $tag, prerelease: $pre, draft: $draft, assets: $assets}]' <<<"$releases")
+  done
+  printf '%s\n' "$releases" >"$forge/repos/testowner/testrepo/releases"
+}
+
+# --- what this registry publishes ------------------------------------
+
+publishing="$work_dir/publishing.json"
+cat >"$publishing" <<'EOF'
+{
+  "sources": {
+    "absent": {
+      "description": "A source that has never been laid down.",
+      "packages": [{"asset": "test-absent-*.tar.zst", "name": "test-absent"}],
+      "repository": "testowner/testrepo",
+      "title": "Absent"
+    },
+    "sdk": {
+      "description": "One package, no family.",
+      "packages": [{"asset": "test-sdk-*.tar.zst", "name": "test-sdk"}],
+      "repository": "testowner/testrepo",
+      "title": "Test SDK"
+    },
+    "tools": {
+      "description": "One package per platform, with a meta package over them.",
+      "meta": {
+        "members": {
+          "arch": {
+            "linux-amd64": "test-tools_linux-amd64",
+            "linux-arm64": "test-tools_linux-arm64"
+          }
+        },
+        "name": "test-tools"
+      },
+      "packages": [
+        {"asset": "test-tools_linux-amd64-*.tar.zst", "name": "test-tools_linux-amd64"},
+        {"asset": "test-tools_linux-arm64-*.tar.zst", "name": "test-tools_linux-arm64"}
+      ],
+      "repository": "testowner/testrepo",
+      "title": "Test tools"
+    }
+  },
+  "version": 3
+}
+EOF
+
+cat >"$work_dir/publish.conf" <<EOF
+registry_root='$registry'
+registry_publish_user='$publisher_user'
+registry_publish_group='$publisher_user'
+registry_publish_keys_dir='$publisher_keys'
+registry_publish_python='$python'
+registry_publish_checkout_dir='$repo'
+registry_publish_publishing_config='$publishing'
+registry_publish_anchor='$anchor'
+registry_publish_pages_dir='$repo/pages'
+registry_publish_tree_files='$anchor'
+registry_publish_github_api='$base'
+registry_publish_include_prereleases=true
+registry_publish_api_timeout=30
+registry_publish_download_timeout=120
+registry_publish_status_warning_is_failure=true
+registry_publish_snapshot_command='$work_dir/bin/packagetool-snapshot'
+registry_publish_mirror_sync_command='$work_dir/bin/packagetool-mirror-sync'
+EOF
+
+out=""
+err=""
+rc=0
+run_tool() {
+  out="$work_dir/stdout"
+  err="$work_dir/stderr"
+  : >"$requests"
+  set +e
+  "$tool" --config "$work_dir/publish.conf" "$@" >"$out" 2>"$err"
+  rc=$?
+  set -e
+}
+
+ran_clean() {
+  if [ "$rc" -eq 0 ]; then
+    ok "$1"
+    return
+  fi
+  bad "$1: the run exited $rc"
+  sed -e 's/^/    | /' "$out" "$err" >&2
+}
+
+snapshot_count() {
+  find "$registry/snapshots" -mindepth 1 -maxdepth 1 | wc -l
+}
+
+served() {
+  printf '%s' "$registry/current"
+}
+
+recorded() {
+  jq -e --arg p "$2" --arg v "$3" '((.packages // {})[$p] // {})[$v] != null' \
+    "$working/$1/index.json" >/dev/null 2>&1
+}
+
+# --- a first publish -------------------------------------------------
+
+note "a first publish"
+make_asset v1.0.0 test-sdk-1.0.0.tar.zst "sdk one"
+make_asset v1.0.0 test-tools_linux-amd64-1.0.0.tar.zst "tools amd64 one"
+make_asset v1.0.0 test-tools_linux-arm64-1.0.0.tar.zst "tools arm64 one"
+printf '{"declared": true}' >"$forge/assets/v1.0.0/test-sdk-1.0.0.tar.zst.build-environment.json"
+make_asset v9.9.9 test-sdk-9.9.9.tar.zst "a draft nobody released"
+write_releases "v1.0.0:true:false" "v9.9.9:false:true"
+
+run_tool
+ran_clean "exit code"
+
+true_that "the sdk package is recorded" \
+  "$(recorded sdk test-sdk 1.0.0 && echo true || echo false)"
+true_that "both tools packages are recorded" \
+  "$(recorded tools test-tools_linux-amd64 1.0.0 && recorded tools test-tools_linux-arm64 1.0.0 &&
+    echo true || echo false)"
+true_that "the meta package is recorded" \
+  "$(recorded tools test-tools 1.0.0 && echo true || echo false)"
+same "the meta entry names packages, not bytes" \
+  "$(jq -r '.packages["test-tools"]["1.0.0"] | has("file")' "$working/tools/index.json")" false
+true_that "the draft release was left alone" \
+  "$(recorded sdk test-sdk 9.9.9 && echo false || echo true)"
+
+same "the package file is in the source" \
+  "$(cat "$working/sdk/test-sdk-1.0.0.tar.zst")" "sdk one"
+true_that "so is its checksum sidecar" \
+  "$([ -f "$working/sdk/test-sdk-1.0.0.tar.zst.sha256" ] && echo true || echo false)"
+true_that "so is the declaration the build published beside it" \
+  "$([ -f "$working/sdk/test-sdk-1.0.0.tar.zst.build-environment.json" ] && echo true || echo false)"
+same "the recorded size is the file's" \
+  "$(jq -r '.packages["test-sdk"]["1.0.0"].size' "$working/sdk/index.json")" \
+  "$(stat -c%s "$working/sdk/test-sdk-1.0.0.tar.zst")"
+same "the recorded hash is the file's" \
+  "$(jq -r '.packages["test-sdk"]["1.0.0"].sha256' "$working/sdk/index.json")" \
+  "$(sha256sum "$working/sdk/test-sdk-1.0.0.tar.zst" | cut -d' ' -f1)"
+
+if grep -q "not laid down" "$err"; then
+  ok "the source that was never laid down is reported"
+else
+  bad "the source that was never laid down went unmentioned"
+fi
+true_that "and was not invented" \
+  "$([ ! -e "$working/absent" ] && echo true || echo false)"
+
+same "the pages are in the tree" \
+  "$(cmp -s "$repo/pages/index.html" "$working/index.html" && echo yes)" yes
+same "so is the anchor" \
+  "$(cmp -s "$anchor" "$working/anchor.json" && echo yes)" yes
+same "the catalogue lists every configured source" \
+  "$(jq -r '[.sources[].name] | join(",")' "$working/sources.json")" "absent,sdk,tools"
+
+note "what the run signed verifies"
+for source in sdk tools; do
+  if "$python" "$repo/verify.py" "$working/$source" --anchor "$anchor" >/dev/null 2>&1; then
+    ok "$source verifies against the anchor"
+  else
+    bad "$source does not verify against the anchor"
+  fi
+  if "$python" "$repo/verify.py" "$registry/current/$source" --anchor "$anchor" >/dev/null 2>&1; then
+    ok "$source verifies against the anchor on the served tree"
+  else
+    bad "$source does not verify against the anchor on the served tree"
+  fi
+done
+
+note "and it was published"
+same "a snapshot was taken" "$(snapshot_count)" 1
+first_snapshot="$(readlink "$(served)")"
+case $first_snapshot in
+snapshots/snapshot-*) ok "the docroot points at it ($first_snapshot)" ;;
+*) bad "the docroot points at '$first_snapshot'" ;;
+esac
+same "the served tree carries the package" \
+  "$(cat "$registry/current/sdk/test-sdk-1.0.0.tar.zst")" "sdk one"
+if echo tampered 2>/dev/null >"$registry/current/sources.json"; then
+  bad "the served snapshot is read-only"
+else
+  ok "the served snapshot is read-only"
+fi
+
+same "the chain index exists" \
+  "$([ -f "$registry/mirror-sync/index.json" ] && echo yes)" yes
+same "with a full dump of the snapshot that was just published" \
+  "$(jq -r '.full.snapshot' "$registry/mirror-sync/index.json")" \
+  "$(basename "$first_snapshot")"
+
+same "the whole repository was asked about once" \
+  "$(grep -c '^/repos/testowner/testrepo/releases' "$requests")" 1
+
+# --- a second run has nothing to do ----------------------------------
+
+note "a second run"
+run_tool
+ran_clean "exit code"
+if grep -q "nothing changed" "$out"; then
+  ok "the run says it had nothing to do"
+else
+  bad "the run did not say it had nothing to do"
+fi
+same "no second snapshot" "$(snapshot_count)" 1
+same "the docroot did not move" "$(readlink "$(served)")" "$first_snapshot"
+
+# --- a new release ---------------------------------------------------
+
+note "a new release"
+make_asset v1.1.0 test-sdk-1.1.0.tar.zst "sdk two"
+write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v9.9.9:false:true"
+
+run_tool
+ran_clean "exit code"
+true_that "the new version is recorded" \
+  "$(recorded sdk test-sdk 1.1.0 && echo true || echo false)"
+true_that "the old one is still there" \
+  "$(recorded sdk test-sdk 1.0.0 && echo true || echo false)"
+same "a second snapshot was taken" "$(snapshot_count)" 2
+second_snapshot="$(readlink "$(served)")"
+if [ "$second_snapshot" != "$first_snapshot" ]; then
+  ok "the docroot moved to it"
+else
+  bad "the docroot did not move"
+fi
+same "the chain now has a difference" \
+  "$(jq -r '.chain | length' "$registry/mirror-sync/index.json")" 1
+same "it starts from the first snapshot" \
+  "$(jq -r '.chain[0].parent' "$registry/mirror-sync/index.json")" \
+  "$(basename "$first_snapshot")"
+if "$python" "$repo/verify.py" "$working/sdk" --anchor "$anchor" >/dev/null 2>&1; then
+  ok "sdk still verifies"
+else
+  bad "sdk stopped verifying"
+fi
+if "$python" "$repo/verify.py" "$registry/current/sdk" --anchor "$anchor" >/dev/null 2>&1; then
+  ok "sdk still verifies on the served tree"
+else
+  bad "sdk stopped verifying on the served tree"
+fi
+
+# --- a partly released family ----------------------------------------
+
+note "a family where only one platform has been released"
+make_asset v2.0.0 test-tools_linux-amd64-2.0.0.tar.zst "tools amd64 two"
+write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v2.0.0:true:false" "v9.9.9:false:true"
+
+run_tool
+ran_clean "exit code"
+true_that "the platform that was released is recorded" \
+  "$(recorded tools test-tools_linux-amd64 2.0.0 && echo true || echo false)"
+true_that "the meta package waits for the other one" \
+  "$(recorded tools test-tools 2.0.0 && echo false || echo true)"
+if grep -q "waits for test-tools_linux-arm64 2.0.0" "$out"; then
+  ok "the run says what it is waiting for"
+else
+  bad "the run did not say what it is waiting for"
+fi
+
+note "and then the other platform arrives"
+make_asset v2.0.0 test-tools_linux-arm64-2.0.0.tar.zst "tools arm64 two"
+write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v2.0.0:true:false" "v9.9.9:false:true"
+
+run_tool
+ran_clean "exit code"
+true_that "the meta package is written now" \
+  "$(recorded tools test-tools 2.0.0 && echo true || echo false)"
+if "$python" "$repo/verify.py" "$working/tools" --anchor "$anchor" >/dev/null 2>&1; then
+  ok "tools verifies with the meta package in it"
+else
+  bad "tools stopped verifying"
+fi
+
+# --- members recorded, meta missing ----------------------------------
+#
+# What a run that stopped between the last member and the meta package
+# leaves behind. The next run finds nothing to fetch for that version, so
+# unless it looks at versions it is *not* missing, the family would stay
+# without its meta package for good and somebody would have to write it
+# by hand.
+
+note "a family whose members are recorded but whose meta package is not"
+make_asset v4.0.0 test-tools_linux-amd64-4.0.0.tar.zst "tools amd64 four"
+make_asset v4.0.0 test-tools_linux-arm64-4.0.0.tar.zst "tools arm64 four"
+write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v2.0.0:true:false" \
+  "v4.0.0:true:false" "v9.9.9:false:true"
+
+for arch in linux-amd64 linux-arm64; do
+  asset="test-tools_$arch-4.0.0.tar.zst"
+  cp "$forge/assets/v4.0.0/$asset" "$forge/assets/v4.0.0/$asset.sha256" "$working/tools/"
+  packagetool add \
+    --source "$working/tools" \
+    --name "test-tools_$arch" \
+    --version 4.0.0 \
+    --file "$asset" \
+    --sha256 "$(sha256sum "$working/tools/$asset" | cut -d' ' -f1)" \
+    --size "$(stat -c%s "$working/tools/$asset")" \
+    --publisher-key "$keys/publisher-1.pem" >/dev/null
+  sleep 1
+done
+chown -R "$publisher_user:$publisher_user" "$working/tools"
+true_that "the members are recorded and the meta package is not" \
+  "$(recorded tools test-tools_linux-amd64 4.0.0 && recorded tools test-tools_linux-arm64 4.0.0 &&
+    ! recorded tools test-tools 4.0.0 && echo true || echo false)"
+
+run_tool
+ran_clean "exit code"
+true_that "the run wrote the meta package it was missing" \
+  "$(recorded tools test-tools 4.0.0 && echo true || echo false)"
+if "$python" "$repo/verify.py" "$working/tools" --anchor "$anchor" >/dev/null 2>&1; then
+  ok "tools verifies afterwards"
+else
+  bad "tools stopped verifying"
+fi
+if "$python" "$repo/verify.py" "$registry/current/tools" --anchor "$anchor" >/dev/null 2>&1; then
+  ok "tools verifies afterwards on the served tree"
+else
+  bad "tools stopped verifying on the served tree"
+fi
+
+# --- a refresh -------------------------------------------------------
+
+note "a refresh"
+before_issued="$(jq -r '.issued' "$working/sdk/index.json")"
+before_snapshots="$(snapshot_count)"
+run_tool --refresh
+ran_clean "exit code"
+if [ "$(jq -r '.issued' "$working/sdk/index.json")" != "$before_issued" ]; then
+  ok "the signed documents were renewed"
+else
+  bad "the signed documents were not renewed"
+fi
+same "a snapshot was taken for it" "$(snapshot_count)" "$((before_snapshots + 1))"
+if "$python" "$repo/verify.py" "$working/sdk" --anchor "$anchor" >/dev/null 2>&1; then
+  ok "the renewed documents verify"
+else
+  bad "the renewed documents do not verify"
+fi
+same "the refresh asked the forge nothing" "$(grep -c '^/repos' "$requests" || true)" 0
+
+# --- a dry run -------------------------------------------------------
+
+note "a dry run"
+before_snapshots="$(snapshot_count)"
+before_index="$(sha256sum "$working/sdk/index.json" | cut -d' ' -f1)"
+run_tool --dry-run
+ran_clean "exit code"
+same "no snapshot" "$(snapshot_count)" "$before_snapshots"
+same "nothing signed" "$(sha256sum "$working/sdk/index.json" | cut -d' ' -f1)" "$before_index"
+
+# --- an asset that does not match its checksum -----------------------
+
+note "an asset that does not match its checksum"
+make_asset v3.0.0 test-sdk-3.0.0.tar.zst "sdk three"
+printf '%s  %s\n' "$(printf 'not these bytes' | sha256sum | cut -d' ' -f1)" \
+  test-sdk-3.0.0.tar.zst >"$forge/assets/v3.0.0/test-sdk-3.0.0.tar.zst.sha256"
+write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v2.0.0:true:false" \
+  "v3.0.0:true:false" "v4.0.0:true:false" "v9.9.9:false:true"
+before_snapshots="$(snapshot_count)"
+
+run_tool
+same "exit code" "$rc" 4
+if grep -q "does not match the checksum" "$err"; then
+  ok "the run says why it stopped"
+else
+  bad "the run did not say why it stopped"
+fi
+true_that "nothing was recorded" \
+  "$(recorded sdk test-sdk 3.0.0 && echo false || echo true)"
+true_that "the file did not reach the source" \
+  "$([ ! -e "$working/sdk/test-sdk-3.0.0.tar.zst" ] && echo true || echo false)"
+same "and nothing was published" "$(snapshot_count)" "$before_snapshots"
+
+# --- a run without a publisher key -----------------------------------
+
+note "a run with the publisher key taken away"
+mv "$publisher_keys/publisher-1.pem" "$work_dir/publisher-1.pem.away"
+run_tool
+same "exit code" "$rc" 2
+if grep -q "no publisher key" "$err"; then
+  ok "the run says what is missing"
+else
+  bad "the run did not say what is missing"
+fi
+mv "$work_dir/publisher-1.pem.away" "$publisher_keys/publisher-1.pem"
+chown "$publisher_user:$publisher_user" "$publisher_keys/publisher-1.pem"
+
+# --- exit codes ------------------------------------------------------
+
+note "exit codes"
+set +e
+"$tool" --config "$work_dir/publish.conf" --nonsense >/dev/null 2>&1
+rc=$?
+set -e
+same "unknown option" "$rc" 1
+set +e
+"$tool" --config "$work_dir/there-is-no-such-file" >/dev/null 2>&1
+rc=$?
+set -e
+same "settings file that is not there" "$rc" 2
+
+# --- result ----------------------------------------------------------
+
+note ""
+if [ "$failures" -eq 0 ]; then
+  note "$checks checks, all passed"
+  exit 0
+fi
+note "$checks checks, $failures failed"
+exit 1

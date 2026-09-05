@@ -1,0 +1,153 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the registry_publish role. See README.md next to this file
+# for what the role does with them.
+
+# Where the registry is mounted. Shared with every other registry role,
+# so it deliberately carries no role prefix; all of them have to be given
+# the same value, and one name for it is the point. Hence the exception
+# from the linter's role-prefix rule.
+registry_root: /srv/registry  # noqa: var-naming[no-role-prefix]
+
+# --- the account that signs -----------------------------------------------
+
+# The publisher key lives on this machine, so the identity that can read
+# it is the whole of what protects it from everything else running here.
+# A system account with no login, no home worth having and nothing else
+# to its name: it owns the working tree and the keys, and that is all it
+# owns. It never gets to create a snapshot or switch the served tree —
+# those need root and are run separately.
+registry_publish_user: packagetool-publish
+registry_publish_group: packagetool-publish
+
+# Where the publisher keys are expected, as PEM files. The role creates
+# the directory and never puts anything into it: keys are not deployment
+# material, and a role that fetched them would be the wrong place to
+# decide who may.
+registry_publish_keys_dir: /etc/packagetool/publisher-keys
+
+# --- the tool ------------------------------------------------------------
+
+# The tool runs from a checkout of its own repository in a virtual
+# environment of its own: the publish pipeline, the reference verifier
+# and the pages a registry serves all come out of the same tree, so there
+# is one version of them on the machine and one thing to move forward.
+# Nothing is installed into the system Python.
+registry_publish_home: /opt/packagetool
+registry_publish_checkout_dir: /opt/packagetool/checkout
+registry_publish_venv_dir: /opt/packagetool/venv
+registry_publish_repository: https://github.com/mcu-home/mcuhome-packagetool.git
+
+# Which revision to run: a commit, a tag, or a branch. Required — a
+# deployment that does not say which version of its publishing tool it
+# runs is a deployment nobody can reproduce.
+registry_publish_version: ""
+
+# Where the resolved revision is recorded, so an operator can see what is
+# installed without asking git.
+registry_publish_version_file: /opt/packagetool/installed-revision
+
+# --- what this registry publishes ----------------------------------------
+
+# The operational configuration: which upstream release feeds which
+# source, which packages that source carries, which meta package stands
+# for a family of them. Required.
+registry_publish_publishing_config: ""
+
+# The trust anchor every source is verified against after it has been
+# written. Required, and deliberately a file of the deployment's own
+# rather than something fetched: a verifier that downloaded its anchor
+# would only be checking that the host agrees with itself.
+registry_publish_anchor: ""
+
+# The browsable pages, installed into the working tree on every run. Each
+# file in this directory lands at the root of the served tree under its
+# own name. Empty means the registry serves no pages.
+registry_publish_pages_dir: "{{ registry_publish_checkout_dir }}/pages"
+
+# Anything else the served tree carries that is not part of a source, as
+# a space-separated list of paths on the server. The trust anchor belongs
+# here: it is published so a mirror operator or an auditor can compare it
+# against the one their tool already carries.
+registry_publish_tree_files: ""
+
+# Whether prereleases count. The versions a registry carries before its
+# first stable release are prereleases, and one that ignored them would
+# carry nothing at all.
+registry_publish_include_prereleases: true
+
+# Where the release listings come from. A different forge, or a stand-in
+# during a test, is this one value.
+registry_publish_github_api: https://api.github.com
+
+# How long a run may wait: for an answer about which releases exist, and
+# for one asset. Package files here are hundreds of megabytes, so the
+# second number is generous on purpose.
+registry_publish_api_timeout: 30
+registry_publish_download_timeout: 3600
+
+# Whether a document that is close to expiring makes the run fail after
+# everything else succeeded. It does by default, because the one document
+# a refresh cannot renew — the root-signed key set — needs an offline
+# ceremony arranged weeks ahead, and a warning nobody is paged about is a
+# warning nobody reads.
+registry_publish_status_warning_is_failure: true
+
+# --- what the pipeline calls ---------------------------------------------
+
+# Installed by registry_snapshot and mirror_sync. Named here rather than
+# assumed, so a deployment that puts them elsewhere still works.
+registry_publish_snapshot_command: /usr/local/sbin/packagetool-snapshot
+registry_publish_mirror_sync_command: /usr/local/sbin/packagetool-mirror-sync
+
+# --- where things go -----------------------------------------------------
+
+registry_publish_script_path: /usr/local/sbin/packagetool-publish
+registry_publish_config_dir: /etc/packagetool
+registry_publish_config_path: /etc/packagetool/publish.conf
+registry_publish_unit_dir: /etc/systemd/system
+
+# --- the units -----------------------------------------------------------
+
+registry_publish_service: packagetool-publish
+registry_publish_refresh_service: packagetool-refresh
+
+# How long a run may take before systemd gives up on it. Three hours: a
+# release set of several hundred megabytes has to be fetched, hashed,
+# signed, snapshotted and sent, and a publish that is killed halfway
+# leaves work for a person.
+registry_publish_unit_timeout: 10800
+
+# Publishing is a deliberate act, so the timer for it is installed and
+# left off: enabling it later is this one value. The refresh is the
+# opposite — expiry is what bounds a frozen mirror, and nobody should
+# have to remember it every week.
+registry_publish_timer_enabled: false
+registry_publish_on_calendar: "Mon *-*-* 05:17:00 UTC"
+registry_publish_refresh_timer_enabled: true
+registry_publish_refresh_on_calendar: "Mon *-*-* 04:17:00 UTC"
+
+# Persistent= catches a missed run up at the next boot instead of waiting
+# for the next scheduled moment. Right for the refresh, whose whole job is
+# to renew signatures before they expire: a server that was off over the
+# scheduled moment must not let that window slide by unnoticed. Wrong for
+# the publish timer while it stays disabled by default — a deliberately
+# skipped publish firing the moment the timer is later enabled would be a
+# publish nobody decided on.
+registry_publish_timer_persistent: false
+registry_publish_refresh_timer_persistent: true
+
+# Spread over a few minutes, so a fleet of registries does not ask the
+# same forge the same question in the same second.
+registry_publish_timer_randomized_delay: 900
+
+# Packages the role installs. Set to an empty list if package
+# installation is managed elsewhere.
+registry_publish_packages:
+  - ca-certificates
+  - curl
+  - git
+  - jq
+  - python3-venv

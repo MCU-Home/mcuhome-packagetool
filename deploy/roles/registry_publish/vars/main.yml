@@ -1,0 +1,23 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Derived structure rather than settings: the two runs the role installs
+# differ in three fields and nothing else, so they are one list here and
+# one template each instead of four near-identical files. Everything an
+# operator would want to change is in defaults/main.yml.
+
+registry_publish_runs:
+  - unit: "{{ registry_publish_service }}"
+    description: Publish new releases into the packagetool registry
+    arguments: []
+    on_calendar: "{{ registry_publish_on_calendar }}"
+    timer_enabled: "{{ registry_publish_timer_enabled }}"
+    timer_persistent: "{{ registry_publish_timer_persistent }}"
+  - unit: "{{ registry_publish_refresh_service }}"
+    description: Renew the packagetool registry's signed documents
+    arguments:
+      - --refresh
+    on_calendar: "{{ registry_publish_refresh_on_calendar }}"
+    timer_enabled: "{{ registry_publish_refresh_timer_enabled }}"
+    timer_persistent: "{{ registry_publish_refresh_timer_persistent }}"

@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# Persistent= is per run, not a blanket setting: the refresh exists to
+# keep signed documents from expiring, so it catches a missed run up at
+# the next boot rather than waiting a week — closing exactly the
+# frozen-mirror window the expiry dates are there to guard against. The
+# publish timer stays disabled by default, and a missed run of a
+# deliberate act must not fire on its own the moment somebody enables it
+# later — so it does not carry Persistent= while off.
+
+[Unit]
+Description={{ item.description }} (scheduled)
+Documentation=https://github.com/mcu-home/mcuhome-packagetool
+
+[Timer]
+OnCalendar={{ item.on_calendar }}
+RandomizedDelaySec={{ registry_publish_timer_randomized_delay }}
+Persistent={{ item.timer_persistent | bool | lower }}
+Unit={{ item.unit }}.service
+
+[Install]
+WantedBy=timers.target

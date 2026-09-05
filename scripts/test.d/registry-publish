@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# deploy/tests/registry-publish: whole publish cycles against a real
+# btrfs filesystem and a stand-in forge — discovery, checksums, signing,
+# verification, the snapshot and the flip, the mirror dumps, and the
+# refusals in between.
+#
+# The test needs root, btrfs-progs, loop devices, jq, curl and this
+# repository installed into its own .venv, and skips itself (exit 77)
+# when it cannot have them. A skip is not a pass, so this wrapper checks
+# the same prerequisites first and fails with what to do about it — a
+# gate that goes green because it never ran is worse than no gate.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+test_script="$root/deploy/tests/registry-publish"
+venv="$root/.venv"
+name="test.d/registry-publish"
+
+if [ ! -x "$test_script" ]; then
+  echo "$name: $test_script is not there or not executable." >&2
+  exit 1
+fi
+
+if [ ! -x "$venv/bin/python" ]; then
+  echo "$name: no .venv found. Create it first — see README, \"Development — how to work on this repository\"." >&2
+  exit 1
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "$name: needs root — it creates a loop device, mounts a filesystem and adds an account." >&2
+  echo "Run: sudo scripts/test registry-publish" >&2
+  exit 1
+fi
+
+missing=()
+for binary in mkfs.btrfs btrfs losetup mount umount findmnt flock jq curl setpriv useradd unshare; do
+  command -v "$binary" >/dev/null 2>&1 || missing+=("$binary")
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+  echo "$name: missing ${missing[*]}. Install btrfs-progs, util-linux, passwd, jq and curl first" >&2
+  echo "(e.g. apt install btrfs-progs util-linux passwd jq curl)." >&2
+  exit 1
+fi
+
+# Named rather than left to the test's own fallback, so the check runs
+# against this repository's environment even when it is invoked through
+# sudo with a different HOME and PATH.
+export PACKAGETOOL_PYTHON="$venv/bin/python"
+
+status=0
+"$test_script" "$@" || status=$?
+if [ "$status" -eq 77 ]; then
+  echo "$name: the test skipped itself although the prerequisites are met — see its" >&2
+  echo "SKIP message above. Treated as a failure, because a skipped check proves nothing." >&2
+  exit 1
+fi
+exit "$status"

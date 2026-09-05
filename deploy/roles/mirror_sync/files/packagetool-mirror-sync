@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# packagetool-mirror-sync — the dumps an official mirror follows.
+#
+# A registry is mirrorable with plain rsync by design, and that stays the
+# way anybody can mirror it. This is the other path: a mirror that runs
+# btrfs itself can take the tree over as snapshots instead of as files,
+# which costs a fraction of the transfer and gives the mirror the same
+# snapshot history the origin has.
+#
+# One run produces, out of the snapshots that exist:
+#
+#   snapshot-<ts>.btrfs.dump   the difference between a snapshot and the
+#                              one before it (btrfs send -p)
+#   full-<ts>.btrfs.dump       the newest snapshot on its own, for a
+#                              mirror that has nothing yet; only the
+#                              newest one is kept
+#   index.json                 the chain: which dump leads from which
+#                              snapshot to which, and the hash of each
+#
+# How a mirror uses it: HEAD index.json and watch ETag/Last-Modified. On
+# a change, GET it and look for the snapshot it already has. Found —
+# apply every dump after it, in order, with `btrfs receive`. Not found —
+# take the full dump and start again from there. Both paths are decided
+# from the index alone, so a mirror never has to guess and never has to
+# be told anything out of band.
+#
+# Retention needs no bounds of its own, and deliberately has none. A dump
+# is worth keeping exactly as long as the snapshot it carries and the
+# snapshot it starts from both still exist; everything else is a file no
+# mirror could ever apply. Because the snapshot retention decides which
+# snapshots exist, the dumps follow it exactly and the two cannot drift
+# apart.
+#
+# Everything is written to a temporary name and renamed into place, so a
+# mirror polling in the middle of a run gets the previous complete answer
+# rather than half of the next one — a dump named by the index is always
+# a dump that is finished.
+#
+# Exit codes:
+#   0  success
+#   1  usage error
+#   2  precondition not met: configuration, layout, or missing tools
+#   3  a dump could not be generated
+#   4  the chain index could not be written
+#   5  another run holds the lock
+#
+# Everything the run did goes to stdout, everything that went wrong or
+# was deliberately left alone goes to stderr.
+
+set -euo pipefail
+
+readonly PROGRAM_NAME=packagetool-mirror-sync
+
+readonly EXIT_USAGE=1
+readonly EXIT_PRECONDITION=2
+readonly EXIT_DUMP=3
+readonly EXIT_INDEX=4
+readonly EXIT_LOCKED=5
+
+readonly DEFAULT_CONFIG_FILE=/etc/packagetool/mirror-sync.conf
+readonly SNAPSHOT_PREFIX=snapshot-
+readonly SNAPSHOT_NAME_PATTERN='^snapshot-[0-9]{8}T[0-9]{6}Z$'
+readonly DUMP_SUFFIX=.btrfs.dump
+readonly INDEX_FILE=index.json
+
+# The chain index format this run writes. A mirror refusing a generation
+# it does not know is better than a mirror guessing at it.
+readonly INDEX_VERSION=1
+
+readonly INDEX_NOTE="\
+The dumps this registry's snapshots can be followed with. Apply the \
+dumps after the snapshot you already have, in the order they are listed; \
+if you have none of them, take the full dump and continue from its \
+snapshot. Every dump is a btrfs send stream, and its sha256 is the hash \
+of the stream as served."
+
+# Settings, in the order they are applied: these built-in values, then
+# the configuration file, then the command line. The names are the ones
+# the Ansible role uses.
+registry_root=/srv/registry
+
+config_file=$DEFAULT_CONFIG_FILE
+config_file_given=false
+dry_run=false
+quiet=false
+opt_root=
+
+snapshots_dir=
+dumps_dir=
+lock_file=
+
+# Removed by the exit trap if a run was interrupted between writing a
+# temporary file and renaming it into place.
+tmp_file=
+
+err() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+say() {
+  if [ "$quiet" = false ]; then
+    printf '%s\n' "$*"
+  fi
+}
+
+die() {
+  local code=$1
+  shift
+  err "$*"
+  exit "$code"
+}
+
+# Invoked by the EXIT trap, not from the flow.
+# shellcheck disable=SC2317,SC2329
+cleanup() {
+  if [ -n "$tmp_file" ] && [ -e "$tmp_file" ]; then
+    rm -f -- "$tmp_file"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: packagetool-mirror-sync [OPTIONS]
+
+Generates the btrfs dumps official mirrors follow — one difference per
+snapshot, one full dump of the newest — and rewrites the chain index that
+says how they fit together.
+
+Options:
+  --config PATH    settings file to read (default /etc/packagetool/mirror-sync.conf)
+  --root PATH      registry root (default /srv/registry)
+  --dry-run        report what a run would do; changes nothing, takes no lock
+  --quiet          report only problems
+  --help           this text
+
+Needs root: btrfs send does.
+
+Exit codes: 0 success, 1 usage, 2 precondition, 3 dump, 4 index,
+5 locked.
+EOF
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+    --config)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--config needs a path"
+      config_file=$2
+      config_file_given=true
+      shift 2
+      ;;
+    --root)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--root needs a path"
+      opt_root=$2
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --quiet)
+      quiet=true
+      shift
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "$EXIT_USAGE" "unknown option $1"
+      ;;
+    esac
+  done
+}
+
+load_config() {
+  if [ "$config_file_given" = true ] && [ ! -r "$config_file" ]; then
+    die "$EXIT_PRECONDITION" "cannot read the settings file $config_file"
+  fi
+  if [ -r "$config_file" ]; then
+    # A root-owned shell fragment, read the way the files under
+    # /etc/default are read.
+    # shellcheck source=/dev/null
+    . "$config_file"
+  fi
+  if [ -n "$opt_root" ]; then
+    registry_root=$opt_root
+  fi
+}
+
+validate_config() {
+  case $registry_root in
+  /*) ;;
+  *) die "$EXIT_PRECONDITION" "the registry root must be an absolute path, not '$registry_root'" ;;
+  esac
+  while [ "$registry_root" != / ] && [ "${registry_root%/}" != "$registry_root" ]; do
+    registry_root=${registry_root%/}
+  done
+  if [ "$registry_root" = / ]; then
+    die "$EXIT_PRECONDITION" "the registry root must not be /"
+  fi
+
+  snapshots_dir=$registry_root/snapshots
+  dumps_dir=$registry_root/mirror-sync
+  lock_file=$registry_root/.mirror-sync.lock
+}
+
+check_preconditions() {
+  local tool
+  for tool in btrfs flock jq sha256sum find stat date mv; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      die "$EXIT_PRECONDITION" "$tool is not installed"
+    fi
+  done
+  if [ "$(id -u)" -ne 0 ]; then
+    die "$EXIT_PRECONDITION" "this command has to run as root — btrfs send does"
+  fi
+  if [ ! -d "$snapshots_dir" ]; then
+    die "$EXIT_PRECONDITION" \
+      "the snapshot area $snapshots_dir does not exist — set the registry storage up first"
+  fi
+  if [ ! -d "$dumps_dir" ]; then
+    die "$EXIT_PRECONDITION" "the dump area $dumps_dir does not exist"
+  fi
+}
+
+take_lock() {
+  exec 9>"$lock_file" || die "$EXIT_PRECONDITION" "cannot open the lock file $lock_file"
+  if ! flock -n 9; then
+    die "$EXIT_LOCKED" "another $PROGRAM_NAME run is working on $registry_root"
+  fi
+}
+
+# The snapshots that exist, oldest first. The names carry an ISO 8601
+# basic timestamp, so plain text order is chronological order.
+list_snapshots() {
+  local name
+  while IFS= read -r name; do
+    if [[ $name =~ $SNAPSHOT_NAME_PATTERN ]]; then
+      printf '%s\n' "$name"
+    fi
+  done < <(find "$snapshots_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+}
+
+# The parent a dump was actually generated against, read from the index
+# already on disk. A dump's parent is immutable once it exists: it says
+# what the stream inside it needs, and recomputing it from today's
+# snapshot adjacency would relabel it the moment a snapshot in between
+# has since disappeared — exactly the lie a mirror must never be told.
+previous_parent_for() {
+  local file=$1
+  [ -f "$dumps_dir/$INDEX_FILE" ] || return 0
+  jq -r --arg f "$file" \
+    '((.chain // []) | map(select(.file == $f)) | .[0].parent) // empty' \
+    "$dumps_dir/$INDEX_FILE" 2>/dev/null || true
+}
+
+# The hash of a dump. Dumps are written once and never rewritten, so a
+# hash the previous index already recorded for a file of the same name
+# and the same size is the hash of the same bytes — and recomputing it
+# would mean reading every gigabyte of every dump on every publish.
+digest_of() {
+  local file=$1 size known=""
+  size=$(stat -c%s "$dumps_dir/$file")
+  if [ -f "$dumps_dir/$INDEX_FILE" ]; then
+    known=$(jq -r --arg f "$file" --argjson s "$size" '
+      [ (.full // empty) ] + ((.chain // []))
+      | map(select(.file == $f and .size == $s and (.sha256 | type == "string")))
+      | (first | .sha256) // ""' "$dumps_dir/$INDEX_FILE" 2>/dev/null || true)
+  fi
+  if [ -n "$known" ]; then
+    printf '%s' "$known"
+    return 0
+  fi
+  sha256sum "$dumps_dir/$file" | cut -d' ' -f1
+}
+
+# One dump, written to a temporary name and renamed into place, so a
+# mirror never sees a partial stream under a name the index will use.
+send_dump() {
+  local target=$1
+  shift
+  tmp_file=$dumps_dir/.$target.tmp
+  rm -f -- "$tmp_file"
+  if ! btrfs send -f "$tmp_file" "$@" 2>&1 | sed 's/^/    /' >&2; then
+    rm -f -- "$tmp_file"
+    tmp_file=
+    return 1
+  fi
+  chmod 0644 "$tmp_file"
+  if ! mv -f -- "$tmp_file" "$dumps_dir/$target"; then
+    rm -f -- "$tmp_file"
+    tmp_file=
+    return 1
+  fi
+  tmp_file=
+  return 0
+}
+
+# A run that gets SIGKILLed between opening a temporary file and renaming
+# it leaves it behind under its ".<name>.tmp" name — a name the cleanup
+# below never matches, because a dump is only ever removed once it is a
+# real ".btrfs.dump" file. Nothing reads a "*.tmp" file and no index ever
+# names one, so anything old enough to no longer belong to a run that
+# could still be in flight is safe to remove outright. The margin only
+# has to outlast one dump: a lock is held for the whole run, so nothing
+# but a genuinely abandoned file survives long enough to be found here.
+readonly STALE_TMP_MINUTES=60
+
+remove_stale_tmp_files() {
+  local file
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if [ "$dry_run" = true ]; then
+      say "would remove stale $file (left behind by an interrupted run)"
+    else
+      rm -f -- "$dumps_dir/$file"
+      say "removed stale $file (left behind by an interrupted run)"
+    fi
+  done < <(find "$dumps_dir" -mindepth 1 -maxdepth 1 -type f \
+    -name '.*.tmp' -mmin "+$STALE_TMP_MINUTES" -printf '%f\n' | LC_ALL=C sort)
+}
+
+main() {
+  trap cleanup EXIT
+  parse_args "$@"
+  load_config
+  validate_config
+  check_preconditions
+
+  local -a snapshots=()
+  local name
+  while IFS= read -r name; do
+    snapshots+=("$name")
+  done < <(list_snapshots)
+
+  if [ ${#snapshots[@]} -eq 0 ]; then
+    say "no snapshot to dump"
+    return 0
+  fi
+
+  if [ "$dry_run" = false ]; then
+    take_lock
+  fi
+
+  remove_stale_tmp_files
+
+  local newest=${snapshots[-1]}
+  local stamp index parent child dump full_dump entry entry_parent
+  local -a chain=()
+
+  # --- the differences ------------------------------------------------
+  # One per snapshot that has a predecessor. Only missing ones are
+  # generated: a dump is written once, and regenerating one would rewrite
+  # a file mirrors may be reading.
+  for ((index = 1; index < ${#snapshots[@]}; index++)); do
+    parent=${snapshots[index - 1]}
+    child=${snapshots[index]}
+    dump=$child$DUMP_SUFFIX
+    entry_parent=
+    if [ -f "$dumps_dir/$dump" ]; then
+      # Reusing an existing dump: its parent is immutable, whatever it
+      # was actually sent against — never recomputed from today's
+      # adjacency, which a vanished snapshot in between would get wrong.
+      entry_parent=$(previous_parent_for "$dump")
+      if [ -z "$entry_parent" ]; then
+        err "$dump exists but the previous index names no parent for it, assuming $parent"
+        entry_parent=$parent
+      fi
+    elif [ "$dry_run" = true ]; then
+      say "would send $child against $parent"
+    else
+      say "sending $child against $parent"
+      send_dump "$dump" -p "$snapshots_dir/$parent" "$snapshots_dir/$child" ||
+        die "$EXIT_DUMP" "could not send $child against $parent"
+      # The parent this dump was just created against, captured here at
+      # creation time rather than re-derived later from adjacency.
+      entry_parent=$parent
+    fi
+    if [ "$dry_run" = false ] && [ -f "$dumps_dir/$dump" ]; then
+      chain+=("$child"$'\t'"$entry_parent"$'\t'"$dump")
+    fi
+  done
+
+  # --- the full dump of the newest snapshot ---------------------------
+  stamp=${newest#"$SNAPSHOT_PREFIX"}
+  full_dump=full-$stamp$DUMP_SUFFIX
+  if [ ! -f "$dumps_dir/$full_dump" ]; then
+    if [ "$dry_run" = true ]; then
+      say "would send $newest in full"
+    else
+      say "sending $newest in full"
+      send_dump "$full_dump" "$snapshots_dir/$newest" ||
+        die "$EXIT_DUMP" "could not send $newest in full"
+    fi
+  fi
+
+  # --- contiguity: the served chain must be an unbroken line ----------
+  # A dump's parent is now immutable (captured above, never recomputed),
+  # so it can only ever describe the truth. What can still go stale is
+  # which snapshot that truth points at: if a middle snapshot disappeared
+  # (retention "continue" on one still served or one whose delete failed,
+  # or a manual removal), a surviving dump's real parent is simply not
+  # there for a mirror to already have, and the entry no longer connects
+  # to anything this index can vouch for. Walk the chain oldest first and
+  # cut at the first parent nothing accounts for — the preceding entry's
+  # own snapshot, or, for the very first entry, the oldest snapshot this
+  # run still finds on disk. Everything after the cut necessarily hangs
+  # off the same gap, so it goes too. The newest snapshot stays reachable
+  # regardless: the full dump covers it on its own, independent of any
+  # chain entry.
+  if [ "$dry_run" = false ] && [ ${#chain[@]} -gt 0 ]; then
+    local -a contiguous_chain=()
+    local expected=${snapshots[0]} broken=false centry cchild cparent cfile
+    for centry in "${chain[@]}"; do
+      IFS=$'\t' read -r cchild cparent cfile <<<"$centry"
+      if [ "$broken" = false ] && [ "$cparent" = "$expected" ]; then
+        contiguous_chain+=("$centry")
+        expected=$cchild
+      else
+        broken=true
+        err "dropping $cfile from the chain: its recorded parent $cparent is not $expected — a snapshot in between is gone"
+      fi
+    done
+    chain=(${contiguous_chain[@]+"${contiguous_chain[@]}"})
+  fi
+
+  # --- what no mirror could apply any more ----------------------------
+  # A difference whose snapshot or whose starting point is gone (now
+  # including one the contiguity check above just dropped), and every
+  # full dump but the newest one. Decided here, while the chain is final,
+  # but not deleted yet: a mirror polling in the window between this
+  # decision and the new index landing must still find every file the
+  # OLD index named. The files themselves are only removed once the new
+  # index is safely in place.
+  local -a obsolete=()
+  local file kept
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    kept=false
+    case $file in
+    full-*"$DUMP_SUFFIX")
+      if [ "$file" = "$full_dump" ]; then
+        kept=true
+      fi
+      ;;
+    "$SNAPSHOT_PREFIX"*"$DUMP_SUFFIX")
+      child=${file%"$DUMP_SUFFIX"}
+      for entry in ${chain[@]+"${chain[@]}"}; do
+        if [ "${entry%%$'\t'*}" = "$child" ]; then
+          kept=true
+        fi
+      done
+      ;;
+    *)
+      err "leaving $file alone, it is not a dump this command wrote"
+      continue
+      ;;
+    esac
+    if [ "$kept" = false ]; then
+      obsolete+=("$file")
+    fi
+  done < <(find "$dumps_dir" -mindepth 1 -maxdepth 1 -type f -name "*$DUMP_SUFFIX" \
+    -printf '%f\n' | LC_ALL=C sort)
+
+  if [ "$dry_run" = true ]; then
+    for file in ${obsolete[@]+"${obsolete[@]}"}; do
+      say "would remove $file"
+    done
+    say "would rewrite $dumps_dir/$INDEX_FILE"
+    return 0
+  fi
+
+  # --- the chain index ------------------------------------------------
+  local entries='[]' size digest
+  for entry in ${chain[@]+"${chain[@]}"}; do
+    IFS=$'\t' read -r child parent dump <<<"$entry"
+    size=$(stat -c%s "$dumps_dir/$dump")
+    digest=$(digest_of "$dump")
+    entries=$(jq -c \
+      --arg snapshot "$child" --arg parent "$parent" --arg file "$dump" \
+      --arg sha256 "$digest" --argjson size "$size" \
+      '. + [{snapshot: $snapshot, parent: $parent, file: $file, sha256: $sha256, size: $size}]' \
+      <<<"$entries") || die "$EXIT_INDEX" "could not build the chain entry for $dump"
+  done
+
+  size=$(stat -c%s "$dumps_dir/$full_dump")
+  digest=$(digest_of "$full_dump")
+
+  tmp_file=$dumps_dir/.$INDEX_FILE.tmp
+  jq -n \
+    --argjson version "$INDEX_VERSION" \
+    --arg note "$INDEX_NOTE" \
+    --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg snapshot "$newest" --arg file "$full_dump" \
+    --arg sha256 "$digest" --argjson size "$size" \
+    --argjson chain "$entries" \
+    '{
+       version: $version,
+       note: $note,
+       generated: $generated,
+       full: {snapshot: $snapshot, parent: null, file: $file, sha256: $sha256, size: $size},
+       chain: $chain
+     }' >"$tmp_file" || die "$EXIT_INDEX" "could not write the chain index"
+  chmod 0644 "$tmp_file"
+  # A rename, so a mirror polling right now reads the previous index or
+  # this one and never a torn file.
+  mv -f -- "$tmp_file" "$dumps_dir/$INDEX_FILE" ||
+    die "$EXIT_INDEX" "could not put the chain index in place"
+  tmp_file=
+
+  # Only now, with the new index in place, can a file the old index
+  # named safely disappear: a mirror polling in between always found
+  # every dump either index promised.
+  for file in ${obsolete[@]+"${obsolete[@]}"}; do
+    rm -f -- "$dumps_dir/$file"
+    say "removed $file"
+  done
+
+  local count=${#chain[@]}
+  say "chain index: 1 full dump of $newest, $count difference(s)"
+}
+
+main "$@"

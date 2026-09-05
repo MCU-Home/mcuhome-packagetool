@@ -1,0 +1,89 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Installs packagetool-mirror-sync, the command that turns the registry's
+# snapshots into the btrfs dumps an official mirror follows, and the
+# chain index that says how they fit together.
+#
+# The role installs the command and its settings; it never runs it for
+# real. Dumps are made when a publish makes a snapshot, and the publish
+# pipeline is what calls this — a configuration run that generated a
+# gigabyte of dumps would be a configuration run nobody dares repeat.
+#
+# It expects the registry_storage role to have run: the command checks
+# the layout it is pointed at and refuses to work on anything else.
+
+- name: Check the mirror-sync settings
+  ansible.builtin.assert:
+    that:
+      - registry_root | default('', true) is match('^/.+')
+      - mirror_sync_script_path | default('', true) is match('^/.+')
+      - mirror_sync_config_path | default('', true) is match('^/.+')
+    fail_msg: >-
+      registry_root, mirror_sync_script_path and mirror_sync_config_path
+      must all be absolute paths.
+    quiet: true
+
+- name: Install what the dumps need
+  ansible.builtin.package:
+    name: "{{ mirror_sync_packages }}"
+    state: present
+  when: mirror_sync_packages | length > 0
+
+- name: Create the settings directory
+  ansible.builtin.file:
+    path: "{{ mirror_sync_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the mirror-sync command
+  ansible.builtin.copy:
+    src: packagetool-mirror-sync
+    dest: "{{ mirror_sync_script_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the mirror-sync settings
+  ansible.builtin.template:
+    src: mirror-sync.conf.j2
+    dest: "{{ mirror_sync_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# The storage role lays the registry tree down, this role only insists
+# that the part of it the dumps live in is there and is readable by the
+# web server that serves them. On a machine where the storage has not
+# been set up yet, everything below is skipped rather than invented.
+- name: Look for the dump area
+  ansible.builtin.stat:
+    path: "{{ registry_root }}/snapshots"
+  register: mirror_sync_layout
+
+- name: Set owner and permissions on the dump area
+  ansible.builtin.file:
+    path: "{{ registry_root }}/mirror-sync"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: mirror_sync_layout.stat.exists
+
+# Proof that what was just installed works on this server: a dry run
+# reads the settings file, checks the layout, and reports which dumps a
+# real run would generate — without sending, removing or rewriting
+# anything.
+- name: Check the installed command accepts the layout
+  ansible.builtin.command:
+    argv:
+      - "{{ mirror_sync_script_path }}"
+      - --config
+      - "{{ mirror_sync_config_path }}"
+      - --dry-run
+      - --quiet
+  changed_when: false
+  when: mirror_sync_layout.stat.exists

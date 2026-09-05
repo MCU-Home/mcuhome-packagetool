@@ -1,0 +1,923 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# packagetool-publish — one command that takes the registry from "a new
+# release exists upstream" to "the mirror serves it".
+#
+# The server pulls. Nothing upstream pushes into the registry and nothing
+# outside this machine holds a key that could: a run asks the forge which
+# releases exist, fetches the assets it does not have yet over plain
+# HTTPS, checks them against the checksum the build published beside
+# them, records them in the source with the publisher key that lives
+# here, verifies the result with the reference verifier, and only then
+# takes a snapshot and switches the served tree onto it.
+#
+# One run does all sources at once. A release set that spans several
+# sources — an SDK, its build tools and its workspace — becomes one
+# snapshot and one flip, because a client that pins a version has to find
+# every part of it at the same moment.
+#
+# The same run with --refresh renews the signed documents instead of
+# looking for new releases. Expiry is what bounds a freeze: a mirror
+# serving a stale but validly signed copy is caught because the copy runs
+# out. Re-signing on a timer is the price, and a refresh is otherwise
+# exactly a publish — verify, snapshot, flip, dumps.
+#
+# Phases and who runs them:
+#
+#   discover        the publishing account   what exists upstream
+#   download        the publishing account   assets and their checksums
+#   record          the publishing account   packagetool add/add-meta,
+#                                            signing with the publisher key
+#   assemble        the publishing account   pages, extra tree files,
+#                                            sources.json
+#   verify          the publishing account   verify.py per source
+#   publish         root                     packagetool-snapshot
+#   dumps           root                     packagetool-mirror-sync
+#
+# The split is the point. Everything that touches the network, the
+# downloaded bytes and the publisher key runs as an unprivileged account
+# that owns nothing but the working tree and the keys; only the two steps
+# that genuinely need CAP_SYS_ADMIN — creating a read-only btrfs
+# snapshot, and sending it — run as root, and neither of them can be
+# reached with anything a download influenced.
+#
+# Idempotent by construction. A version already recorded in a source is
+# never recorded again (and the tool would refuse: a published version is
+# immutable), a tree file that already has the right content is not
+# rewritten, and a run that changed nothing takes no snapshot and
+# generates no dumps.
+#
+# A source that is not laid down yet is reported and skipped, not an
+# error. Creating a source needs the offline root keys, which are
+# deliberately not on this machine, so an empty working tree is a state
+# this command has to survive rather than fix.
+#
+# Exit codes:
+#   0  success
+#   1  usage error
+#   2  precondition not met: configuration, layout, missing tools
+#   3  the forge could not be asked which releases exist
+#   4  an asset could not be fetched, or did not match its checksum
+#   5  a package could not be recorded
+#   6  the published result did not verify
+#   7  the snapshot, the docroot switch or the dumps failed
+#   8  everything succeeded, but a document is close to expiry
+#   9  another run holds the lock
+#
+# Everything the run did goes to stdout, everything that went wrong or
+# was deliberately left alone goes to stderr.
+
+set -euo pipefail
+
+readonly PROGRAM_NAME=packagetool-publish
+
+readonly EXIT_USAGE=1
+readonly EXIT_PRECONDITION=2
+readonly EXIT_DISCOVERY=3
+readonly EXIT_DOWNLOAD=4
+readonly EXIT_RECORD=5
+readonly EXIT_VERIFY=6
+readonly EXIT_PUBLISH=7
+readonly EXIT_EXPIRY=8
+readonly EXIT_LOCKED=9
+
+readonly DEFAULT_CONFIG_FILE=/etc/packagetool/publish.conf
+
+# Settings, in the order they are applied: these built-in values, then
+# the configuration file, then the command line. The names are the ones
+# the Ansible role uses, so a configuration file and a playbook say the
+# same thing in the same words.
+registry_root=/srv/registry
+registry_publish_user=packagetool-publish
+registry_publish_group=packagetool-publish
+registry_publish_python=/opt/packagetool/venv/bin/python
+registry_publish_checkout_dir=/opt/packagetool/checkout
+registry_publish_publishing_config=
+registry_publish_anchor=
+registry_publish_pages_dir=
+registry_publish_tree_files=
+registry_publish_keys_dir=/etc/packagetool/publisher-keys
+registry_publish_github_api=https://api.github.com
+registry_publish_include_prereleases=true
+registry_publish_snapshot_command=/usr/local/sbin/packagetool-snapshot
+registry_publish_mirror_sync_command=/usr/local/sbin/packagetool-mirror-sync
+registry_publish_status_warning_is_failure=true
+registry_publish_api_timeout=30
+registry_publish_download_timeout=3600
+
+config_file=$DEFAULT_CONFIG_FILE
+config_file_given=false
+dry_run=false
+quiet=false
+refresh_only=false
+opt_root=
+selected_sources=()
+
+working_dir=
+staging_dir=
+lock_file=
+verifier=
+publisher_keys=()
+
+# Scratch space for this run: the release listings and the generated
+# catalogue. Owned by the publishing account, because everything written
+# into it is written by that account, and removed by the exit trap
+# however the run ends.
+run_tmp=
+
+# Every asset of every release of the repository a source is fed from,
+# as "<tag>/<asset name>" to its download URL. Filled per source and read
+# by the fetch step, which needs the URL of a sidecar it did not select
+# itself.
+declare -A asset_url=()
+
+tree_changed=false
+recorded_count=0
+skipped_sources=()
+
+# Second-resolution timestamps and a strictly advancing "issued" field:
+# the tool refuses a document whose timestamp does not move past the one
+# it replaces, so two writes inside the same second are a refusal. This
+# is the second the last document write used; every further write waits
+# for the clock to leave it.
+last_write_second=0
+
+err() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+say() {
+  if [ "$quiet" = false ]; then
+    printf '%s\n' "$*"
+  fi
+}
+
+die() {
+  local code=$1
+  shift
+  err "$*"
+  exit "$code"
+}
+
+# Invoked by the EXIT trap, not from the flow.
+# shellcheck disable=SC2317,SC2329
+cleanup() {
+  if [ -n "$run_tmp" ] && [ -d "$run_tmp" ]; then
+    rm -rf -- "$run_tmp"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: packagetool-publish [OPTIONS]
+
+Fetches every release the publishing configuration knows about and has
+not recorded yet, records and signs it, verifies the result, and
+publishes it as a new snapshot with the dumps official mirrors follow.
+
+Options:
+  --config PATH    settings file to read (default /etc/packagetool/publish.conf)
+  --root PATH      registry root (default /srv/registry)
+  --source NAME    limit the run to this source; repeatable
+  --refresh        renew the signed documents instead of looking for new
+                   releases, then verify and publish as usual
+  --dry-run        report what a run would do; changes nothing
+  --quiet          report only problems
+  --help           this text
+
+Needs root: the snapshot and the dumps do. Everything that touches the
+network, the fetched bytes or the publisher key is run as the publishing
+account instead.
+
+Exit codes: 0 success, 1 usage, 2 precondition, 3 discovery, 4 download,
+5 recording, 6 verification, 7 publication, 8 expiry warning, 9 locked.
+EOF
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+    --config)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--config needs a path"
+      config_file=$2
+      config_file_given=true
+      shift 2
+      ;;
+    --root)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--root needs a path"
+      opt_root=$2
+      shift 2
+      ;;
+    --source)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--source needs a source name"
+      selected_sources+=("$2")
+      shift 2
+      ;;
+    --refresh)
+      refresh_only=true
+      shift
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --quiet)
+      quiet=true
+      shift
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "$EXIT_USAGE" "unknown option $1"
+      ;;
+    esac
+  done
+}
+
+load_config() {
+  if [ "$config_file_given" = true ] && [ ! -r "$config_file" ]; then
+    die "$EXIT_PRECONDITION" "cannot read the settings file $config_file"
+  fi
+  if [ -r "$config_file" ]; then
+    # A root-owned shell fragment, read the way the files under
+    # /etc/default are read.
+    # shellcheck source=/dev/null
+    . "$config_file"
+  fi
+  if [ -n "$opt_root" ]; then
+    registry_root=$opt_root
+  fi
+}
+
+validate_config() {
+  case $registry_root in
+  /*) ;;
+  *) die "$EXIT_PRECONDITION" "the registry root must be an absolute path, not '$registry_root'" ;;
+  esac
+  while [ "$registry_root" != / ] && [ "${registry_root%/}" != "$registry_root" ]; do
+    registry_root=${registry_root%/}
+  done
+  if [ "$registry_root" = / ]; then
+    die "$EXIT_PRECONDITION" "the registry root must not be /"
+  fi
+
+  working_dir=$registry_root/working
+  staging_dir=$registry_root/staging
+  lock_file=$registry_root/.publish.lock
+  verifier=$registry_publish_checkout_dir/verify.py
+
+  if [ -z "$registry_publish_publishing_config" ]; then
+    die "$EXIT_PRECONDITION" \
+      "no publishing configuration: set registry_publish_publishing_config in $config_file"
+  fi
+  if [ -z "$registry_publish_anchor" ]; then
+    die "$EXIT_PRECONDITION" "no trust anchor: set registry_publish_anchor in $config_file"
+  fi
+
+  # Both end up in a JSON expression or a comparison, where anything but
+  # these two words would be read as something nobody meant.
+  case $registry_publish_include_prereleases in
+  true | false) ;;
+  *) die "$EXIT_PRECONDITION" \
+    "registry_publish_include_prereleases must be true or false, not '$registry_publish_include_prereleases'" ;;
+  esac
+  case $registry_publish_status_warning_is_failure in
+  true | false) ;;
+  *) die "$EXIT_PRECONDITION" \
+    "registry_publish_status_warning_is_failure must be true or false, not '$registry_publish_status_warning_is_failure'" ;;
+  esac
+}
+
+check_preconditions() {
+  local tool
+  for tool in curl jq sha256sum flock setpriv cmp find sort install stat cut date; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      die "$EXIT_PRECONDITION" "$tool is not installed"
+    fi
+  done
+
+  if [ "$(id -u)" -ne 0 ]; then
+    die "$EXIT_PRECONDITION" \
+      "this command has to run as root — the snapshot and the dumps need it. Run: sudo systemctl start packagetool-publish.service"
+  fi
+  if ! id -u "$registry_publish_user" >/dev/null 2>&1; then
+    die "$EXIT_PRECONDITION" "the publishing account $registry_publish_user does not exist"
+  fi
+
+  [ -x "$registry_publish_python" ] ||
+    die "$EXIT_PRECONDITION" "$registry_publish_python is not there — the tool is not installed"
+  [ -f "$verifier" ] ||
+    die "$EXIT_PRECONDITION" "$verifier is not there — the tool checkout is incomplete"
+  [ -r "$registry_publish_publishing_config" ] ||
+    die "$EXIT_PRECONDITION" "cannot read $registry_publish_publishing_config"
+  [ -r "$registry_publish_anchor" ] ||
+    die "$EXIT_PRECONDITION" "cannot read $registry_publish_anchor"
+
+  [ -d "$working_dir" ] ||
+    die "$EXIT_PRECONDITION" \
+      "$working_dir is not there — set the registry storage up first"
+  [ -x "$registry_publish_snapshot_command" ] ||
+    die "$EXIT_PRECONDITION" "$registry_publish_snapshot_command is not installed"
+  [ -x "$registry_publish_mirror_sync_command" ] ||
+    die "$EXIT_PRECONDITION" "$registry_publish_mirror_sync_command is not installed"
+}
+
+# The publisher keys, newest configuration first. Deliberately passed to
+# the tool as file arguments rather than through the environment: a key
+# in a unit's environment is printed by "systemctl show" and readable in
+# /proc, and the file it comes from is not.
+collect_publisher_keys() {
+  publisher_keys=()
+  local key
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    publisher_keys+=("$key")
+  done < <(find "$registry_publish_keys_dir" -mindepth 1 -maxdepth 1 -name '*.pem' \
+    -type f 2>/dev/null | LC_ALL=C sort)
+}
+
+# A dry run reports rather than signs, so it says what is missing and
+# carries on: it is also what a configuration run uses to check that the
+# command accepts the layout, and on a fresh machine the keys arrive
+# after the software does.
+require_publisher_keys() {
+  if [ ${#publisher_keys[@]} -gt 0 ]; then
+    return 0
+  fi
+  if [ "$dry_run" = true ]; then
+    err "no publisher key in $registry_publish_keys_dir yet — a real run could not sign"
+    return 0
+  fi
+  die "$EXIT_PRECONDITION" \
+    "no publisher key in $registry_publish_keys_dir — nothing could be signed. Install the key files there, owned by $registry_publish_user and mode 0400."
+}
+
+# Everything that touches the network, a fetched byte or the publisher
+# key runs through here.
+as_publisher() {
+  setpriv --reuid "$registry_publish_user" --regid "$registry_publish_group" \
+    --clear-groups --no-new-privs -- "$@"
+}
+
+packagetool() {
+  as_publisher "$registry_publish_python" -m mcuhome.packagetool "$@"
+}
+
+# Waits until the wall clock has left the second the last document write
+# used, so the next document's "issued" is strictly newer than the one it
+# replaces.
+advance_clock() {
+  local now
+  now=$(date -u +%s)
+  while [ "$now" -le "$last_write_second" ]; do
+    sleep 0.2
+    now=$(date -u +%s)
+  done
+  last_write_second=$now
+}
+
+changed() {
+  tree_changed=true
+}
+
+take_lock() {
+  exec 9>"$lock_file" || die "$EXIT_PRECONDITION" "cannot open the lock file $lock_file"
+  if ! flock -n 9; then
+    die "$EXIT_LOCKED" "another $PROGRAM_NAME run is working on $registry_root"
+  fi
+}
+
+# --------------------------------------------------------------- sources
+
+source_names() {
+  if [ ${#selected_sources[@]} -gt 0 ]; then
+    printf '%s\n' "${selected_sources[@]}"
+    return 0
+  fi
+  jq -r '.sources | keys[]' "$registry_publish_publishing_config"
+}
+
+source_field() {
+  jq -r --arg s "$1" --arg f "$2" '.sources[$s][$f] // empty' \
+    "$registry_publish_publishing_config"
+}
+
+# Whether a source knows this package version already: the index head
+# first, then every part it names. A part is a file whose name carries
+# the hash of its own content, so reading it here is reading exactly what
+# the head vouches for.
+recorded_version() {
+  local source_dir=$1 package=$2 version=$3
+  local index=$source_dir/index.json part
+  [ -f "$index" ] || return 1
+  if jq -e --arg p "$package" --arg v "$version" \
+    '((.packages // {})[$p] // {})[$v] != null' "$index" >/dev/null 2>&1; then
+    return 0
+  fi
+  while IFS= read -r part; do
+    [ -n "$part" ] || continue
+    [ -f "$source_dir/$part" ] || continue
+    if jq -e --arg p "$package" --arg v "$version" \
+      '((.packages // {})[$p] // {})[$v] != null' "$source_dir/$part" >/dev/null 2>&1; then
+      return 0
+    fi
+  done < <(jq -r '(.parts // [])[].file // empty' "$index")
+  return 1
+}
+
+# ------------------------------------------------------------- discovery
+
+# The release listing of one repository, cached on disk for the length of
+# the run. On disk rather than in a shell variable because the listing is
+# read inside a process substitution, whose assignments do not reach the
+# shell that started it — a cache that quietly never hits would spend one
+# of the sixty requests an unauthenticated caller gets per hour on every
+# source, instead of one on every repository.
+releases_file() {
+  printf '%s/releases-%s.json' "$run_tmp" "${1//\//_}"
+}
+
+fetch_releases() {
+  local repository=$1 path status=0
+  path=$(releases_file "$repository")
+  if [ -s "$path" ]; then
+    return 0
+  fi
+  as_publisher curl --fail-with-body --silent --show-error --location \
+    --max-time "$registry_publish_api_timeout" \
+    --header 'Accept: application/vnd.github+json' \
+    --header 'X-GitHub-Api-Version: 2022-11-28' \
+    --output "$path" \
+    "$registry_publish_github_api/repos/$repository/releases?per_page=100" || status=$?
+  if [ "$status" -ne 0 ]; then
+    err "could not list the releases of $repository (curl exit $status). The forge answered:"
+    head -c 500 "$path" >&2 2>/dev/null || true
+    printf '\n' >&2
+    rm -f -- "$path"
+    return 1
+  fi
+  if ! jq -e 'type == "array"' "$path" >/dev/null 2>&1; then
+    err "the release list of $repository is not a JSON array. The forge answered:"
+    head -c 500 "$path" >&2
+    printf '\n' >&2
+    rm -f -- "$path"
+    return 1
+  fi
+  return 0
+}
+
+# tag <TAB> asset name <TAB> download URL, for every asset of every
+# release that is not a draft. Prereleases are included or not by
+# configuration: the versions this registry carries before 1.0 are
+# prereleases, and a registry that refused them would carry nothing.
+release_assets() {
+  jq -r --argjson pre "$registry_publish_include_prereleases" '
+    .[]
+    | select(.draft | not)
+    | select($pre or (.prerelease | not))
+    | .tag_name as $tag
+    | (.assets // [])[]
+    | [$tag, .name, .browser_download_url]
+    | @tsv' "$(releases_file "$1")"
+}
+
+# ------------------------------------------------------- one source
+
+# Fetches one asset and its sidecars into the staging directory and
+# checks the bytes against the checksum the build published beside them.
+# A release without a checksum sidecar stops the run: the sidecar is the
+# only thing that says the bytes on the wire are the bytes the build
+# made.
+fetch_asset() {
+  local tag=$1 name=$2 url=$3
+  local sidecar_url
+
+  say "  fetching $name ($tag)"
+  as_publisher curl --fail --silent --show-error --location \
+    --max-time "$registry_publish_download_timeout" \
+    --output "$staging_dir/$name" "$url" ||
+    die "$EXIT_DOWNLOAD" "could not fetch $name from $url"
+
+  sidecar_url=${asset_url["$tag/$name.sha256"]:-}
+  if [ -z "$sidecar_url" ]; then
+    die "$EXIT_DOWNLOAD" \
+      "$tag publishes $name without $name.sha256 — the bytes cannot be checked against what the build made"
+  fi
+  as_publisher curl --fail --silent --show-error --location \
+    --max-time "$registry_publish_api_timeout" \
+    --output "$staging_dir/$name.sha256" "$sidecar_url" ||
+    die "$EXIT_DOWNLOAD" "could not fetch $name.sha256 from $sidecar_url"
+
+  if ! (cd "$staging_dir" && as_publisher sha256sum -c --quiet "$name.sha256"); then
+    die "$EXIT_DOWNLOAD" "$name does not match the checksum $tag publishes for it"
+  fi
+  say "  checksum ok: $name"
+
+  # The declaration sidecar where a release carries one: a provisioner
+  # reads it before it unpacks anything, so it has to be served next to
+  # the archive rather than only inside it.
+  sidecar_url=${asset_url["$tag/$name.build-environment.json"]:-}
+  if [ -n "$sidecar_url" ]; then
+    as_publisher curl --fail --silent --show-error --location \
+      --max-time "$registry_publish_api_timeout" \
+      --output "$staging_dir/$name.build-environment.json" "$sidecar_url" ||
+      die "$EXIT_DOWNLOAD" "could not fetch $name.build-environment.json"
+  fi
+}
+
+# Moves what was fetched into the source and records it. The file has to
+# be in the source before the index names it: "file" is relative to the
+# source, and a mirror copies the directory, not a link.
+record_asset() {
+  local source_dir=$1 package=$2 version=$3 name=$4
+  local digest size extra
+
+  for extra in "$name" "$name.sha256" "$name.build-environment.json"; do
+    [ -f "$staging_dir/$extra" ] || continue
+    # Reflinks make this share extents with the staged copy instead of
+    # doubling a half-gigabyte package on disk.
+    as_publisher cp --reflink=auto --preserve=timestamps -- \
+      "$staging_dir/$extra" "$source_dir/$extra" ||
+      die "$EXIT_RECORD" "could not put $extra into $source_dir"
+  done
+
+  digest=$(cut -d' ' -f1 <"$staging_dir/$name.sha256")
+  size=$(stat -c%s "$source_dir/$name")
+
+  advance_clock
+  packagetool add \
+    --source "$source_dir" \
+    --name "$package" \
+    --version "$version" \
+    --file "$name" \
+    --sha256 "$digest" \
+    --size "$size" \
+    --publisher-key "${publisher_keys[@]}" ||
+    die "$EXIT_RECORD" "could not record $package $version in $source_dir"
+  recorded_count=$((recorded_count + 1))
+  changed
+}
+
+# The meta package a source declares: one name standing for a family,
+# whose version is its members' version. It is written once every member
+# exists at that version — the tool refuses otherwise, which is the
+# invariant that makes pinning the meta name pin every platform's bytes.
+record_meta() {
+  local name=$1 source_dir=$2 version=$3
+  local meta_name members=() dimension key package
+
+  meta_name=$(jq -r --arg s "$name" '.sources[$s].meta.name // empty' \
+    "$registry_publish_publishing_config")
+  [ -n "$meta_name" ] || return 0
+
+  if recorded_version "$source_dir" "$meta_name" "$version"; then
+    return 0
+  fi
+
+  while IFS=$'\t' read -r dimension key package; do
+    [ -n "$package" ] || continue
+    if ! recorded_version "$source_dir" "$package" "$version"; then
+      say "  $meta_name $version waits for $package $version"
+      return 0
+    fi
+    members+=(--member "$dimension:$key=$package")
+  done < <(jq -r --arg s "$name" '
+    .sources[$s].meta.members // {} | to_entries[] as $d
+    | $d.value | to_entries[] | "\($d.key)\t\(.key)\t\(.value)"' \
+    "$registry_publish_publishing_config")
+
+  [ ${#members[@]} -gt 0 ] || return 0
+
+  advance_clock
+  packagetool add-meta \
+    --source "$source_dir" \
+    --name "$meta_name" \
+    --version "$version" \
+    "${members[@]}" \
+    --publisher-key "${publisher_keys[@]}" ||
+    die "$EXIT_RECORD" "could not record the meta package $meta_name $version"
+  say "  recorded $meta_name $version"
+  changed
+}
+
+publish_source() {
+  local name=$1
+  local source_dir=$working_dir/$name
+  local repository tag asset_name url package pattern version line row entry
+  local pending_count=0 has_meta=no did_any
+  local -A pending=()
+  local -a versions=()
+  local -a rows=()
+
+  repository=$(source_field "$name" repository)
+  if [ -z "$repository" ]; then
+    err "$name declares no repository in $registry_publish_publishing_config — skipped"
+    return 0
+  fi
+
+  say "$name (from $repository)"
+
+  fetch_releases "$repository" ||
+    die "$EXIT_DISCOVERY" "could not find out which releases $repository has"
+
+  asset_url=()
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    rows+=("$line")
+  done < <(release_assets "$repository")
+
+  for row in ${rows[@]+"${rows[@]}"}; do
+    IFS=$'\t' read -r tag asset_name url <<<"$row"
+    asset_url["$tag/$asset_name"]=$url
+  done
+
+  # A source that declares a meta package has to look at versions whose
+  # packages are all recorded already, not only at the ones it is
+  # missing: the meta is written after its members, so a run that
+  # stopped between the two would otherwise leave a family that no later
+  # run ever completes.
+  if [ -n "$(jq -r --arg s "$name" '.sources[$s].meta.name // empty' \
+    "$registry_publish_publishing_config")" ]; then
+    has_meta=yes
+  fi
+
+  # Which (version, package, asset) triples this source is missing.
+  while IFS=$'\t' read -r package pattern; do
+    [ -n "$package" ] || continue
+    for row in ${rows[@]+"${rows[@]}"}; do
+      IFS=$'\t' read -r tag asset_name url <<<"$row"
+      # An unquoted pattern on the right is a glob, which is what the
+      # configuration declares.
+      # shellcheck disable=SC2053
+      [[ $asset_name == $pattern ]] || continue
+      version=${asset_name#"$package"-}
+      version=${version%.tar.zst}
+      if [ "$version" = "$asset_name" ] || [ -z "$version" ]; then
+        err "  $asset_name does not look like $package-<version>.tar.zst — left alone"
+        continue
+      fi
+      if recorded_version "$source_dir" "$package" "$version"; then
+        if [ "$has_meta" = yes ]; then
+          versions+=("$version")
+        fi
+        continue
+      fi
+      if [ -n "${pending["$version/$package"]:-}" ]; then
+        die "$EXIT_DISCOVERY" \
+          "$package $version is offered by more than one release of $repository — which bytes are meant is not for this command to guess"
+      fi
+      pending["$version/$package"]=$tag$'\t'$asset_name
+      pending_count=$((pending_count + 1))
+      versions+=("$version")
+    done
+  done < <(jq -r --arg s "$name" \
+    '(.sources[$s].packages // [])[] | "\(.name)\t\(.asset)"' \
+    "$registry_publish_publishing_config")
+
+  if [ ! -d "$source_dir" ]; then
+    if [ "$pending_count" -gt 0 ]; then
+      err "  $source_dir is not laid down yet — $pending_count release asset(s) wait for it. A source is created with the offline root keys, which are deliberately not on this machine."
+    else
+      say "  not laid down yet — skipped"
+    fi
+    skipped_sources+=("$name")
+    return 0
+  fi
+
+  if [ ${#versions[@]} -eq 0 ]; then
+    say "  up to date"
+    return 0
+  fi
+
+  # Oldest version first: the index records them in the order they were
+  # released, and a meta package can only be written once its members are
+  # there.
+  local -a ordered=()
+  while IFS= read -r version; do
+    ordered+=("$version")
+  done < <(printf '%s\n' "${versions[@]}" | sort -u -V)
+
+  for version in "${ordered[@]}"; do
+    did_any=false
+    while IFS=$'\t' read -r package pattern; do
+      [ -n "$package" ] || continue
+      entry=${pending["$version/$package"]:-}
+      [ -n "$entry" ] || continue
+      if [ "$did_any" = false ]; then
+        say "  version $version"
+        did_any=true
+      fi
+      IFS=$'\t' read -r tag asset_name <<<"$entry"
+      if [ "$dry_run" = true ]; then
+        say "  would publish $package $version from $tag ($asset_name)"
+        continue
+      fi
+      fetch_asset "$tag" "$asset_name" "${asset_url["$tag/$asset_name"]}"
+      record_asset "$source_dir" "$package" "$version" "$asset_name"
+      say "  recorded $package $version"
+      rm -f -- "$staging_dir/$asset_name" "$staging_dir/$asset_name.sha256" \
+        "$staging_dir/$asset_name.build-environment.json"
+    done < <(jq -r --arg s "$name" \
+      '(.sources[$s].packages // [])[] | "\(.name)\t\(.asset)"' \
+      "$registry_publish_publishing_config")
+
+    if [ "$dry_run" = false ]; then
+      record_meta "$name" "$source_dir" "$version"
+    fi
+  done
+
+  if [ "$pending_count" -eq 0 ]; then
+    say "  up to date"
+  fi
+}
+
+# --------------------------------------------------------------- refresh
+
+refresh_sources() {
+  local -a existing=()
+  local name
+  while IFS= read -r name; do
+    if [ -d "$working_dir/$name" ]; then
+      existing+=("$working_dir/$name")
+    else
+      say "$name: not laid down yet — skipped"
+      skipped_sources+=("$name")
+    fi
+  done < <(source_names)
+
+  if [ ${#existing[@]} -eq 0 ]; then
+    say "no source to refresh"
+    return 0
+  fi
+  if [ "$dry_run" = true ]; then
+    say "would refresh ${#existing[@]} source(s)"
+    return 0
+  fi
+
+  require_publisher_keys
+  advance_clock
+  packagetool refresh --source "${existing[@]}" \
+    --publisher-key "${publisher_keys[@]}" ||
+    die "$EXIT_RECORD" "could not refresh the signed documents"
+  changed
+}
+
+# -------------------------------------------------------------- assemble
+
+install_tree_file() {
+  local src=$1 dst=$2
+  [ -f "$src" ] || die "$EXIT_PRECONDITION" "$src is not there"
+  if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+    return 0
+  fi
+  if [ "$dry_run" = true ]; then
+    say "would install $(basename "$dst")"
+    changed
+    return 0
+  fi
+  as_publisher cp --preserve=timestamps -- "$src" "$dst" ||
+    die "$EXIT_RECORD" "could not install $dst"
+  say "installed $(basename "$dst")"
+  changed
+}
+
+assemble_tree() {
+  local page file generated
+
+  if [ -n "$registry_publish_pages_dir" ]; then
+    [ -d "$registry_publish_pages_dir" ] ||
+      die "$EXIT_PRECONDITION" "$registry_publish_pages_dir is not there"
+    while IFS= read -r page; do
+      [ -n "$page" ] || continue
+      install_tree_file "$page" "$working_dir/$(basename "$page")"
+    done < <(find "$registry_publish_pages_dir" -mindepth 1 -maxdepth 1 -type f |
+      LC_ALL=C sort)
+  fi
+
+  # Everything else the served tree carries that is not a source: the
+  # trust anchor above all, which is published so a mirror operator can
+  # compare it against the one their tool already has.
+  for file in $registry_publish_tree_files; do
+    install_tree_file "$file" "$working_dir/$(basename "$file")"
+  done
+
+  # sources.json is generated rather than kept: it is the tree's unsigned
+  # directory of sources, and the configuration is what decides which
+  # ones there are.
+  generated=$run_tmp/sources.json
+  as_publisher "$registry_publish_python" -m mcuhome.packagetool catalog \
+    --publishing "$registry_publish_publishing_config" --out "$generated" >/dev/null ||
+    die "$EXIT_RECORD" "could not generate sources.json"
+  install_tree_file "$generated" "$working_dir/sources.json"
+  rm -f "$generated"
+}
+
+# ---------------------------------------------------------------- verify
+
+verify_tree() {
+  local name checked=0
+  while IFS= read -r name; do
+    [ -d "$working_dir/$name" ] || continue
+    as_publisher "$registry_publish_python" "$verifier" "$working_dir/$name" \
+      --anchor "$registry_publish_anchor" ||
+      die "$EXIT_VERIFY" "$name does not verify against $registry_publish_anchor"
+    checked=$((checked + 1))
+  done < <(source_names)
+  say "verified $checked source(s) against the anchor"
+}
+
+# --------------------------------------------------------------- publish
+
+publish_tree() {
+  say "publishing"
+  "$registry_publish_snapshot_command" ||
+    die "$EXIT_PUBLISH" "the snapshot or the docroot switch failed"
+  "$registry_publish_mirror_sync_command" ||
+    die "$EXIT_PUBLISH" "the mirror dumps could not be generated"
+}
+
+# ---------------------------------------------------------------- status
+
+report_status() {
+  local -a existing=()
+  local name
+  while IFS= read -r name; do
+    [ -d "$working_dir/$name" ] && existing+=("$working_dir/$name")
+  done < <(source_names)
+  [ ${#existing[@]} -gt 0 ] || return 0
+
+  if packagetool status --source "${existing[@]}"; then
+    return 0
+  fi
+  if [ "$registry_publish_status_warning_is_failure" = true ]; then
+    err "a signed document is close to expiring. The publish itself succeeded; renew before it runs out."
+    return 1
+  fi
+  err "a signed document is close to expiring — see the report above."
+  return 0
+}
+
+# ------------------------------------------------------------------ main
+
+main() {
+  trap cleanup EXIT
+  parse_args "$@"
+  load_config
+  validate_config
+  check_preconditions
+  collect_publisher_keys
+
+  run_tmp=$(mktemp -d)
+  chown "$registry_publish_user:$registry_publish_group" "$run_tmp"
+  chmod 0700 "$run_tmp"
+
+  if [ "$dry_run" = false ]; then
+    take_lock
+    install -d -o "$registry_publish_user" -g "$registry_publish_group" -m 0700 "$staging_dir"
+    find "$staging_dir" -mindepth 1 -delete
+  fi
+
+  if [ "$refresh_only" = true ]; then
+    refresh_sources
+  else
+    require_publisher_keys
+    local name
+    while IFS= read -r name; do
+      publish_source "$name"
+    done < <(source_names)
+  fi
+
+  assemble_tree
+  if [ "$dry_run" = false ]; then
+    verify_tree
+  fi
+
+  if [ ${#skipped_sources[@]} -gt 0 ]; then
+    err "not laid down yet, left alone: ${skipped_sources[*]}"
+  fi
+
+  if [ "$tree_changed" = false ]; then
+    say "nothing changed — no snapshot taken"
+    if [ "$dry_run" = false ]; then
+      report_status || exit "$EXIT_EXPIRY"
+    fi
+    return 0
+  fi
+
+  if [ "$dry_run" = true ]; then
+    say "would take a snapshot, switch the docroot and generate the dumps"
+    return 0
+  fi
+
+  say "recorded $recorded_count package(s)"
+  publish_tree
+  find "$staging_dir" -mindepth 1 -delete
+  report_status || exit "$EXIT_EXPIRY"
+}
+
+main "$@"

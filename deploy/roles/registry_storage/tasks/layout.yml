@@ -13,6 +13,11 @@
 #                  first publish
 #   current        symlink to the directory that is served
 #
+# One more directory appears beside these where a publish pipeline is
+# installed: staging/, where a fetched package waits until its checksum
+# has been checked. It is created by the role that installs the pipeline,
+# because it belongs to it and is worthless without it.
+#
 # "working" is a subvolume rather than a plain directory because a
 # snapshot can only be taken of a subvolume. "current" exists from the
 # start so the servers have a valid docroot before anything is published;
@@ -44,10 +49,23 @@
     group: "{{ registry_storage_group }}"
     mode: "0755"
   loop:
-    - working
     - snapshots
     - mirror-sync
     - placeholder
+
+# The working tree is the one part of the layout somebody else may own:
+# whatever publishes has to write there, and that account is created by
+# the role that installs the publish pipeline, which cannot have run
+# before this one. So ownership is left alone unless it is asked for by
+# name — the alternative would be two roles setting it back and forth on
+# every run.
+- name: Set owner and permissions on the working tree
+  ansible.builtin.file:
+    path: "{{ registry_root }}/working"
+    state: directory
+    owner: "{{ registry_storage_working_owner | default(omit, true) }}"
+    group: "{{ registry_storage_working_group | default(omit, true) }}"
+    mode: "0755"
 
 - name: Look at the docroot symlink
   ansible.builtin.stat:

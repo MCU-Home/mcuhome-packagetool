@@ -43,10 +43,22 @@ registry_storage_label: registry
 registry_storage_mount_options: >-
   noatime,compress=zstd:3,nodev,nosuid,nofail,x-systemd.device-timeout=15s
 
-# Owner and group of the registry tree. Root by default; set it to the
-# account that runs the publish pipeline if that account is not root.
+# Owner and group of the registry tree. Root: the docroot symlink, the
+# snapshot area and the dump area are switched, created and deleted by
+# root, and nothing else needs to write there.
 registry_storage_owner: root
 registry_storage_group: root
+
+# Owner and group of the working tree alone — the one part of the layout
+# that something other than root writes to. Empty means the role leaves
+# its ownership exactly as it finds it, which is what a deployment with a
+# separate publishing account wants: that account is created by the role
+# that installs the publish pipeline, so it cannot exist the first time
+# this role runs, and two roles setting the same directory to two
+# different owners would fight on every run. Set it only if this role is
+# the one that should decide.
+registry_storage_working_owner: ""
+registry_storage_working_group: ""
 
 # Whether the role may create a filesystem on a device that carries none.
 # A device that carries anything at all — a filesystem, a partition

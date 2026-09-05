@@ -12,6 +12,7 @@ version of this directory rather than editing the roles.
 ```
 vars/registry.yml   storage layout and snapshot retention
 vars/serving.yml    the host names, what each one serves, the rsync limits
+vars/publish.yml    where the tool comes from, what it reads, what is on a timer
 publishing.json     which upstream release feeds which source
 anchor.json         the root key set this registry's sources verify against
 ```
@@ -72,6 +73,7 @@ hands the roles what is in them:
   vars_files:
     - <this repository>/deploy/mcuhome/vars/registry.yml
     - <this repository>/deploy/mcuhome/vars/serving.yml
+    - <this repository>/deploy/mcuhome/vars/publish.yml
   vars:
     # The public sites here, plus whatever this machine adds of its own.
     registry_proxy_sites: >-
@@ -79,12 +81,14 @@ hands the roles what is in them:
   roles:
     - role: registry_storage
     - role: registry_snapshot
+    - role: mirror_sync
     - role: registry_web
     - role: registry_proxy
     - role: registry_rsync
+    - role: registry_publish
 ```
 
-Four values are deliberately not set here, because each of them describes
+Five values are deliberately not set here, because each of them describes
 one machine rather than the registry:
 
 | Value | Where it belongs |
@@ -93,3 +97,19 @@ one machine rather than the registry:
 | `registry_proxy_public_addresses` | the addresses the public sites bind |
 | `registry_rsync_listen_addresses` | the addresses the rsync export listens on |
 | `registry_mirror_sync_users` | the mirror-sync credentials — never in a repository |
+| the publisher keys | put on the server by whoever is entitled to move them, into the directory `registry_publish_keys_dir` names — never in a repository, and not by a configuration run either |
+
+## Publishing
+
+`vars/publish.yml` says that the server follows the `main` branch of this
+repository for the tool it publishes with, reads `publishing.json` and
+`anchor.json` out of that checkout, and installs `pages/` from it into
+the served tree. One version of one tree, on the machine, recorded in
+`/opt/packagetool/installed-revision`.
+
+A publish is `systemctl start packagetool-publish.service` and nothing
+else: it is deliberate, its timer is installed and off, and it batches —
+one run picks up every new release at once, so an SDK, its build tools
+and its workspace become one snapshot and one flip. The weekly refresh
+runs on its own from the start, because that one is not a decision but an
+expiry date.

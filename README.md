@@ -91,7 +91,7 @@ standard library.
 python3 -m venv .venv && .venv/bin/pip install -e . --group dev
 ```
 
-Four checks need more than that:
+Six checks need more than that, four of them deploy tests that need root:
 
 | Check | Needs |
 |---|---|
@@ -99,12 +99,15 @@ Four checks need more than that:
 | `test verify-sources` | `jq` and network access: it verifies every published document against `deploy/mcuhome/anchor.json` |
 | `test registry-snapshot` | root, `btrfs-progs` and loop devices — run it as `sudo scripts/test registry-snapshot` |
 | `test registry-storage` | root, loop devices, `btrfs-progs`, `e2fsprogs`, `lvm2` and `fdisk` — run it as `sudo scripts/test registry-storage` |
+| `test mirror-sync` | root, `btrfs-progs`, loop devices and `jq` — run it as `sudo scripts/test mirror-sync` |
+| `test registry-publish` | root, loop devices, `btrfs-progs`, `jq`, `curl`, `useradd`, `unshare` and this repository installed into a Python (its own `.venv` unless `$PACKAGETOOL_PYTHON` says otherwise) — run it as `sudo scripts/test registry-publish` |
 
-Both deploy tests build their filesystems in loopback images they create
-and throw away again; the storage one additionally runs in a mount
-namespace of its own, so the mounts and the fstab entry it makes never
-reach the machine it runs on. Without root they fail and say so rather
-than reporting a pass, because a check that skipped itself has proved
+All four deploy tests build their filesystems in loopback images they
+create and throw away again; `registry-storage` and `registry-publish`
+additionally run in a mount namespace of their own, so the mounts, the
+fstab entry and the throwaway system account they make never reach the
+machine they run on. Without root they fail and say so rather than
+reporting a pass, because a check that skipped itself has proved
 nothing — which also means `scripts/test all` wants root:
 
 ```sh

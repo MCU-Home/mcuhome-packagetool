@@ -1,0 +1,260 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The publish pipeline: the tool in a virtual environment of its own, the
+# account that signs, the command that takes the registry from "a release
+# exists upstream" to "the mirror serves it", and the two units that run
+# it — one by hand, one on a timer.
+#
+# The role installs; it never publishes. A configuration run that
+# published would make every configuration run a release, and the whole
+# point of a manual trigger is that somebody decided.
+#
+# It expects registry_storage, registry_snapshot and mirror_sync to have
+# run: the command checks the layout it is pointed at and refuses to work
+# on anything else. Where the working tree already exists, this role is
+# what gives it to the publishing account — the storage role deliberately
+# leaves its ownership alone, because the account is created here.
+
+- name: Check the publish settings
+  ansible.builtin.assert:
+    that:
+      - registry_root | default('', true) is match('^/.+')
+      - registry_publish_user | default('', true) | length > 0
+      - registry_publish_group | default('', true) | length > 0
+      - registry_publish_version | default('', true) | length > 0
+      - registry_publish_repository | default('', true) | length > 0
+      - registry_publish_publishing_config | default('', true) is match('^/.+')
+      - registry_publish_anchor | default('', true) is match('^/.+')
+      - registry_publish_unit_timeout | int > 0
+    fail_msg: >-
+      registry_root, registry_publish_publishing_config and
+      registry_publish_anchor must be absolute paths,
+      registry_publish_repository and registry_publish_version must name
+      the tool and the revision to run it at, and the account and the
+      timeout must be set.
+    quiet: true
+
+- name: Install what the pipeline needs
+  ansible.builtin.package:
+    name: "{{ registry_publish_packages }}"
+    state: present
+  when: registry_publish_packages | length > 0
+
+# --- the account that signs ------------------------------------------------
+
+- name: Create the publishing group
+  ansible.builtin.group:
+    name: "{{ registry_publish_group }}"
+    system: true
+
+# No login, no shell, no home of its own: it exists to own two things,
+# the working tree and the publisher keys.
+- name: Create the publishing account
+  ansible.builtin.user:
+    name: "{{ registry_publish_user }}"
+    group: "{{ registry_publish_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ registry_publish_home }}"
+    create_home: false
+    password: "!"
+
+# Only this account may look inside, and it may not write there: keys are
+# put in by whoever is entitled to move them, not by a configuration run.
+- name: Create the publisher key directory
+  ansible.builtin.file:
+    path: "{{ registry_publish_keys_dir }}"
+    state: directory
+    owner: "{{ registry_publish_user }}"
+    group: "{{ registry_publish_group }}"
+    mode: "0500"
+
+# --- the tool --------------------------------------------------------------
+
+- name: Create the tool directory
+  ansible.builtin.file:
+    path: "{{ registry_publish_home }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Root-owned, so the account that runs the tool cannot change the tool it
+# runs. A publish that could rewrite its own verifier would verify
+# nothing.
+- name: Check the tool out
+  ansible.builtin.git:
+    repo: "{{ registry_publish_repository }}"
+    dest: "{{ registry_publish_checkout_dir }}"
+    version: "{{ registry_publish_version }}"
+    force: true
+  register: registry_publish_checkout
+
+- name: Create the virtual environment
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -m
+      - venv
+      - "{{ registry_publish_venv_dir }}"
+    creates: "{{ registry_publish_venv_dir }}/bin/python"
+  register: registry_publish_venv
+
+# Only when the checkout moved or the environment is new: pip reaching
+# out to an index on every configuration run would make the run depend on
+# a network it does not otherwise need.
+- name: Install the tool into the virtual environment
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_publish_venv_dir }}/bin/pip"
+      - install
+      - --disable-pip-version-check
+      - --no-cache-dir
+      - --upgrade
+      - "{{ registry_publish_checkout_dir }}"
+  when: registry_publish_checkout is changed or registry_publish_venv is changed
+  changed_when: true
+
+- name: Record which revision is installed
+  ansible.builtin.copy:
+    content: "{{ registry_publish_checkout.after }}\n"
+    dest: "{{ registry_publish_version_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# Proof that what was installed can be imported and run at all, before
+# anything depends on it.
+- name: Check the installed tool runs
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_publish_venv_dir }}/bin/python"
+      - -m
+      - mcuhome.packagetool
+      - --help
+  changed_when: false
+
+# --- the command -----------------------------------------------------------
+
+- name: Create the settings directory
+  ansible.builtin.file:
+    path: "{{ registry_publish_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the publish command
+  ansible.builtin.copy:
+    src: packagetool-publish
+    dest: "{{ registry_publish_script_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the publish settings
+  ansible.builtin.template:
+    src: publish.conf.j2
+    dest: "{{ registry_publish_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# --- the working tree ------------------------------------------------------
+
+- name: Look for the registry layout
+  ansible.builtin.stat:
+    path: "{{ registry_root }}/working"
+  register: registry_publish_working
+
+- name: Give the working tree to the publishing account
+  ansible.builtin.file:
+    path: "{{ registry_root }}/working"
+    state: directory
+    owner: "{{ registry_publish_user }}"
+    group: "{{ registry_publish_group }}"
+    mode: "0755"
+  when: registry_publish_working.stat.exists
+
+# Where a fetched asset lands before its checksum has been checked.
+# Beside the working tree rather than inside it, so nothing half fetched
+# can end up in a snapshot, and on the same filesystem, so putting a
+# checked package into a source is a reflink rather than a second copy of
+# half a gigabyte.
+- name: Create the staging area
+  ansible.builtin.file:
+    path: "{{ registry_root }}/staging"
+    state: directory
+    owner: "{{ registry_publish_user }}"
+    group: "{{ registry_publish_group }}"
+    mode: "0700"
+  when: registry_publish_working.stat.exists
+
+# --- the units -------------------------------------------------------------
+
+- name: Install the publish and refresh units
+  ansible.builtin.template:
+    src: service.j2
+    dest: "{{ registry_publish_unit_dir }}/{{ item.unit }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ registry_publish_runs }}"
+  loop_control:
+    label: "{{ item.unit }}.service"
+  register: registry_publish_units
+
+- name: Install their timers
+  ansible.builtin.template:
+    src: timer.j2
+    dest: "{{ registry_publish_unit_dir }}/{{ item.unit }}.timer"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ registry_publish_runs }}"
+  loop_control:
+    label: "{{ item.unit }}.timer"
+  register: registry_publish_timers
+
+# Deliberately not a handler: the tasks below ask systemd about these
+# units, and systemd only knows them after a reload.
+- name: Make systemd read the new units  # noqa: no-handler
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: registry_publish_units is changed or registry_publish_timers is changed
+
+# A timer that is off is installed all the same, so turning it on later
+# is one value and not a deployment.
+- name: Set the timers
+  ansible.builtin.systemd_service:
+    name: "{{ item.unit }}.timer"
+    enabled: "{{ item.timer_enabled | bool }}"
+    state: "{{ 'started' if item.timer_enabled | bool else 'stopped' }}"
+  loop: "{{ registry_publish_runs }}"
+  loop_control:
+    label: "{{ item.unit }}.timer"
+
+# --- proof -----------------------------------------------------------------
+
+# What was just installed, run against this server: it reads the settings
+# file and checks the layout, the tool, the account, the configuration,
+# the anchor and the pages, then reports what a run would do — without
+# fetching, signing, snapshotting or switching anything.
+#
+# The refresh variant on purpose. It is the one that asks nothing of the
+# forge: a configuration run should not depend on a third party being
+# reachable, and should not spend one of the sixty requests an hour an
+# unauthenticated caller gets.
+- name: Check the installed command accepts the layout
+  ansible.builtin.command:
+    argv:
+      - "{{ registry_publish_script_path }}"
+      - --config
+      - "{{ registry_publish_config_path }}"
+      - --refresh
+      - --dry-run
+      - --quiet
+  changed_when: false
+  when: registry_publish_working.stat.exists

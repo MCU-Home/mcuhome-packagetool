@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# Settings for packagetool-publish. The file is read as a shell fragment,
+# the way the files under /etc/default are, and the names are the ones
+# the Ansible role uses. Command-line options override what is set here.
+
+registry_root={{ registry_root | quote }}
+
+registry_publish_user={{ registry_publish_user | quote }}
+registry_publish_group={{ registry_publish_group | quote }}
+registry_publish_keys_dir={{ registry_publish_keys_dir | quote }}
+
+registry_publish_python={{ (registry_publish_venv_dir ~ '/bin/python') | quote }}
+registry_publish_checkout_dir={{ registry_publish_checkout_dir | quote }}
+
+registry_publish_publishing_config={{ registry_publish_publishing_config | quote }}
+registry_publish_anchor={{ registry_publish_anchor | quote }}
+registry_publish_pages_dir={{ registry_publish_pages_dir | quote }}
+registry_publish_tree_files={{ registry_publish_tree_files | quote }}
+
+registry_publish_github_api={{ registry_publish_github_api | quote }}
+registry_publish_include_prereleases={{ registry_publish_include_prereleases | bool | lower }}
+registry_publish_api_timeout={{ registry_publish_api_timeout | int }}
+registry_publish_download_timeout={{ registry_publish_download_timeout | int }}
+registry_publish_status_warning_is_failure={{ registry_publish_status_warning_is_failure | bool | lower }}
+
+registry_publish_snapshot_command={{ registry_publish_snapshot_command | quote }}
+registry_publish_mirror_sync_command={{ registry_publish_mirror_sync_command | quote }}

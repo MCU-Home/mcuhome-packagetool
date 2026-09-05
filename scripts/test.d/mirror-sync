@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# deploy/tests/mirror-sync: the dumps an official mirror follows — the
+# full dump, the differences, the chain index and its hashes, the
+# retention that follows the snapshots, and a mirror that reproduces the
+# origin's tree with btrfs receive.
+#
+# The test needs root, btrfs-progs and loop devices, and skips itself
+# (exit 77) when it cannot have them. A skip is not a pass, so this
+# wrapper checks the same prerequisites first and fails with what to do
+# about it — a gate that goes green because it never ran is worse than
+# no gate.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+test_script="$root/deploy/tests/mirror-sync"
+name="test.d/mirror-sync"
+
+if [ ! -x "$test_script" ]; then
+  echo "$name: $test_script is not there or not executable." >&2
+  exit 1
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "$name: needs root — it creates loop devices and mounts filesystems." >&2
+  echo "Run: sudo scripts/test mirror-sync" >&2
+  exit 1
+fi
+
+missing=()
+for binary in mkfs.btrfs btrfs losetup mount umount findmnt flock jq; do
+  command -v "$binary" >/dev/null 2>&1 || missing+=("$binary")
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+  echo "$name: missing ${missing[*]}. Install btrfs-progs, util-linux and jq first" >&2
+  echo "(e.g. apt install btrfs-progs util-linux jq)." >&2
+  exit 1
+fi
+
+status=0
+"$test_script" "$@" || status=$?
+if [ "$status" -eq 77 ]; then
+  echo "$name: the test skipped itself although the prerequisites are met — see its" >&2
+  echo "SKIP message above. Treated as a failure, because a skipped check proves nothing." >&2
+  exit 1
+fi
+exit "$status"

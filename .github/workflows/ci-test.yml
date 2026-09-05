@@ -12,12 +12,15 @@
 # broken signature or an expiring document fails here rather than in
 # somebody's build.
 #
-# test-registry-snapshot and test-registry-storage exercise the deploy/
-# material against real filesystems: a btrfs image on a loop device, and
-# for the storage role a set of loop devices carrying the things it has
-# to refuse to overwrite. Both need root and are therefore invoked
-# through sudo — the wrappers themselves refuse to run without it rather
-# than reporting a pass they did not earn.
+# test-registry-snapshot, test-registry-storage, test-mirror-sync and
+# test-registry-publish exercise the deploy/ material against real
+# filesystems: btrfs images on loop devices, and for the storage role a
+# set of devices carrying the things it has to refuse to overwrite. The
+# publish job also runs whole publish cycles against a stand-in forge on
+# the loopback address, so it needs this repository installed as well.
+# All four need root and are therefore invoked through sudo — the
+# wrappers themselves refuse to run without it rather than reporting a
+# pass they did not earn.
 #
 # All actions are pinned to commit SHAs, not tags.
 
@@ -152,3 +155,48 @@ jobs:
 
       - name: scripts/test registry-storage
         run: sudo scripts/test registry-storage
+
+  test-mirror-sync:
+    name: Test (mirror-sync)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install btrfs-progs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs
+
+      - name: scripts/test mirror-sync
+        run: sudo scripts/test mirror-sync
+
+  test-registry-publish:
+    name: Test (registry-publish)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check -e . --group dev
+
+      - name: Install btrfs-progs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs
+
+      # The wrapper hands the test this repository's own .venv, so sudo
+      # may drop the rest of the environment as it likes.
+      - name: scripts/test registry-publish
+        run: sudo scripts/test registry-publish

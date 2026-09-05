@@ -1,0 +1,77 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# How the public MCUHome registry publishes: where the tool comes from,
+# what it reads, and which of the two runs is on a timer.
+#
+# Everything here is public. What is *not* here is anything true of one
+# particular machine or of the way it is administered — above all the
+# publisher keys, which are never in a repository and are put on the
+# server by whoever is entitled to move them.
+#
+# Values are spelled out even where they match a role default: this file
+# is what the running registry is, and a changed default in a role must
+# not quietly change a live server.
+
+# --- the tool -------------------------------------------------------------
+
+registry_publish_repository: https://github.com/mcu-home/mcuhome-packagetool.git
+
+# The tool is this repository, so pinning a commit here would mean the
+# commit that pins it cannot be the commit it pins. The branch is
+# therefore what the server follows, and which revision is actually
+# installed is recorded on the machine
+# (/opt/packagetool/installed-revision) and printed by the run that
+# installs it. Pin a tag here once the tool carries releases of its own.
+registry_publish_version: main
+
+registry_publish_home: /opt/packagetool
+registry_publish_checkout_dir: /opt/packagetool/checkout
+registry_publish_venv_dir: /opt/packagetool/venv
+
+# --- what this registry publishes ----------------------------------------
+
+# Out of the checkout, so the tool, the reference verifier, the pages and
+# the configuration that says which release feeds which source are all
+# one version of one tree.
+registry_publish_publishing_config: /opt/packagetool/checkout/deploy/mcuhome/publishing.json
+registry_publish_anchor: /opt/packagetool/checkout/deploy/mcuhome/anchor.json
+registry_publish_pages_dir: /opt/packagetool/checkout/pages
+
+# The anchor is served as well as used. A mirror operator or an auditor
+# compares it against the one their tool already carries — comparing is
+# the use; fetching it at verification time is not verification.
+registry_publish_tree_files: /opt/packagetool/checkout/deploy/mcuhome/anchor.json
+
+# Every version this registry carries before 1.0 is a prerelease, so a
+# pipeline that ignored them would carry nothing.
+registry_publish_include_prereleases: true
+
+# A document close to expiring fails the run after everything else has
+# succeeded, so it arrives as a notification rather than as a line in a
+# journal nobody is reading. The key set it warns about needs the offline
+# root keys and weeks of notice.
+registry_publish_status_warning_is_failure: true
+
+# --- the accounts and the paths -------------------------------------------
+
+registry_publish_user: packagetool-publish
+registry_publish_group: packagetool-publish
+registry_publish_keys_dir: /etc/packagetool/publisher-keys
+
+# --- when things run ------------------------------------------------------
+
+# Publishing stays a deliberate act: the timer exists so that turning it
+# on later is one value, and it is off.
+registry_publish_timer_enabled: false
+registry_publish_on_calendar: "Mon *-*-* 05:17:00 UTC"
+
+# The refresh runs from day one. Mondays, early, the same slot the
+# retired hosted job used.
+registry_publish_refresh_timer_enabled: true
+registry_publish_refresh_on_calendar: "Mon *-*-* 04:17:00 UTC"
+
+# Three hours. The largest package this registry carries is over half a
+# gigabyte and a release set is several of them.
+registry_publish_unit_timeout: 10800

@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# {{ ansible_managed }}
+#
+# A oneshot, so "systemctl start" is the one command a publish is: it
+# blocks until the run is over and its exit status is the run's. That is
+# also what makes the manual path and the timer path the same path, and
+# what gives a failure notification something to hang off.
+#
+# It runs as root and drops out of it immediately. The snapshot, the
+# docroot switch and btrfs send need CAP_SYS_ADMIN; the network, the
+# fetched bytes and the publisher key are handled by an unprivileged
+# account the command switches to. Doing it the other way round — running
+# unprivileged and asking for the privileged parts back — would mean
+# handing that account a way to become root, which is the thing being
+# avoided.
+
+[Unit]
+Description={{ item.description }}
+Documentation=https://github.com/mcu-home/mcuhome-packagetool
+
+# The registry root is a mount. A run against the empty directory
+# underneath it would publish a registry that lost everything.
+RequiresMountsFor={{ registry_root }}
+AssertPathIsMountPoint={{ registry_root }}
+
+# Nothing to fetch before the network is up.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={{ registry_publish_script_path }} --config {{ registry_publish_config_path }}{% for argument in item.arguments %} {{ argument }}{% endfor %}
+
+TimeoutStartSec={{ registry_publish_unit_timeout }}
+
+# The whole filesystem is read-only to this run except the registry
+# itself. It writes the working tree, the snapshots and the dumps, and
+# has no business anywhere else — including in the checkout of the tool
+# it is running, which a configuration run owns and a publish must not be
+# able to change.
+ProtectSystem=strict
+ReadWritePaths={{ registry_root }}
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
