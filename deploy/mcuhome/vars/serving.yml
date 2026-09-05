@@ -111,7 +111,7 @@ registry_proxy_public_sites:
 # and this value is changed to match after the certificate has been
 # issued and the host answers under it. A name that turns out not to
 # resolve here yet then costs a second run rather than a revert.
-registry_bootstrap_tls: internal
+registry_bootstrap_tls: acme
 
 # --- the rsync export -----------------------------------------------------
 
