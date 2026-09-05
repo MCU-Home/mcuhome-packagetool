@@ -2,28 +2,40 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# The catalogue-regeneration check: sources.json, a registry tree's
-# unsigned directory of sources, is generated from the publishing
-# configuration. This regenerates it from
-# deploy/mcuhome/publishing.json — the configuration the public MCUHome
-# registry is run with — and compares the result against the sources.json
-# at the repository root, which is the copy the host serves today.
+# The catalogue-generation check: sources.json, a registry tree's
+# unsigned directory of sources, is written by the publish pipeline from
+# the publishing configuration, once per publish. This runs the same
+# command the pipeline runs, with the configuration the public MCUHome
+# registry is run with, and checks that what comes out names exactly the
+# sources that configuration declares.
 #
-# The regenerated file goes to a temporary directory and never into the
-# working tree: the served copy is frozen, and a check that rewrites what
-# it is checking cannot fail cleanly on a machine where the working tree
-# has to stay as it is. A correctness assertion over generated output,
-# not a style check, so it lives in the test gate rather than lint. Run
-# from this repository's own .venv.
+# There is nothing to compare against in this repository: the catalogue
+# is not kept here, it exists on the registry host and is regenerated
+# whenever anything is published. So the generated file goes to a
+# temporary directory and is checked against its own input — which is
+# also why this stays offline. Comparing it against what the host serves
+# would go red for every source added here until the next publish ran,
+# and that is a change waiting to be deployed, not a broken repository.
+#
+# The document's properties are pytest's subject; what this adds is the
+# command-line path the pipeline depends on — argument handling and the
+# file it writes. A correctness assertion over generated output, not a
+# style check, so it lives in the test gate rather than lint. Run from
+# this repository's own .venv.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 venv="$root/.venv"
 publishing="deploy/mcuhome/publishing.json"
-served="sources.json"
+catalog="sources.json"
 
 if [ ! -x "$venv/bin/python" ]; then
   echo "test.d/catalog: no .venv found. Create it first — see README, \"Development — how to work on this repository\"." >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "test.d/catalog: jq is not installed. Install it first (e.g. apt install jq)." >&2
   exit 1
 fi
 
@@ -32,13 +44,34 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 "$venv/bin/python" -m mcuhome.packagetool catalog \
-  --publishing "$publishing" --out "$work/$served"
+  --publishing "$publishing" --out "$work/$catalog"
 
-if diff -u "$served" "$work/$served"; then
-  exit 0
+if [ ! -s "$work/$catalog" ]; then
+  echo "test.d/catalog: the command wrote no $catalog." >&2
+  exit 1
 fi
 
-echo "test.d/catalog: $served does not match what $publishing generates." >&2
-echo "Write the generated one over it with:" >&2
-echo "  .venv/bin/python -m mcuhome.packagetool catalog --publishing $publishing --out $served" >&2
-exit 1
+declared="$(jq -r '.sources | keys[]' "$publishing" | LC_ALL=C sort)"
+listed="$(jq -r '.sources[].name' "$work/$catalog" | LC_ALL=C sort)"
+if [ "$declared" != "$listed" ]; then
+  echo "test.d/catalog: the catalogue does not name the sources $publishing declares." >&2
+  diff -u <(printf '%s\n' "$declared") <(printf '%s\n' "$listed") >&2 || true
+  exit 1
+fi
+
+# Every entry has to be usable by whoever reads the catalogue: a path
+# into the tree, and the two texts the browsable page shows.
+if ! jq -e '
+  .version == 1 and
+  (.sources | length > 0) and
+  all(.sources[];
+    .path == (.name + "/") and
+    (.title | type == "string" and length > 0) and
+    (.description | type == "string" and length > 0))
+' "$work/$catalog" >/dev/null; then
+  echo "test.d/catalog: an entry has no directory path, title or description." >&2
+  jq . "$work/$catalog" >&2
+  exit 1
+fi
+
+echo "test.d/catalog: $(printf '%s\n' "$listed" | wc -l) source(s) generated from $publishing."

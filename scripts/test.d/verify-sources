@@ -2,17 +2,28 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# The reference verifier over every source the publishing configuration
-# declares, checked against the anchor beside it, followed by the
-# remaining-validity report: a broken signature or a document past its
-# warning threshold fails here rather than in somebody's build.
+# The reference verifier against the registry as it is actually served,
+# followed by the remaining-validity report: a broken signature, a
+# document that no longer matches the anchor, or one past its warning
+# threshold fails here rather than in somebody's build.
 #
-# Configuration and anchor come from deploy/mcuhome/, which is where the
-# MCUHome registry's own instance settings live; the source directories
-# themselves are still at the repository root, which is what the host
-# serves today. Needs network (fetches the published documents) — that is
-# fine, it is its own job, kept apart from the offline pytest/catalog
-# checks. Run from this repository's own .venv.
+# This repository no longer holds any source directory — the tree lives
+# on the registry host — so the documents are fetched first and the
+# verifier is pointed at what came back. The route is the one a client
+# takes: the bootstrap host is asked for a source's signed mirror list,
+# and every mirror that list names is then fetched from in full. Only
+# the bootstrap host is a constant here; nothing else is hard-coded,
+# because nothing else is meant to be.
+#
+# Which sources exist and which anchor they are checked against come from
+# deploy/mcuhome/ — the instance settings of the MCUHome registry, which
+# is what makes this the one check in this repository that is about a
+# particular registry rather than about the tool.
+#
+# Needs network, and says so: it fails while the registry is unreachable,
+# which is the price of checking the live tree instead of a checkout.
+# Kept apart from the offline pytest/catalog checks for exactly that
+# reason. Run from this repository's own .venv.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,21 +31,137 @@ venv="$root/.venv"
 publishing="deploy/mcuhome/publishing.json"
 anchor="deploy/mcuhome/anchor.json"
 
+# The one address a client is configured with. Everything else — which
+# mirrors exist, what they serve — is discovered from signed documents.
+bootstrap="https://packages.mcuhome.org"
+
+# The documents a source consists of. Package files are deliberately not
+# fetched: the verifier checks documents, and a package's bytes are
+# checked against the index when somebody actually downloads it.
+documents=(keys.json mirrors.json index.json)
+
+# How far a key rotation is followed back. A source that has rotated
+# names its predecessor, and the verifier walks the chain to reach the
+# anchor; the bound is here so a malformed chain ends the run instead of
+# the network.
+max_key_generations=10
+
 if [ ! -x "$venv/bin/python" ]; then
   echo "test.d/verify-sources: no .venv found. Create it first — see README, \"Development — how to work on this repository\"." >&2
   exit 1
 fi
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "test.d/verify-sources: jq is not installed. Install it first (e.g. apt install jq)." >&2
+for tool in jq curl; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "test.d/verify-sources: $tool is not installed. Install it first (e.g. apt install $tool)." >&2
+    exit 1
+  fi
+done
+
+cd "$root"
+tree="$(mktemp -d)"
+trap 'rm -rf "$tree"' EXIT
+
+fetch() {
+  # One document, into the fetched tree. Retries only what a retry can
+  # fix, and never silently writes an error page into a file the
+  # verifier is about to trust.
+  local url="$1" target="$2"
+  mkdir -p "$(dirname "$target")"
+  if ! curl -fsS --max-time 60 --retry 3 --retry-connrefused -o "$target" "$url"; then
+    echo "test.d/verify-sources: could not fetch $url" >&2
+    return 1
+  fi
+}
+
+# Everything fetched here is named by a document that has not been
+# verified yet — that is the order the check exists in. So the two things
+# a document gets to decide, a mirror's base URL and a file name inside
+# the source, are held to their shape before they are used: an unchecked
+# document must not be able to name a scheme curl reads from disk, or a
+# path that leaves the directory being assembled.
+usable_base() {
+  case "$1" in
+    https://*/) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+usable_name() {
+  case "$1" in
+    "" | /* | .* | *..*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+copies=()
+sources="$(jq -r '.sources | keys[]' "$publishing")"
+for source in $sources; do
+  list="$tree/discovery/$source.json"
+  mkdir -p "$(dirname "$list")"
+  fetch "$bootstrap/$source/mirrors.json" "$list"
+
+  mirrors="$(jq -r '.mirrors[]?.url' "$list")"
+  if [ -z "$mirrors" ]; then
+    echo "test.d/verify-sources: $source: the bootstrap host names no mirror for it." >&2
+    exit 1
+  fi
+
+  for mirror in $mirrors; do
+    if ! usable_base "$mirror"; then
+      echo "test.d/verify-sources: $source: $mirror is not an https base URL ending in '/'." >&2
+      exit 1
+    fi
+    copy="$tree/sources/$source/$(printf '%s' "$mirror" | tr -c 'A-Za-z0-9._-' '_')"
+    for document in "${documents[@]}"; do
+      fetch "$mirror$document" "$copy/$document"
+      fetch "$mirror$document.sig" "$copy/$document.sig"
+    done
+
+    # An index that has outgrown one file names its parts, and the parts
+    # carry most of the entries; verifying only the head would check the
+    # smaller half and say nothing about it.
+    while IFS= read -r part; do
+      [ -z "$part" ] && continue
+      if ! usable_name "$part"; then
+        echo "test.d/verify-sources: $source at $mirror: index part $part is not a file name in the source." >&2
+        exit 1
+      fi
+      fetch "$mirror$part" "$copy/$part"
+    done < <(jq -r '.parts[]?.file' "$copy/index.json")
+
+    # A rotated key set is authorised by the one before it, so the chain
+    # back to the anchor has to be here too.
+    previous="$(jq -r '.previous // empty' "$copy/keys.json")"
+    generations=0
+    while [ -n "$previous" ]; do
+      generations=$((generations + 1))
+      if [ "$generations" -gt "$max_key_generations" ]; then
+        echo "test.d/verify-sources: $source: more than $max_key_generations key generations at $mirror." >&2
+        exit 1
+      fi
+      if ! usable_name "$previous"; then
+        echo "test.d/verify-sources: $source at $mirror: key set $previous is not a path in the source." >&2
+        exit 1
+      fi
+      fetch "$mirror$previous" "$copy/$previous"
+      fetch "$mirror$previous.sig" "$copy/$previous.sig"
+      previous="$(jq -r '.previous // empty' "$copy/$previous")"
+    done
+
+    echo "$source at $mirror"
+    "$venv/bin/python" verify.py "$copy" --anchor "$anchor"
+    copies+=("$copy")
+  done
+done
+
+if [ "${#copies[@]}" -eq 0 ]; then
+  echo "test.d/verify-sources: $publishing declares no source — nothing was verified." >&2
   exit 1
 fi
 
-cd "$root"
-sources="$(jq -r '.sources | keys[]' "$publishing")"
-for source in $sources; do
-  "$venv/bin/python" verify.py "$source" --anchor "$anchor"
-done
+# The validity report over everything fetched: one warning is enough to
+# fail, and it arrives weeks before the document it is about runs out.
+"$venv/bin/python" -m mcuhome.packagetool status --source "${copies[@]}"
 
-# shellcheck disable=SC2086
-"$venv/bin/python" -m mcuhome.packagetool status --source $sources
+echo "test.d/verify-sources: ${#copies[@]} served copies verified against $anchor."

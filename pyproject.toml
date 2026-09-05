@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# This repository publishes no distribution: it is the package host
-# (https://packages.mcuhome.org) plus the tooling that maintains it. The
-# project table exists so the tooling and the reference verifier are
-# importable in a virtual environment of this repository's own — the
-# published artefacts are the JSON documents under sdk/, not a wheel.
+# This repository publishes no distribution: it is the tooling that
+# maintains a package registry (https://packages.mcuhome.org), not
+# something installed from an index. The project table exists so the
+# tooling and the reference verifier are importable in a virtual
+# environment of this repository's own, and so the registry host can
+# install the same tree into one of its own.
 
 [build-system]
 requires = ["setuptools>=68"]

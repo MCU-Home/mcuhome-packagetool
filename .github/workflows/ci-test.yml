@@ -4,13 +4,15 @@
 # Test gate: one job per wrapper in scripts/test.d/, plus a pre-check
 # that every wrapper has a job here.
 #
-# test-pytest and test-catalog are offline: the fixed test vectors and
-# the catalogue-regeneration check (sources.json against
-# deploy/mcuhome/publishing.json). test-verify-sources is its own job
-# because it needs network — the reference verifier and the
-# remaining-validity report run against the *published* sources, so a
-# broken signature or an expiring document fails here rather than in
-# somebody's build.
+# test-pytest and test-catalog are offline: the fixed test vectors, and
+# the catalogue the publish pipeline generates from
+# deploy/mcuhome/publishing.json. test-verify-sources is its own job
+# because it needs network — it fetches the signed documents from the
+# live registry and runs the reference verifier and the
+# remaining-validity report against those, so a broken signature or an
+# expiring document fails here rather than in somebody's build. That
+# also makes it the one job whose result depends on a host outside this
+# repository.
 #
 # test-registry-snapshot, test-registry-storage, test-mirror-sync and
 # test-registry-publish exercise the deploy/ material against real

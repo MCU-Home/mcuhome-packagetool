@@ -1,12 +1,12 @@
 version = 1
-SPDX-PackageName = "MCUHome package host"
+SPDX-PackageName = "MCUHome package tooling"
 SPDX-PackageSupplier = "The MCUHome Contributors"
 SPDX-PackageDownloadLocation = "https://github.com/mcu-home/mcuhome-packagetool"
 
 # Fallback annotation: files carrying their own SPDX headers take
-# precedence ("closest"); everything else — Markdown, the static page,
-# CNAME, and the published JSON documents, none of which have a comment
-# syntax that survives being served — is covered here.
+# precedence ("closest"); everything else — Markdown, the HTML pages, and
+# the JSON documents, none of which have a comment syntax that survives
+# being served — is covered here.
 [[annotations]]
 path = "**"
 precedence = "closest"

@@ -9,9 +9,13 @@ assumes.** A source declares a list of packages, and the pipeline reads
 that list with jq — a malformed entry would surface as a failed publish
 rather than as a failed test.
 
-**The catalogue cannot drift.** ``sources.json`` is generated from the
-publishing configuration; a source added to one and not the other would
-be a directory that lies, and it would lie silently.
+**The catalogue describes the sources the configuration declares.**
+``sources.json`` is not kept in this repository: the publish pipeline
+generates it from the publishing configuration and writes it into the
+served tree. What can be checked here is the document that configuration
+produces — a catalogue naming a source the registry does not publish, or
+pointing somewhere other than that source's own directory, would be a
+directory that lies.
 
 **The pages load nothing from another host.** A registry exists so that
 integrity is checkable, and a script fetched from somebody else's server
@@ -20,9 +24,9 @@ Linking to another site is fine; *executing* code from one is not, and
 the difference is what this checks.
 
 The pages are read from ``pages/`` and the configuration from
-``deploy/mcuhome/``, which are the sources of truth for both. The copies
-still lying at the repository root are the tree as it is served today,
-and they are on their way out.
+``deploy/mcuhome/``, which is where both are edited and what the registry
+host installs from. Nothing here reads a served tree — that is
+``scripts/test.d/verify-sources``, which fetches one.
 """
 
 from __future__ import annotations
@@ -44,13 +48,19 @@ BROWSER = PAGES_DIR / "browser.html"
 
 
 @pytest.fixture(scope="module")
-def catalog() -> dict:
-    return json.loads((ROOT / CATALOG_FILE).read_text(encoding="utf-8"))
+def publishing() -> dict:
+    return json.loads(PUBLISHING.read_text(encoding="utf-8"))
 
 
 @pytest.fixture(scope="module")
-def publishing() -> dict:
-    return json.loads(PUBLISHING.read_text(encoding="utf-8"))
+def catalog(publishing: dict) -> dict:
+    """The catalogue this registry's configuration produces.
+
+    Built rather than read: the served copy is written by the publish
+    pipeline on the registry host, and this repository holds the input to
+    it, not the result.
+    """
+    return build_catalog(publishing)
 
 
 def test_every_source_declares_the_packages_it_carries(publishing: dict) -> None:
@@ -102,43 +112,36 @@ def test_a_declared_meta_package_names_packages_the_source_carries(publishing: d
                 )
 
 
-def test_the_catalogue_is_up_to_date(catalog: dict, publishing: dict) -> None:
-    assert catalog == build_catalog(publishing), (
-        f"{CATALOG_FILE} is stale — run: python -m mcuhome.packagetool catalog "
-        f"--publishing {PUBLISHING.relative_to(ROOT)} --out {CATALOG_FILE}"
+def test_the_catalogue_names_the_sources_that_are_published(
+    catalog: dict, publishing: dict
+) -> None:
+    """A catalogue entry stands for a source of this registry, and only for one.
+
+    ``sources.json`` is what a visitor browses the registry by, so an
+    entry with no source behind it is a dead link and a source with no
+    entry is invisible. The pipeline writes the file from exactly this
+    configuration, which is why the two can be held to each other here.
+    """
+    listed = [entry["name"] for entry in catalog["sources"]]
+    assert len(listed) == len(set(listed)), f"{CATALOG_FILE} names a source twice"
+    assert set(listed) == set(publishing["sources"]), (
+        "a source is declared but not catalogued, or catalogued but not declared"
     )
 
 
-def test_the_served_copies_still_match_what_they_were_taken_from() -> None:
-    """One file in two places is a bug waiting for the second edit.
+def test_every_catalogue_entry_points_at_its_own_directory(catalog: dict) -> None:
+    """The path is where the source's ``index.json`` is, relative to the tree root.
 
-    While this repository is still the host, its root carries the tree as
-    it is served: the pages, the catalogue, the anchor. Those copies are
-    frozen — the pages under ``pages/`` and the configuration under
-    ``deploy/mcuhome/`` are what gets edited — and this is what says so
-    out loud if somebody edits the wrong one.
+    A source is a directory named after it — that is the whole layout —
+    and the browser resolves ``path`` against the host it was loaded
+    from, so an absolute or reaching path would take a reader off the
+    tree it is inspecting.
     """
-    for served, source in (
-        (ROOT / "index.html", PAGES_DIR / "index.html"),
-        (ROOT / "browser.html", PAGES_DIR / "browser.html"),
-        (ROOT / "anchor.json", ROOT / "deploy" / "mcuhome" / "anchor.json"),
-    ):
-        assert served.read_bytes() == source.read_bytes(), (
-            f"{served.name} at the repository root is what the host serves today, and "
-            f"{source.relative_to(ROOT)} is what it is taken from — they have drifted apart"
-        )
-
-
-def test_the_catalogue_and_the_published_sources_agree(catalog: dict) -> None:
-    listed = {entry["name"] for entry in catalog["sources"]}
-    published = {path.parent.name for path in ROOT.glob("*/" + INDEX_FILE)}
-    assert listed == published, "a source is published but undeclared, or declared but absent"
-
-
-def test_every_catalogue_entry_points_at_a_real_source(catalog: dict) -> None:
     for entry in catalog["sources"]:
-        assert entry["path"] == f"{entry['name']}/"
-        assert (ROOT / entry["path"] / INDEX_FILE).is_file()
+        assert entry["path"] == f"{entry['name']}/", (
+            f"{entry['name']}: a source lives in the directory named after it"
+        )
+        assert INDEX_FILE not in entry["path"], "the path names the directory, not the document"
 
 
 def test_the_catalogue_says_it_is_not_authoritative(catalog: dict) -> None:

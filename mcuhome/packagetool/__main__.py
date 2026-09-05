@@ -65,9 +65,10 @@ PRUNE_GRACE_DAYS = 90
 #: time to arrange one.
 WARN_DAYS = {KEYS_FILE: 60, INDEX_FILE: 7, MIRRORS_FILE: 7}
 
-#: Where a workflow finds the publisher key: one or more PEM blocks in
-#: one environment variable, so a key overlap (ADR 0025 §6) needs no
-#: change to the workflow, only a second block in the secret.
+#: Fallback for callers that cannot pass ``--publisher-key`` file
+#: arguments: one or more PEM blocks in one environment variable, so a
+#: key overlap needs no code change, only a second block in the value.
+#: The server pipeline passes key files explicitly instead.
 PUBLISHER_ENV = "MCUHOME_PUBLISHER_KEYS"
 
 

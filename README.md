@@ -12,33 +12,32 @@ signature, not by trusting a URL.
 - `verify.py` — the normative reference verifier, standalone so it can be copied next to a mirrored source and run with the standard library and `cryptography`.
 - `pages/` — the pages a registry serves: a front page and the browsable index of everything published. They are part of what is deployed, not part of this repository's own presentation.
 - `deploy/` — the Ansible roles that turn a server into a registry host, and under `deploy/mcuhome/` the settings, source declarations and trust anchor the public MCUHome registry is run with.
-- `sdk/`, `build-workspace/`, `build-tools/` — the published sources: the SDK a build compiles from, and the two kinds of package the build environment is made of. Each is a self-contained directory carrying its own root keys, mirror list, signed index and package files.
-- `sources.json` — the unsigned directory of sources, generated from the publishing configuration: a listing for a human to browse, with no authority over any source.
 
-### The copies at the repository root
+### What it does not hold
 
-Until the registry finishes moving to its own host, this repository is
-also still the site behind `packages.mcuhome.org`, and what that site
-serves is what lies at its root: `CNAME`, `.nojekyll`, `index.html`,
-`browser.html`, `sources.json`, `anchor.json` and the three source
-directories.
-
-Two of those exist twice on purpose. `pages/` and `deploy/mcuhome/` are
-where the pages and the anchor are edited; the copies at the root are
-frozen serving artefacts, and a test compares them so the two cannot
-drift apart. They are removed once the served tree comes from the new
-host rather than from this repository.
+The registry itself. `packages.mcuhome.org` is served from its own host:
+the signed documents, the package files and the generated `sources.json`
+live in a filesystem tree there, published in one atomic step per
+release and mirrorable in full over plain rsync. This repository holds
+what produces that tree and what checks it — a published package is
+never in a git history, which is what lets one be larger than a
+repository has any business carrying.
 
 ## Using it
 
 A source is a plain directory, and everything needed to trust it is inside:
 the packages, the key set that signs the index, and the mirror list. Verifying
-one is therefore local work on bytes you already have — a mirror, a cache or a
-checkout — against a root anchor supplied out of band:
+one is therefore local work on bytes you already have — a mirror or a cache —
+against a root anchor supplied out of band:
 
 ```sh
+rsync -a rsync://mirror-1.packages.mcuhome.org/registry/sdk/ sdk/
 python verify.py sdk --anchor deploy/mcuhome/anchor.json
 ```
+
+The verifier fetches nothing itself, on purpose: what it says holds for the
+bytes on disk, so pulling them and checking them stay two separable acts and
+a mirror is worth exactly as much as the origin.
 
 Operating a source is the other half: `python -m mcuhome.packagetool` lays a
 source down, records a package or a meta package in it, renews its
@@ -46,11 +45,11 @@ signatures and reports how long each document is still valid.
 
 ## How it fits into MCUHome
 
-The packages served here are the release archives of
+The packages the registry carries are the release archives of
 [mcuhome-sdk](https://github.com/mcu-home/mcuhome-sdk) — the SDK itself and
 the two kinds of package its build environment is made of — pulled from a
-tagged release and recorded into their source with the tool in this
-repository. A source's `index.json` names each package with its size and
+tagged release by the registry host and recorded into their source with the
+tool in this repository. A source's `index.json` names each package with its size and
 sha256, which is what
 [mcuhome-workbench](https://github.com/mcu-home/mcuhome-workbench) resolves an
 SDK pin against and what
@@ -68,10 +67,7 @@ exactly as much as the original.
 | `deploy/mcuhome/` | How the public MCUHome registry is run: storage and serving settings, `publishing.json`, `anchor.json` |
 | `tests/` | The suite, and the fixed source directories it verifies, one per outcome |
 | `deploy/tests/` | Functional tests for the deploy material, against real filesystems |
-| `sdk/` | The published MCUHome SDK source: signed documents and package files |
-| `build-workspace/` | The build environment's source-world package: same shape, own keys |
-| `build-tools/` | The build environment's host-tool packages, one per platform, plus the meta package standing for the family |
-| `.github/` | The refresh and check workflows |
+| `.github/` | The check workflows: one job per lint and test wrapper |
 
 ## Development — how to work on this repository
 
@@ -95,8 +91,8 @@ Six checks need more than that, four of them deploy tests that need root:
 
 | Check | Needs |
 |---|---|
-| `test catalog` | regenerates `sources.json` from `deploy/mcuhome/publishing.json` into a temporary file and compares — nothing extra |
-| `test verify-sources` | `jq` and network access: it verifies every published document against `deploy/mcuhome/anchor.json` |
+| `test catalog` | `jq`: it generates `sources.json` from `deploy/mcuhome/publishing.json` into a temporary file and checks it against that configuration — offline, nothing else |
+| `test verify-sources` | `jq`, `curl` and network access: it asks `packages.mcuhome.org` for each source's mirror list, fetches the signed documents from every mirror named there, and verifies them against `deploy/mcuhome/anchor.json`. It checks the live registry, so it fails while that registry is unreachable |
 | `test registry-snapshot` | root, `btrfs-progs` and loop devices — run it as `sudo scripts/test registry-snapshot` |
 | `test registry-storage` | root, loop devices, `btrfs-progs`, `e2fsprogs`, `lvm2` and `fdisk` — run it as `sudo scripts/test registry-storage` |
 | `test mirror-sync` | root, `btrfs-progs`, loop devices and `jq` — run it as `sudo scripts/test mirror-sync` |
@@ -214,7 +210,8 @@ compromise through
 - [`verify.py`](verify.py) — what a client must check, in executable form
 - [`mcuhome/packagetool/`](mcuhome/packagetool/) — the publishing tool, documented module by module
 - [`deploy/`](deploy/) — hosting a registry: the roles, the tree they lay down, and how a publish is made atomic
-- [packages.mcuhome.org](https://packages.mcuhome.org) — the sources this repository serves
+- `packages.mcuhome.org` — the bootstrap host: where a client asks which mirrors a source has. It answers with signed documents and nothing else, so there is no page to open there
+- [mirror-1.packages.mcuhome.org](https://mirror-1.packages.mcuhome.org/) — the registry itself: the full tree, browsable, and the rsync export to copy it from
 - [The MCUHome organization](https://github.com/mcu-home) — the other repositories of the project
 
 ## Contributing and support
