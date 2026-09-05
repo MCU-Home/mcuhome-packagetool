@@ -73,7 +73,8 @@ exactly as much as the original.
 
 This repository has its own virtual environment in `.venv/`; nothing is
 installed into the system Python or into another repository's environment.
-`bin/` holds the user-facing entry points, `scripts/` the development
+There is no `bin/`: the tool is invoked as `python -m mcuhome.packagetool`
+and the verifier as `python verify.py`. `scripts/` holds the development
 tooling: `scripts/test` and `scripts/lint` dispatch the checks — `all` runs
 every one, `list` names them, `<name>` runs one — and each check is its own
 wrapper in `scripts/test.d/` or `scripts/lint.d/`. The wrappers select

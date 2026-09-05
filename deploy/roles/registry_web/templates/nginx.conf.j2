@@ -271,12 +271,12 @@ http {
 
     # The bootstrap subset. Same tree, but only the documents a client
     # needs to get from "I have an anchor and a source name" to "I know
-    # which mirror to fetch from": the key set it verifies against the
-    # anchor, the archived key sets it may have to walk back through, and
-    # the signed mirror list. No index, no packages, no pages — a client
-    # that resolved a package here would find nothing to download, and a
-    # host that answers with half a source is worse than one that answers
-    # with none of it.
+    # which mirror to fetch from": the anchor, the key set it verifies
+    # against it, the archived key sets it may have to walk back through,
+    # and the signed mirror list — plus, when configured, the page at the
+    # root. No index.json, no packages: a client that resolved a package
+    # here would find nothing to download, and a host that answers with
+    # half a source is worse than one that answers with none of it.
     server {
 {{ tree_server_head(registry_web_bootstrap_port) }}
 
