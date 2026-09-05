@@ -191,6 +191,15 @@ jobs:
           .venv/bin/pip install --disable-pip-version-check -U pip
           .venv/bin/pip install --disable-pip-version-check -e . --group dev
 
+      # packagetool-publish drops privileges via setpriv, and the unprivileged
+      # user then has to traverse down to the venv; runner home directories
+      # are 0750, unlike production (/opt) and local checkouts, which are
+      # world-traversable already, so this fix-up is CI-only.
+      - name: Make workspace traversable for the dropped-privilege publish user
+        run: |
+          sudo chmod o+x /home/runner /home/runner/work "$(dirname "$GITHUB_WORKSPACE")"
+          sudo chmod -R o+rX "$GITHUB_WORKSPACE"
+
       - name: Install btrfs-progs
         run: |
           sudo apt-get update
