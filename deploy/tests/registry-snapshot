@@ -72,7 +72,7 @@ loop_device=""
 mount_point=""
 
 # Invoked by the EXIT trap below, not from anywhere in the flow.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   if [ -n "$mount_point" ] && findmnt --mountpoint "$mount_point" >/dev/null 2>&1; then
     umount "$mount_point" || true

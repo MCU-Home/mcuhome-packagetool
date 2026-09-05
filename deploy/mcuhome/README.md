@@ -12,14 +12,29 @@ version of this directory rather than editing the roles.
 ```
 vars/registry.yml   storage layout and snapshot retention
 vars/serving.yml    the host names, what each one serves, the rsync limits
+publishing.json     which upstream release feeds which source
+anchor.json         the root key set this registry's sources verify against
 ```
+
+`publishing.json` and `anchor.json` are not Ansible variables, and they
+are here anyway: they answer the same question the two `vars/` files do —
+what this one registry consists of — and the tool that reads them is told
+their path like every other path it works on. A registry of your own has
+its own pair of them.
 
 ## What is here and what is not
 
 Here: values that describe the registry itself — where it is mounted,
 what the subvolume is called, how the filesystem is mounted, how many
 snapshots and how many days of them are kept, which host names it answers
-on and what each of them is allowed to answer with.
+on and what each of them is allowed to answer with, which sources it
+publishes and which root keys those sources are rooted in.
+
+The anchor is configuration on both ends: it lives here because it says
+what *this* registry's trust is rooted in, and it is served from the
+registry as well, so that a mirror operator or an auditor can compare it
+against the one their tool already carries. Comparing is the use;
+downloading it at verification time is not verification.
 
 Not here: anything that is a property of one particular machine or of the
 way it is administered. Which block device the registry lives on, which

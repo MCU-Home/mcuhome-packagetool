@@ -1,23 +1,28 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""The served site: its directory of sources, and what its pages may load.
+"""The served tree: its directory of sources, and what its pages may load.
 
 Three properties are worth a test rather than a habit.
 
-**The operational configuration has the shape the publish workflow
-assumes.** A source declares a list of packages, and the workflow reads
+**The operational configuration has the shape the publish pipeline
+assumes.** A source declares a list of packages, and the pipeline reads
 that list with jq — a malformed entry would surface as a failed publish
 rather than as a failed test.
 
-**The catalogue cannot drift.** ``sources.json`` is generated from
-``publishing.json``; a source added to one and not the other would be a
-directory that lies, and it would lie silently.
+**The catalogue cannot drift.** ``sources.json`` is generated from the
+publishing configuration; a source added to one and not the other would
+be a directory that lies, and it would lie silently.
 
-**The pages load nothing from another host.** This host exists so that
+**The pages load nothing from another host.** A registry exists so that
 integrity is checkable, and a script fetched from somebody else's server
 is the one moving part able to rewrite the hashes a visitor is reading.
 Linking to another site is fine; *executing* code from one is not, and
 the difference is what this checks.
+
+The pages are read from ``pages/`` and the configuration from
+``deploy/mcuhome/``, which are the sources of truth for both. The copies
+still lying at the repository root are the tree as it is served today,
+and they are on their way out.
 """
 
 from __future__ import annotations
@@ -32,7 +37,10 @@ from mcuhome.packagetool.catalog import CATALOG_FILE, build_catalog
 from mcuhome.packagetool.source import INDEX_FILE
 
 ROOT = Path(__file__).resolve().parents[2]
+PAGES_DIR = ROOT / "pages"
+PUBLISHING = ROOT / "deploy" / "mcuhome" / "publishing.json"
 PAGES = ["index.html", "browser.html"]
+BROWSER = PAGES_DIR / "browser.html"
 
 
 @pytest.fixture(scope="module")
@@ -42,15 +50,15 @@ def catalog() -> dict:
 
 @pytest.fixture(scope="module")
 def publishing() -> dict:
-    return json.loads((ROOT / "publishing.json").read_text(encoding="utf-8"))
+    return json.loads(PUBLISHING.read_text(encoding="utf-8"))
 
 
 def test_every_source_declares_the_packages_it_carries(publishing: dict) -> None:
-    """The shape the publish workflow loops over, checked before it runs.
+    """The shape the publish pipeline loops over, checked before it runs.
 
     A source carries a list of packages rather than one, because an
     architecture is a suffix of a package name and not a source of its
-    own. The workflow reads that list with jq while publishing; a
+    own. The pipeline reads that list with jq while publishing; a
     malformed entry is a failed publish, and this is where it is cheap.
     """
     for name, entry in publishing["sources"].items():
@@ -63,12 +71,12 @@ def test_every_source_declares_the_packages_it_carries(publishing: dict) -> None
             )
             assert package["asset"].startswith(package["name"] + "-"), (
                 f"{name}: the asset pattern of {package['name']} must name that package — "
-                "the workflow derives the version by stripping the name from the file name"
+                "the pipeline derives the version by stripping the name from the file name"
             )
 
 
 def test_a_declared_meta_package_names_packages_the_source_carries(publishing: dict) -> None:
-    """The shape the publish workflow turns into ``add-meta`` arguments.
+    """The shape the publish pipeline turns into ``add-meta`` arguments.
 
     A meta package stands for packages of its own source: one it does not
     carry could never be published together with it, and the version
@@ -96,8 +104,29 @@ def test_a_declared_meta_package_names_packages_the_source_carries(publishing: d
 
 def test_the_catalogue_is_up_to_date(catalog: dict, publishing: dict) -> None:
     assert catalog == build_catalog(publishing), (
-        "sources.json is stale — run: python -m mcuhome.packagetool catalog"
+        f"{CATALOG_FILE} is stale — run: python -m mcuhome.packagetool catalog "
+        f"--publishing {PUBLISHING.relative_to(ROOT)} --out {CATALOG_FILE}"
     )
+
+
+def test_the_served_copies_still_match_what_they_were_taken_from() -> None:
+    """One file in two places is a bug waiting for the second edit.
+
+    While this repository is still the host, its root carries the tree as
+    it is served: the pages, the catalogue, the anchor. Those copies are
+    frozen — the pages under ``pages/`` and the configuration under
+    ``deploy/mcuhome/`` are what gets edited — and this is what says so
+    out loud if somebody edits the wrong one.
+    """
+    for served, source in (
+        (ROOT / "index.html", PAGES_DIR / "index.html"),
+        (ROOT / "browser.html", PAGES_DIR / "browser.html"),
+        (ROOT / "anchor.json", ROOT / "deploy" / "mcuhome" / "anchor.json"),
+    ):
+        assert served.read_bytes() == source.read_bytes(), (
+            f"{served.name} at the repository root is what the host serves today, and "
+            f"{source.relative_to(ROOT)} is what it is taken from — they have drifted apart"
+        )
 
 
 def test_the_catalogue_and_the_published_sources_agree(catalog: dict) -> None:
@@ -119,7 +148,7 @@ def test_the_catalogue_says_it_is_not_authoritative(catalog: dict) -> None:
 
 @pytest.mark.parametrize("page", PAGES)
 def test_a_page_executes_nothing_from_another_host(page: str) -> None:
-    html = (ROOT / page).read_text(encoding="utf-8")
+    html = (PAGES_DIR / page).read_text(encoding="utf-8")
     assert not re.search(r"<script[^>]+\bsrc\s*=", html, re.I), "no external script"
     assert not re.search(r"<link[^>]+\bhref\s*=\s*[\"']https?:", html, re.I), "no stylesheet"
     assert not re.search(r"<(img|iframe)[^>]+\bsrc\s*=\s*[\"']https?:", html, re.I)
@@ -128,7 +157,7 @@ def test_a_page_executes_nothing_from_another_host(page: str) -> None:
 
 @pytest.mark.parametrize("page", PAGES)
 def test_a_page_fetches_only_from_this_host(page: str) -> None:
-    html = (ROOT / page).read_text(encoding="utf-8")
+    html = (PAGES_DIR / page).read_text(encoding="utf-8")
     for target in re.findall(r"""fetch\(\s*([^,)]+)""", html):
         assert "http" not in target, f"{page}: fetch({target}) leaves this host"
 
@@ -141,7 +170,7 @@ def test_the_inspection_page_admits_it_verifies_nothing() -> None:
     without saying that is worse than showing nothing: it manufactures
     confidence the visitor has no way to earn.
     """
-    html = (ROOT / "browser.html").read_text(encoding="utf-8")
+    html = BROWSER.read_text(encoding="utf-8")
     assert "cannot verify" in html or "verifies nothing" in html
     assert "not verified" in html
     # And the caveat has to reach a downloader, not only a careful reader.
@@ -152,18 +181,18 @@ def test_the_inspection_page_admits_it_verifies_nothing() -> None:
 def test_no_page_sells_the_download_as_protected() -> None:
     """Wording is the whole risk here: 'signed index' reads as 'safe file'."""
     for page in PAGES:
-        html = (ROOT / page).read_text(encoding="utf-8")
+        html = (PAGES_DIR / page).read_text(encoding="utf-8")
         assert "signed index" not in html.lower()
 
 
 def test_sources_can_be_switched_off_not_only_filtered() -> None:
-    html = (ROOT / "browser.html").read_text(encoding="utf-8")
+    html = BROWSER.read_text(encoding="utf-8")
     assert 'type: "checkbox"' in html or 'type="checkbox"' in html
     assert "state.enabled" in html
 
 
 def test_the_browser_reads_the_files_the_site_actually_has() -> None:
-    html = (ROOT / "browser.html").read_text(encoding="utf-8")
+    html = BROWSER.read_text(encoding="utf-8")
     assert CATALOG_FILE in html
     assert INDEX_FILE in html
     # A split index keeps most entries in parts; a browser that only read

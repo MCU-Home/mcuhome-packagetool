@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Functional test for the registry_storage role, against real block
+# devices: loopback images this script creates and throws away again.
+#
+# The role's whole reason for being careful is that it writes to a block
+# device. It creates a filesystem only on a device a low-level probe
+# finds completely empty, adopts an existing btrfs one as it is, and
+# stops without touching anything otherwise. Those refusals are the part
+# that must never quietly stop working, and reasoning about them from
+# reading the tasks is not the same as watching them happen, so this runs
+# the role six times and looks at the device afterwards:
+#
+#   ext4 carrying a file   refused, and the file is still readable
+#   an empty GPT           refused, and the partition table is still there
+#   an LVM member          refused, and the signature is still there
+#   the volume root left mounted at the registry root
+#                          refused, because a run interrupted halfway
+#                          leaves exactly that, and building the tree on
+#                          the volume root is the layout mistake the role
+#                          exists to avoid
+#   an empty device        formatted, mounted, and the tree laid down
+#   an existing btrfs      adopted: same filesystem, same label, whatever
+#                          else was on it untouched
+#
+# Nothing outside its own temporary directory and its own loop devices is
+# touched. The two cases that get as far as mounting write an fstab entry
+# and mount a filesystem, so the script re-executes itself in a private
+# mount namespace with a throwaway copy of /etc/fstab bound over the real
+# one first: the run then cannot change the machine it runs on, and the
+# mounts disappear with the namespace even if it is killed.
+#
+# The play deliberately does not gather facts. The role reads exactly one
+# fact, to decide whether to tell systemd about the new fstab entry, and
+# with no facts that step is skipped — which is what we want, because the
+# fstab the role wrote is inside the namespace and the systemd that would
+# be asked to read it is outside.
+#
+# Needs root, loop devices, btrfs-progs, e2fsprogs, lvm2, fdisk (for
+# sfdisk), util-linux and an ansible-playbook; exits 77 ("skipped")
+# without them. The ansible-playbook to use comes from
+# $ANSIBLE_PLAYBOOK, else from PATH.
+#
+#   sudo deploy/tests/registry-storage
+
+set -euo pipefail
+
+self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+here="$(dirname "$self")"
+roles="$here/../roles"
+ansible_playbook="${ANSIBLE_PLAYBOOK:-ansible-playbook}"
+
+failures=0
+checks=0
+
+note() { printf '%s\n' "$*"; }
+ok() {
+  checks=$((checks + 1))
+  printf '  ok    %s\n' "$1"
+}
+bad() {
+  checks=$((checks + 1))
+  failures=$((failures + 1))
+  printf '  FAIL  %s\n' "$1" >&2
+}
+same() {
+  if [ "$2" = "$3" ]; then
+    ok "$1"
+  else
+    bad "$1: expected '$3', got '$2'"
+  fi
+}
+contains() {
+  if grep -qF -- "$3" "$2"; then
+    ok "$1"
+  else
+    bad "$1: '$3' is not in the output"
+  fi
+}
+
+skip() {
+  printf 'SKIP: %s\n' "$*" >&2
+  exit 77
+}
+
+# A run that was meant to work and did not is the one case where the
+# role's own output is worth having: the checks after it would otherwise
+# report a dozen missing directories and never say why.
+ran_clean() {
+  if [ "$rc" -eq 0 ]; then
+    ok "$1"
+    return
+  fi
+  bad "$1: the run exited $rc"
+  sed -e 's/^/    | /' "$out" >&2
+}
+
+# --- prerequisites ---------------------------------------------------
+
+[ -d "$roles/registry_storage" ] || skip "$roles/registry_storage is not there"
+[ "$(id -u)" -eq 0 ] || skip "needs root: it creates loop devices and mounts filesystems"
+for binary in mkfs.btrfs btrfs mkfs.ext4 pvcreate sfdisk losetup mount umount findmnt blkid unshare; do
+  command -v "$binary" >/dev/null 2>&1 || skip "$binary is not installed"
+done
+command -v "$ansible_playbook" >/dev/null 2>&1 ||
+  skip "$ansible_playbook is not there — set ANSIBLE_PLAYBOOK to one"
+
+# --- a mount namespace of our own ------------------------------------
+#
+# The two cases that get this far mount a real filesystem, so the bind
+# mounts below must land in a mount namespace of their own — an
+# inherited "yes, I already re-executed" flag cannot be trusted for
+# that, because a caller who happens to already have that variable set
+# in their environment would make this skip the unshare and bind-mount
+# the throwaway /etc copy over the HOST's /etc. So this compares the
+# mount namespace's own identity instead of trusting a flag: the
+# identity read here, before the possible re-exec, is passed through in
+# REGISTRY_STORAGE_TEST_PARENT_MNTNS, and the bind mounts only happen
+# once the identity read on the next line differs from the one carried
+# in that variable — i.e. the exec below really landed in a new
+# namespace, not merely once some variable claims it did.
+
+current_mntns="$(readlink /proc/self/ns/mnt)"
+if [ -z "${REGISTRY_STORAGE_TEST_PARENT_MNTNS:-}" ] ||
+  [ "$REGISTRY_STORAGE_TEST_PARENT_MNTNS" = "$current_mntns" ]; then
+  export REGISTRY_STORAGE_TEST_PARENT_MNTNS="$current_mntns"
+  exec unshare --mount --propagation private -- "$self" "$@"
+fi
+
+work=""
+declare -a loop_devices=()
+declare -a mount_points=()
+
+# Invoked by the EXIT trap below, not from anywhere in the flow.
+# shellcheck disable=SC2317,SC2329
+cleanup() {
+  local index point device
+  for ((index = ${#mount_points[@]} - 1; index >= 0; index--)); do
+    point="${mount_points[index]}"
+    findmnt --mountpoint "$point" >/dev/null 2>&1 && umount "$point" || true
+  done
+  for device in "${loop_devices[@]}"; do
+    [ -b "$device" ] && losetup -d "$device" || true
+  done
+  [ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"
+  return 0
+}
+trap cleanup EXIT
+
+work="$(mktemp -d)"
+
+# A copy of the whole of /etc, bound over the real one for the length of
+# this namespace, so that the fstab entry the role writes lands in the
+# copy and disappears with the namespace.
+#
+# The whole directory and not just the file: the module that writes the
+# entry writes a temporary file beside the target and renames it into
+# place, and a rename onto a bind-mounted *file* fails with EBUSY. A
+# bind-mounted directory has no such problem, and everything else under
+# /etc is there in the copy exactly as it was.
+mkdir -p "$work/etc"
+cp -a /etc/. "$work/etc/" 2>/dev/null || true
+[ -e "$work/etc/passwd" ] || skip "could not copy /etc — the run could not be kept off this machine"
+[ -e "$work/etc/fstab" ] || : >"$work/etc/fstab"
+mount --bind "$work/etc" /etc
+mount_points+=(/etc)
+fstab="$work/etc/fstab"
+note "for the length of this run, /etc is a copy in $work/etc"
+
+# --- the play the role is run through --------------------------------
+
+cat >"$work/play.yml" <<'EOF'
+---
+- name: registry_storage under test
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    # The test host already has btrfs-progs — that is a prerequisite of
+    # the test — and installing packages is not what is under test here.
+    registry_storage_packages: []
+  roles:
+    - role: registry_storage
+EOF
+
+export ANSIBLE_ROLES_PATH="$roles"
+export ANSIBLE_COLLECTIONS_PATH="$work/collections"
+export ANSIBLE_LOCALHOST_WARNING=False
+export ANSIBLE_INVENTORY_UNPARSED_WARNING=False
+export ANSIBLE_RETRY_FILES_ENABLED=False
+export ANSIBLE_NOCOLOR=1
+export ANSIBLE_HOME="$work/ansible"
+
+out=""
+rc=0
+run_role() {
+  local device=$1 root=$2
+  out="$work/output"
+  set +e
+  "$ansible_playbook" \
+    -i localhost, \
+    -e "registry_storage_device=$device" \
+    -e "registry_root=$root" \
+    "$work/play.yml" >"$out" 2>&1
+  rc=$?
+  set -e
+}
+
+# --- loopback images -------------------------------------------------
+
+new_device() {
+  local name=$1 size=${2:-512M} device
+  truncate -s "$size" "$work/$name.img"
+  device="$(losetup --find --show "$work/$name.img")"
+  loop_devices+=("$device")
+  printf '%s' "$device"
+}
+
+# Each case detaches its device as soon as its checks are done, so the
+# test holds one loop device at a time instead of six. That is not only
+# tidiness: the kernel hands out the lowest free number, so a run needs
+# one device node to exist rather than six consecutive ones.
+release_device() {
+  local device=$1 index
+  losetup -d "$device" || true
+  for index in "${!loop_devices[@]}"; do
+    if [ "${loop_devices[index]}" = "$device" ]; then
+      unset 'loop_devices[index]'
+    fi
+  done
+}
+
+probe_type() {
+  blkid -p -o value -s TYPE "$1" 2>/dev/null || true
+}
+
+probe_pttype() {
+  blkid -p -o value -s PTTYPE "$1" 2>/dev/null || true
+}
+
+fs_uuid() {
+  blkid -o value -s UUID "$1" 2>/dev/null || true
+}
+
+registry_root_for() {
+  local name=$1
+  mkdir -p "$work/$name"
+  printf '%s' "$work/$name/registry"
+}
+
+# --- a device carrying ext4 with a file on it ------------------------
+
+note "a device carrying ext4"
+device="$(new_device ext4)"
+mkfs.ext4 -q -L payload "$device"
+holding="$work/ext4-mount"
+mkdir -p "$holding"
+mount "$device" "$holding"
+mount_points+=("$holding")
+echo "do not lose me" >"$holding/payload.txt"
+umount "$holding"
+
+root="$(registry_root_for ext4)"
+run_role "$device" "$root"
+if [ "$rc" -ne 0 ]; then
+  ok "the run stopped"
+else
+  bad "the run did not stop"
+fi
+contains "it says the device carries data" "$out" "already carries data"
+contains "it names the filesystem it found" "$out" "'ext4'"
+same "the filesystem is still ext4" "$(probe_type "$device")" ext4
+mount "$device" "$holding"
+same "the file on it is untouched" "$(cat "$holding/payload.txt")" "do not lose me"
+umount "$holding"
+same "nothing was mounted at the registry root" \
+  "$(findmnt --mountpoint "$root" >/dev/null 2>&1 && echo yes || echo no)" no
+release_device "$device"
+
+# --- a device carrying a partition table -----------------------------
+
+note "a device carrying a GPT"
+device="$(new_device gpt)"
+# sfdisk complains that it cannot make the kernel re-read a partition
+# table on a loop device; the table is written all the same, which the
+# check on the next line is here to establish before the role is asked
+# about it.
+echo 'label: gpt' | sfdisk --quiet "$device" >/dev/null 2>&1 || true
+same "the device really carries a GPT" "$(probe_pttype "$device")" gpt
+root="$(registry_root_for gpt)"
+run_role "$device" "$root"
+if [ "$rc" -ne 0 ]; then
+  ok "the run stopped"
+else
+  bad "the run did not stop"
+fi
+contains "it says the device carries data" "$out" "already carries data"
+contains "it names the partition table it found" "$out" "'gpt'"
+same "the partition table is still there" "$(probe_pttype "$device")" gpt
+release_device "$device"
+
+# --- a device carrying an LVM signature ------------------------------
+
+note "a device carrying an LVM physical volume signature"
+device="$(new_device lvm)"
+pvcreate --quiet --yes --force "$device" >/dev/null
+lvm_uuid="$(fs_uuid "$device")"
+root="$(registry_root_for lvm)"
+run_role "$device" "$root"
+if [ "$rc" -ne 0 ]; then
+  ok "the run stopped"
+else
+  bad "the run did not stop"
+fi
+contains "it says the device carries data" "$out" "already carries data"
+contains "it names the signature it found" "$out" "'LVM2_member'"
+same "the signature is still there" "$(probe_type "$device")" LVM2_member
+same "the physical volume still has its identity" "$(fs_uuid "$device")" "$lvm_uuid"
+release_device "$device"
+
+# --- the volume root left mounted at the registry root ---------------
+
+note "the volume root mounted at the registry root"
+device="$(new_device interrupted)"
+mkfs.btrfs -q --label registry "$device"
+root="$(registry_root_for interrupted)"
+mkdir -p "$root"
+mount -o subvolid=5 "$device" "$root"
+mount_points+=("$root")
+btrfs subvolume create "$root/@registry" >/dev/null
+run_role "$device" "$root"
+if [ "$rc" -ne 0 ]; then
+  ok "the run stopped"
+else
+  bad "the run did not stop"
+fi
+contains "it says what is mounted there" "$out" "is mounted at $root"
+contains "it says how to get out of it" "$out" "unmount"
+same "the volume root is still mounted" \
+  "$(findmnt --noheadings --output OPTIONS --mountpoint "$root" | grep -c 'subvol=/,\|subvol=/$')" 1
+umount "$root"
+same "the tree was not built on the volume root" \
+  "$([ -e "$work/interrupted/registry/working" ] && echo yes || echo no)" no
+release_device "$device"
+
+# --- an empty device -------------------------------------------------
+
+note "an empty device"
+device="$(new_device empty)"
+same "the device really is empty" "$(probe_type "$device")$(probe_pttype "$device")" ""
+root="$(registry_root_for empty)"
+run_role "$device" "$root"
+ran_clean "the run went through"
+mount_points+=("$root")
+same "a btrfs filesystem was created" "$(probe_type "$device")" btrfs
+same "it carries the configured label" "$(blkid -o value -s LABEL "$device")" registry
+same "the registry subvolume is what is mounted" \
+  "$(findmnt --noheadings --output OPTIONS --mountpoint "$root" | grep -c 'subvol=/@registry')" 1
+for entry in working snapshots mirror-sync placeholder; do
+  same "the tree has $entry" "$([ -d "$root/$entry" ] && echo yes || echo no)" yes
+done
+same "working is a subvolume" \
+  "$(btrfs subvolume show "$root/working" >/dev/null 2>&1 && echo yes || echo no)" yes
+same "the docroot points at the placeholder" "$(readlink "$root/current")" placeholder
+empty_uuid="$(fs_uuid "$device")"
+contains "the fstab entry names the filesystem by UUID" "$fstab" "UUID=$empty_uuid"
+contains "the fstab entry names the registry subvolume" "$fstab" "subvol=@registry"
+
+note "the same device again"
+run_role "$device" "$root"
+ran_clean "the run went through"
+if grep -qE 'localhost[[:space:]]*:.*changed=0' "$out"; then
+  ok "a second run changes nothing"
+else
+  bad "a second run reported a change: $(grep -E 'localhost[[:space:]]*:' "$out" | tail -1)"
+fi
+same "the filesystem was not recreated" "$(fs_uuid "$device")" "$empty_uuid"
+umount "$root"
+release_device "$device"
+
+# --- a device that already carries btrfs -----------------------------
+
+note "a device that already carries btrfs"
+device="$(new_device adopt)"
+mkfs.btrfs -q --label somebody-elses "$device"
+adopt_uuid="$(fs_uuid "$device")"
+holding="$work/adopt-mount"
+mkdir -p "$holding"
+mount -o subvolid=5 "$device" "$holding"
+mount_points+=("$holding")
+btrfs subvolume create "$holding/@other" >/dev/null
+echo "not mine to delete" >"$holding/@other/payload.txt"
+umount "$holding"
+
+root="$(registry_root_for adopt)"
+run_role "$device" "$root"
+ran_clean "the run went through"
+mount_points+=("$root")
+same "the filesystem was adopted, not recreated" "$(fs_uuid "$device")" "$adopt_uuid"
+same "its label was left alone" "$(blkid -o value -s LABEL "$device")" somebody-elses
+same "the registry subvolume is what is mounted" \
+  "$(findmnt --noheadings --output OPTIONS --mountpoint "$root" | grep -c 'subvol=/@registry')" 1
+same "the tree is inside it" "$([ -d "$root/snapshots" ] && echo yes || echo no)" yes
+
+note "the same device again"
+run_role "$device" "$root"
+ran_clean "the run went through"
+if grep -qE 'localhost[[:space:]]*:.*changed=0' "$out"; then
+  ok "a second run changes nothing"
+else
+  bad "a second run reported a change: $(grep -E 'localhost[[:space:]]*:' "$out" | tail -1)"
+fi
+same "the filesystem was not recreated" "$(fs_uuid "$device")" "$adopt_uuid"
+same "its label is still left alone" "$(blkid -o value -s LABEL "$device")" somebody-elses
+
+umount "$root"
+mount -o subvolid=5 "$device" "$holding"
+same "what was already on the volume is still there" \
+  "$(cat "$holding/@other/payload.txt")" "not mine to delete"
+same "the registry subvolume was added beside it" \
+  "$([ -d "$holding/@registry" ] && echo yes || echo no)" yes
+umount "$holding"
+release_device "$device"
+
+# --- result ----------------------------------------------------------
+
+note ""
+if [ "$failures" -eq 0 ]; then
+  note "$checks checks, all passed"
+  exit 0
+fi
+note "$checks checks, $failures failed"
+exit 1

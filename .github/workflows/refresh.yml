@@ -11,6 +11,11 @@
 # root-signed, root keys are offline, and a refresh path that could
 # re-sign it would mean they were not. The status step at the end is how
 # its yearly renewal gets announced in time.
+#
+# Which sources exist, and the anchor they are checked against, come from
+# deploy/mcuhome/ — the instance configuration of the MCUHome registry.
+# The source directories themselves are at the repository root, which is
+# what this repository still serves.
 
 name: Refresh signed documents
 
@@ -43,12 +48,12 @@ jobs:
           MCUHOME_PUBLISHER_KEYS: ${{ secrets.PUBLISHER_KEY }}
         run: |
           python -m mcuhome.packagetool refresh \
-            --source $(jq -r '.sources | keys[]' publishing.json | tr '\n' ' ')
+            --source $(jq -r '.sources | keys[]' deploy/mcuhome/publishing.json | tr '\n' ' ')
 
       - name: Verify
         run: |
-          for source in $(jq -r '.sources | keys[]' publishing.json); do
-            python verify.py "$source" --anchor anchor.json
+          for source in $(jq -r '.sources | keys[]' deploy/mcuhome/publishing.json); do
+            python verify.py "$source" --anchor deploy/mcuhome/anchor.json
           done
 
       - name: Commit
@@ -66,4 +71,4 @@ jobs:
         # Runs last so a failing warning cannot cost the refresh above.
         run: |
           python -m mcuhome.packagetool status \
-            --source $(jq -r '.sources | keys[]' publishing.json | tr '\n' ' ')
+            --source $(jq -r '.sources | keys[]' deploy/mcuhome/publishing.json | tr '\n' ' ')

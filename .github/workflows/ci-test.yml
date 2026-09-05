@@ -1,15 +1,23 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Test gate: one job per wrapper in scripts/test.d/ (pytest, catalog,
-# verify-sources), plus a pre-check that every wrapper has a job here.
+# Test gate: one job per wrapper in scripts/test.d/, plus a pre-check
+# that every wrapper has a job here.
 #
 # test-pytest and test-catalog are offline: the fixed test vectors and
 # the catalogue-regeneration check (sources.json against
-# publishing.json). test-verify-sources is its own job because it needs
-# network — the reference verifier and the remaining-validity report run
-# against the *published* sources, so a broken signature or an expiring
-# document fails here rather than in somebody's build.
+# deploy/mcuhome/publishing.json). test-verify-sources is its own job
+# because it needs network — the reference verifier and the
+# remaining-validity report run against the *published* sources, so a
+# broken signature or an expiring document fails here rather than in
+# somebody's build.
+#
+# test-registry-snapshot and test-registry-storage exercise the deploy/
+# material against real filesystems: a btrfs image on a loop device, and
+# for the storage role a set of loop devices carrying the things it has
+# to refuse to overwrite. Both need root and are therefore invoked
+# through sudo — the wrappers themselves refuse to run without it rather
+# than reporting a pass they did not earn.
 #
 # All actions are pinned to commit SHAs, not tags.
 
@@ -100,3 +108,47 @@ jobs:
 
       - name: scripts/test verify-sources
         run: scripts/test verify-sources
+
+  test-registry-snapshot:
+    name: Test (registry-snapshot)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install btrfs-progs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs
+
+      - name: scripts/test registry-snapshot
+        run: sudo scripts/test registry-snapshot
+
+  test-registry-storage:
+    name: Test (registry-storage)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check -e . --group dev
+
+      - name: Install the filesystem tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            btrfs-progs e2fsprogs lvm2 fdisk
+
+      - name: scripts/test registry-storage
+        run: sudo scripts/test registry-storage

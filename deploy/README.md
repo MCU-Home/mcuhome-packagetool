@@ -14,6 +14,11 @@ mcuhome/        the values the public MCUHome registry is run with
 tests/          checks that run on a throwaway filesystem, not on a server
 ```
 
+The HTML pages a registry serves are not here: they are `../pages/`, next
+to the tool, because they are part of what is published rather than part
+of how a server is set up. Putting them into the working tree is the
+publish pipeline's job.
+
 Nothing under `roles/` knows anything about a particular registry: every
 value it needs is a variable. `mcuhome/` is the other half — the settings
 one specific registry is run with — and is kept separate so that using
@@ -145,3 +150,25 @@ to look at.
 the retention bounds against a real btrfs filesystem in a loopback image,
 created and thrown away by the test itself. It needs root, `btrfs-progs`
 and loop devices, and exits 77 when it cannot have them.
+
+`tests/registry-storage` runs the storage role itself, against loopback
+devices carrying the things it has to refuse: an ext4 filesystem with a
+file on it, a partition table, an LVM signature, and the volume root left
+mounted at the registry root by an interrupted run. Each refusal is
+checked twice — the run stopped, and the device is still exactly as it
+was — and the two cases that are meant to work, formatting an empty
+device and adopting one that already carries btrfs, are checked all the
+way down to the tree and the fstab entry.
+
+It needs an `ansible-playbook` (from `$ANSIBLE_PLAYBOOK` or from `PATH`)
+besides root, loop devices, `btrfs-progs`, `e2fsprogs`, `lvm2` and
+`fdisk`, and exits 77 when it cannot have them. Because two of its cases
+write an fstab entry and mount a filesystem, it re-executes itself in a
+private mount namespace with a copy of `/etc` bound over the real one:
+the machine it runs on is left exactly as it was, whether the run
+finishes or not.
+
+Both are wired into this repository's test gate as
+`scripts/test registry-snapshot` and `scripts/test registry-storage`,
+which check the prerequisites themselves and fail rather than let a
+skipped check pass for a green one.

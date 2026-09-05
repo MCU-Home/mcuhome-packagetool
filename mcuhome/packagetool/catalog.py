@@ -12,8 +12,11 @@ Saying that in the file itself is the point of the note below. A
 directory listing that looks official is exactly how a trust model gets
 quietly undermined by its own convenience feature.
 
-It is generated from ``publishing.json`` rather than maintained by hand,
-and CI regenerates it and fails on a difference, so the two cannot drift.
+It is generated from the operational configuration rather than
+maintained by hand, and both paths are arguments: which configuration
+file describes the sources, and where in the tree the result belongs,
+are the caller's business. A check that regenerates it and compares is
+what keeps a served copy and its configuration from drifting apart.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ def build_catalog(publishing: dict) -> dict:
     """The directory document, from the operational configuration."""
     sources = publishing.get("sources")
     if not isinstance(sources, dict):
-        raise SystemExit("publishing.json carries no sources object")
+        raise SystemExit("no sources object — the configuration needs a `sources` map")
     return {
         "note": NOTE,
         "sources": [
@@ -58,7 +61,10 @@ def write_catalog(publishing_path: Path, catalog_path: Path) -> list[str]:
         publishing = json.loads(publishing_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as failure:
         raise SystemExit(f"{publishing_path}: {failure}") from failure
-    catalog = build_catalog(publishing)
+    try:
+        catalog = build_catalog(publishing)
+    except SystemExit as failure:
+        raise SystemExit(f"{publishing_path}: {failure}") from failure
     catalog_path.write_text(
         json.dumps(catalog, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
         encoding="utf-8",

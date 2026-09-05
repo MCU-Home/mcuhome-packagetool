@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# ansible-lint over deploy/, from this repository's own .venv. The
+# profile and the excluded paths come from .ansible-lint at the
+# repository root, not from an argument here; extra arguments are passed
+# through.
+#
+# ansible-lint requires blocking stdio and errors out under the
+# non-blocking pipes some automation runs commands with; this wrapper
+# works around that by sending its output to a temporary file and
+# printing that file afterwards, instead of letting ansible-lint write to
+# the wrapper's own stdout/stderr directly.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+venv="$root/.venv"
+
+if [ ! -x "$venv/bin/ansible-lint" ]; then
+  echo "lint.d/ansible-lint: no .venv found. Create it first — see README, \"Development — how to work on this repository\"." >&2
+  exit 1
+fi
+
+cd "$root"
+out="$(mktemp)"
+trap 'rm -f "$out"' EXIT
+status=0
+"$venv/bin/ansible-lint" deploy/ "$@" >"$out" 2>&1 || status=$?
+cat "$out"
+exit "$status"

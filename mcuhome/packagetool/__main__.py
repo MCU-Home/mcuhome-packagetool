@@ -17,6 +17,12 @@ Commands:
 ``refresh``   renew the publisher-signed documents before they expire
 ``status``    how long each document is still valid (a CI guard)
 ``prune``     list superseded part files past their grace period
+``catalog``   write the tree's unsigned directory of sources
+
+Every command is told the paths it works on. The tool knows the shape of
+a source and the shape of a registry tree; where either of them lives,
+and where the operational configuration describing them is kept, is the
+caller's to decide.
 """
 
 from __future__ import annotations
@@ -175,7 +181,16 @@ def main(argv: list[str]) -> int:
     prune.add_argument("--source", type=Path, nargs="+", required=True)
     prune.add_argument("--delete", action="store_true")
 
-    commands.add_parser("catalog", help="write sources.json, the site's unsigned directory")
+    catalog = commands.add_parser(
+        "catalog", help="write sources.json, the tree's unsigned directory"
+    )
+    catalog.add_argument(
+        "--publishing",
+        type=Path,
+        required=True,
+        help="the operational configuration to read the sources from",
+    )
+    catalog.add_argument("--out", type=Path, required=True, help=f"where to write {CATALOG_FILE}")
 
     arguments = parser.parse_args(argv)
     now = _now(arguments.now)
@@ -289,8 +304,8 @@ def main(argv: list[str]) -> int:
         return worst
 
     if arguments.command == "catalog":
-        written = write_catalog(Path("publishing.json"), Path(CATALOG_FILE))
-        print(f"{CATALOG_FILE}: {', '.join(written) or 'no sources'}")
+        written = write_catalog(arguments.publishing, arguments.out)
+        print(f"{arguments.out}: {', '.join(written) or 'no sources'}")
         return 0
 
     if arguments.command == "prune":

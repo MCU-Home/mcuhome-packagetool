@@ -2,17 +2,23 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# The reference verifier over every source publishing.json declares,
-# checked against anchor.json, followed by the remaining-validity
-# report: a broken signature or a document past its warning threshold
-# fails here rather than in somebody's build. Needs network (fetches the
-# published documents) — that is fine, it is its own job, kept apart
-# from the offline pytest/catalog checks. Run from this repository's
-# own .venv.
+# The reference verifier over every source the publishing configuration
+# declares, checked against the anchor beside it, followed by the
+# remaining-validity report: a broken signature or a document past its
+# warning threshold fails here rather than in somebody's build.
+#
+# Configuration and anchor come from deploy/mcuhome/, which is where the
+# MCUHome registry's own instance settings live; the source directories
+# themselves are still at the repository root, which is what the host
+# serves today. Needs network (fetches the published documents) — that is
+# fine, it is its own job, kept apart from the offline pytest/catalog
+# checks. Run from this repository's own .venv.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 venv="$root/.venv"
+publishing="deploy/mcuhome/publishing.json"
+anchor="deploy/mcuhome/anchor.json"
 
 if [ ! -x "$venv/bin/python" ]; then
   echo "test.d/verify-sources: no .venv found. Create it first — see README, \"Development — how to work on this repository\"." >&2
@@ -25,9 +31,9 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 cd "$root"
-sources="$(jq -r '.sources | keys[]' publishing.json)"
+sources="$(jq -r '.sources | keys[]' "$publishing")"
 for source in $sources; do
-  "$venv/bin/python" verify.py "$source" --anchor anchor.json
+  "$venv/bin/python" verify.py "$source" --anchor "$anchor"
 done
 
 # shellcheck disable=SC2086

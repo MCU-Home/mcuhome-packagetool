@@ -1,0 +1,18 @@
+---
+# ansible-lint configuration for the Ansible material under deploy/.
+# The rest of this repository is Python and static files; scripts/lint.d/
+# ansible-lint points the tool at deploy/ and the settings live here so a
+# run by hand from the repository root behaves the same way.
+
+profile: production
+
+exclude_paths:
+  - .venv/
+  - .ansible/
+  - .collections/
+
+# Nothing here is a collection or a role that gets published to Galaxy,
+# so the metadata a Galaxy upload would need is not written.
+skip_list:
+  - meta-no-info
+  - meta-runtime

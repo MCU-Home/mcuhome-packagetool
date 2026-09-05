@@ -2,16 +2,25 @@
 # SPDX-FileCopyrightText: 2026 The MCUHome Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# The catalogue-regeneration check: sources.json, the site's unsigned
-# directory, is generated from publishing.json — this asserts the
-# committed sources.json still matches what publishing.json declares.
-# A correctness/freshness assertion over generated output, not a style
-# check, so it lives in the test gate rather than lint. Run from this
-# repository's own .venv.
+# The catalogue-regeneration check: sources.json, a registry tree's
+# unsigned directory of sources, is generated from the publishing
+# configuration. This regenerates it from
+# deploy/mcuhome/publishing.json — the configuration the public MCUHome
+# registry is run with — and compares the result against the sources.json
+# at the repository root, which is the copy the host serves today.
+#
+# The regenerated file goes to a temporary directory and never into the
+# working tree: the served copy is frozen, and a check that rewrites what
+# it is checking cannot fail cleanly on a machine where the working tree
+# has to stay as it is. A correctness assertion over generated output,
+# not a style check, so it lives in the test gate rather than lint. Run
+# from this repository's own .venv.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 venv="$root/.venv"
+publishing="deploy/mcuhome/publishing.json"
+served="sources.json"
 
 if [ ! -x "$venv/bin/python" ]; then
   echo "test.d/catalog: no .venv found. Create it first — see README, \"Development — how to work on this repository\"." >&2
@@ -19,5 +28,17 @@ if [ ! -x "$venv/bin/python" ]; then
 fi
 
 cd "$root"
-"$venv/bin/python" -m mcuhome.packagetool catalog
-git diff --exit-code sources.json
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+"$venv/bin/python" -m mcuhome.packagetool catalog \
+  --publishing "$publishing" --out "$work/$served"
+
+if diff -u "$served" "$work/$served"; then
+  exit 0
+fi
+
+echo "test.d/catalog: $served does not match what $publishing generates." >&2
+echo "Write the generated one over it with:" >&2
+echo "  .venv/bin/python -m mcuhome.packagetool catalog --publishing $publishing --out $served" >&2
+exit 1

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Runs shellcheck over every shell script this repository tracks, from
+# this repository's own .venv. (Written that way round on purpose: a
+# comment starting with the tool's name is read as a directive to it.)
+# That is the deploy/ material — the script the snapshot role installs on
+# a server and the functional tests beside it — and the wrappers under
+# scripts/ themselves.
+#
+# Which files those are is decided by their shebang rather than by an
+# extension: the scripts here deliberately have none, because the gate
+# dispatchers call them by name. Only tracked files are looked at, the
+# same rule lint.d/hygiene follows, so a new script is checked once it is
+# added to the index.
+#
+# Extra arguments are passed through.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+venv="$root/.venv"
+
+if [ ! -x "$venv/bin/shellcheck" ]; then
+  echo "lint.d/shellcheck: no .venv found. Create it first — see README, \"Development — how to work on this repository\"." >&2
+  exit 1
+fi
+
+cd "$root"
+
+scripts=()
+while IFS= read -r -d '' candidate; do
+  read -r shebang <"$candidate" || continue
+  case $shebang in
+  '#!'*/sh | '#!'*/bash | '#!'*env\ sh | '#!'*env\ bash) scripts+=("$candidate") ;;
+  esac
+done < <(git ls-files -z)
+
+if [ "${#scripts[@]}" -eq 0 ]; then
+  echo "lint.d/shellcheck: no shell scripts tracked."
+  exit 0
+fi
+
+# -x so a script that sources another is checked against what it really
+# gets, not against an unknown file.
+exec "$venv/bin/shellcheck" -x "$@" "${scripts[@]}"

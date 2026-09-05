@@ -4,6 +4,11 @@
 # Lint gate: one job per wrapper in scripts/lint.d/, plus a pre-check
 # that every wrapper has a job here.
 #
+# lint-ansible-lint and lint-shellcheck cover deploy/: the Ansible
+# material that sets a registry server up, and the shell scripts a role
+# installs there. They need no more than the dev tools, because both
+# tools install from PyPI like the rest of them.
+#
 # The lint tools are a PEP 735 dependency group ([dependency-groups] dev
 # in pyproject.toml), not a [project.optional-dependencies] extra: a
 # group installs standalone, without the project itself.
@@ -122,3 +127,47 @@ jobs:
 
       - name: scripts/lint hygiene
         run: scripts/lint hygiene
+
+  lint-ansible-lint:
+    name: Lint (ansible-lint)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install the dev tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check --group dev
+
+      - name: scripts/lint ansible-lint
+        run: scripts/lint ansible-lint
+
+  lint-shellcheck:
+    name: Lint (shellcheck)
+    needs: check-gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create .venv and install the dev tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -U pip
+          .venv/bin/pip install --disable-pip-version-check --group dev
+
+      - name: scripts/lint shellcheck
+        run: scripts/lint shellcheck

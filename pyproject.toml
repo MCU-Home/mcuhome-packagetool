@@ -33,6 +33,15 @@ dev = [
   "codespell==2.4.3",
   "reuse==5.0.2",
   "pre-commit-hooks==5.0.0",
+  # For deploy/: the Ansible material is linted with ansible-lint and the
+  # shell scripts a role installs with shellcheck, and the functional
+  # tests under deploy/tests/ run the roles with this ansible-core. The
+  # core version is pinned rather than left to ansible-lint's range, so
+  # the roles are checked and exercised with the same one an operator
+  # deploys them with.
+  "ansible-core==2.21.3",
+  "ansible-lint==26.8.0",
+  "shellcheck-py==0.11.0.1",
 ]
 
 [tool.setuptools]
