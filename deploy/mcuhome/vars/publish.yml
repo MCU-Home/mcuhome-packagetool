@@ -72,6 +72,14 @@ registry_publish_on_calendar: "Mon *-*-* 05:17:00 UTC"
 registry_publish_refresh_timer_enabled: true
 registry_publish_refresh_on_calendar: "Mon *-*-* 04:17:00 UTC"
 
+# The unit names the publish and the refresh run as. Spelled out here,
+# matching the role defaults (registry_publish role, defaults/main.yml),
+# because a playbook that starts or queries these units without applying
+# the role — the migration does — has no role default to fall back on and
+# needs the same instance values every other consumer reads.
+registry_publish_service: packagetool-publish
+registry_publish_refresh_service: packagetool-refresh
+
 # Three hours. The largest package this registry carries is over half a
 # gigabyte and a release set is several of them.
 registry_publish_unit_timeout: 10800

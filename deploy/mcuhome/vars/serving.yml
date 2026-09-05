@@ -83,15 +83,35 @@ registry_proxy_public_sites:
     realm: MCUHome mirror sync
     users: "{{ registry_mirror_sync_users | default([]) }}"
 
-  # The bootstrap host. Configured, but the name still resolves to the
-  # old host, so asking a certificate authority for a certificate could
-  # only produce failed validations. It runs on Caddy's own local CA
-  # until the DNS record moves; switching "internal" to "acme" and
-  # restarting is the cutover.
+  # The bootstrap host. Its certificate is the one value that turns over
+  # with the DNS record; see registry_bootstrap_tls below.
   - name: packages.mcuhome.org
     bind: "{{ registry_proxy_public_addresses }}"
     upstream: "127.0.0.1:{{ registry_web_bootstrap_port }}"
-    tls: internal
+    tls: "{{ registry_bootstrap_tls }}"
+
+# Where the bootstrap host's certificate comes from. Two states and
+# nothing in between:
+#
+#   internal  Caddy's own local CA. The right state for as long as the
+#             name still resolves somewhere else: an ACME challenge for a
+#             name that points at another host can only fail, and Caddy
+#             would keep retrying it and collect failed validations at
+#             the certificate authority for no gain.
+#   acme      an ordinary publicly issued certificate over an HTTP-01
+#             challenge, like the other two public names. Correct from
+#             the moment the name resolves here, and wrong before it.
+#
+# It is a variable of its own rather than a word inside the site above so
+# that the cutover can be run before it is written down: the playbook is
+# run once with
+#
+#   -e registry_bootstrap_tls=acme
+#
+# and this value is changed to match after the certificate has been
+# issued and the host answers under it. A name that turns out not to
+# resolve here yet then costs a second run rather than a revert.
+registry_bootstrap_tls: internal
 
 # --- the rsync export -----------------------------------------------------
 
