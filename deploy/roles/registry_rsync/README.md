@@ -72,10 +72,13 @@ process that serves that connection. A transfer already running keeps the
 tree it started with, the next connection gets the new one, and neither
 ever sees a tree that is half published. `<root>/current` points at a
 composed tree — a read-only btrfs subvolume with a read-only btrfs
-subvolume nested under it for each source. Tree retention, not snapshot
-retention, is what makes the first half safe: it is what keeps a tree a
-running transfer holds open from being deleted, and the tree the docroot
-currently points at is never the one a publish removes.
+subvolume nested under it for each source. Tree retention does not exist
+to protect an in-flight transfer — it only keeps the newest
+`registry_snapshot_keep_trees` trees plus whatever the docroot currently
+points at, with no notion of who still has a tree open. In practice that
+window is what keeps a transfer's tree from disappearing under it, but a
+transfer slow or paused long enough to outlive the retention window can
+still have its tree deleted while it reads from it.
 
 ### Per-source subvolumes and `--one-file-system`
 

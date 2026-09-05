@@ -26,8 +26,18 @@ it at the same moment.
 
 The command is idempotent. A version already recorded is never recorded
 again (and the tool would refuse: a published version is immutable), a
-tree file that already has the right content is not rewritten, and a run
-that changed nothing composes no tree and generates no dumps.
+tree file that already has the right content is not rewritten, and
+`packagetool-snapshot` composes no tree and generates no dumps when it
+finds nothing to publish.
+
+The snapshot and dump commands run at the end of every non-dry run,
+whether or not that particular run recorded anything itself — they decide
+from the working tree's own state, not from what this run remembers doing.
+That is what makes a run that was interrupted after recording a package
+but before publishing self-healing: the next run, changed or not, reaches
+the same tail and the snapshot command finds and publishes what is
+already there, instead of that content waiting for the weekly refresh to
+happen to touch the same source.
 
 ## Who runs what
 

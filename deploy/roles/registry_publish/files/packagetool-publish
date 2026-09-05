@@ -56,8 +56,18 @@
 # Idempotent by construction. A version already recorded in a source is
 # never recorded again (and the tool would refuse: a published version is
 # immutable), a tree file that already has the right content is not
-# rewritten, and a run that changed nothing takes no snapshot and
-# generates no dumps.
+# rewritten, and packagetool-snapshot takes no snapshot and generates no
+# dumps when it finds nothing to publish.
+#
+# The publish phase runs at the end of every non-dry run, whether or not
+# THIS run recorded anything itself: packagetool-snapshot and
+# packagetool-mirror-sync decide idempotently from the state of the
+# working tree, not from anything this script remembers about its own
+# run. That is deliberate — a run that recorded a package but was
+# interrupted before it reached this phase leaves the working tree ahead
+# of what is served, and the next run, changed or not, always asks the
+# snapshot command again and so heals that gap itself instead of waiting
+# for the weekly refresh to happen to touch the same source.
 #
 # A source that is not laid down yet is reported and skipped, not an
 # error. Creating a source needs the offline root keys, which are
@@ -924,20 +934,22 @@ main() {
     err "not laid down yet, left alone: ${skipped_sources[*]}"
   fi
 
-  if [ "$tree_changed" = false ]; then
-    say "nothing changed — no snapshot taken"
-    if [ "$dry_run" = false ]; then
-      report_status || exit "$EXIT_EXPIRY"
+  if [ "$recorded_count" -gt 0 ]; then
+    say "recorded $recorded_count package(s)"
+  fi
+
+  if [ "$dry_run" = true ]; then
+    if [ "$tree_changed" = true ]; then
+      say "would take a snapshot, switch the docroot and generate the dumps"
+    else
+      say "nothing changed in this run — a real run still asks packagetool-snapshot at the end, which decides on its own whether there is anything left to publish"
     fi
     return 0
   fi
 
-  if [ "$dry_run" = true ]; then
-    say "would take a snapshot, switch the docroot and generate the dumps"
-    return 0
-  fi
-
-  say "recorded $recorded_count package(s)"
+  # Unconditional: see the note above main() about why this is not gated
+  # on $tree_changed. packagetool-snapshot's own report of what it did (or
+  # did not do) is what follows on stdout.
   publish_tree
   find "$staging_dir" -mindepth 1 -delete
   report_status || exit "$EXIT_EXPIRY"

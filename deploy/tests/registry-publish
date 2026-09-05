@@ -530,22 +530,81 @@ same "the whole repository was asked about once" \
   "$(grep -c '^/repos/testowner/testrepo/releases' "$requests")" 1
 
 # --- a second run has nothing to do ----------------------------------
+#
+# The publish command asks packagetool-snapshot at the tail of every run,
+# whether this run itself recorded anything or not — it is
+# packagetool-snapshot's own "nothing changed" that this checks for, not
+# a decision the publish command made to skip the call.
 
 note "a second run"
 run_tool
 ran_clean "exit code"
-if grep -q "nothing changed" "$out"; then
-  ok "the run says it had nothing to do"
+if grep -q "publishing" "$out"; then
+  ok "the tail still ran packagetool-snapshot"
 else
-  bad "the run did not say it had nothing to do"
+  bad "the tail did not run — a no-op run must still ask, not skip the call"
+fi
+if grep -q "nothing changed" "$out"; then
+  ok "packagetool-snapshot itself says it had nothing to do"
+else
+  bad "packagetool-snapshot did not say it had nothing to do"
 fi
 same "no second tree" "$(tree_count)" 1
 same "no second snapshot of sdk" "$(snapshot_count sdk)" 1
 same "the docroot did not move" "$(readlink "$(served)")" "$first_tree"
 
+# --- self-heal: content recorded but never published by an earlier run -
+#
+# What an earlier run that crashed between recording a package and
+# reaching the publish tail leaves behind: a version in the working
+# tree's index that no snapshot and no served tree carries yet. Nothing
+# here goes through packagetool-publish's own fetch/record path — the
+# forge is not asked for anything new — so the only reason a following
+# run notices is that packagetool-snapshot compares the working tree
+# against its own last snapshot, not against what packagetool-publish
+# remembers doing.
+
+note "a version recorded straight into the working tree, as a crashed earlier run would leave it"
+before_trees="$(tree_count)"
+before_sdk_snapshots="$(snapshot_count sdk)"
+printf '%s' "sdk recorded but never published" >"$working/sdk/test-sdk-9.0.0.tar.zst"
+packagetool add \
+  --source "$working/sdk" \
+  --name test-sdk \
+  --version 9.0.0 \
+  --file test-sdk-9.0.0.tar.zst \
+  --sha256 "$(sha256sum "$working/sdk/test-sdk-9.0.0.tar.zst" | cut -d' ' -f1)" \
+  --size "$(stat -c%s "$working/sdk/test-sdk-9.0.0.tar.zst")" \
+  --publisher-key "$keys/publisher-1.pem" >/dev/null
+chown "$publisher_user:$publisher_user" \
+  "$working/sdk/test-sdk-9.0.0.tar.zst" "$working/sdk/index.json"
+true_that "it is recorded in the working tree already" \
+  "$(recorded sdk test-sdk 9.0.0 && echo true || echo false)"
+true_that "but not yet in the served tree" \
+  "$([ ! -e "$registry/current/sdk/test-sdk-9.0.0.tar.zst" ] && echo true || echo false)"
+
+note "a following run, with no new release for the forge to offer"
+run_tool
+ran_clean "exit code"
+same "it composed a new tree without recording anything itself" \
+  "$(tree_count)" "$((before_trees + 1))"
+same "sdk was snapshotted again" "$(snapshot_count sdk)" "$((before_sdk_snapshots + 1))"
+same "the served tree now carries the healed package" \
+  "$(cat "$registry/current/sdk/test-sdk-9.0.0.tar.zst")" "sdk recorded but never published"
+same "the whole repository was still asked about only once" \
+  "$(grep -c '^/repos/testowner/testrepo/releases' "$requests")" 1
+first_tree="$(readlink "$(served)")"
+
 # --- a new release ---------------------------------------------------
+#
+# The counts below are relative to the state the self-heal above already
+# left behind (one extra tree and one extra sdk snapshot beyond the first
+# publish), not to the first publish itself.
 
 note "a new release"
+before_trees="$(tree_count)"
+before_sdk_snapshots="$(snapshot_count sdk)"
+before_sdk_chain_length="$(jq -r '.chain | length' "$registry/mirror-sync/sdk/index.json")"
 make_asset v1.1.0 test-sdk-1.1.0.tar.zst "sdk two"
 write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v9.9.9:false:true"
 
@@ -555,8 +614,8 @@ true_that "the new version is recorded" \
   "$(recorded sdk test-sdk 1.1.0 && echo true || echo false)"
 true_that "the old one is still there" \
   "$(recorded sdk test-sdk 1.0.0 && echo true || echo false)"
-same "a second tree was composed" "$(tree_count)" 2
-same "sdk was snapshotted again" "$(snapshot_count sdk)" 2
+same "a second tree was composed" "$(tree_count)" "$((before_trees + 1))"
+same "sdk was snapshotted again" "$(snapshot_count sdk)" "$((before_sdk_snapshots + 1))"
 same "the sources nothing touched were not" \
   "$(snapshot_count tools)$(snapshot_count absent)" "11"
 second_tree="$(readlink "$(served)")"
@@ -565,8 +624,9 @@ if [ "$second_tree" != "$first_tree" ]; then
 else
   bad "the docroot did not move"
 fi
-same "sdk's chain now has a difference" \
-  "$(jq -r '.chain | length' "$registry/mirror-sync/sdk/index.json")" 1
+same "sdk's chain now has one more difference" \
+  "$(jq -r '.chain | length' "$registry/mirror-sync/sdk/index.json")" \
+  "$((before_sdk_chain_length + 1))"
 same "it starts from sdk's first snapshot" \
   "$(jq -r '.chain[0].parent' "$registry/mirror-sync/sdk/index.json")" \
   "$first_sdk_snapshot"

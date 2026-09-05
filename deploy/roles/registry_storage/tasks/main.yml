@@ -22,16 +22,20 @@
       - registry_storage_subvolume | default('', true) is match('^[^/]+$')
       - not (registry_storage_mount_options is search('subvol'))
       - registry_storage_sources | default([], true) is sequence
+      - registry_storage_sources | default([], true) is not string
+      - registry_storage_sources | default([], true) is not mapping
       - registry_storage_sources | default([], true)
         | reject('match', '^[A-Za-z0-9][A-Za-z0-9._-]*$') | list | length == 0
     fail_msg: >-
       registry_storage_device must name a block device, registry_root must
       be an absolute path, registry_storage_subvolume must be a plain name
       without a slash, registry_storage_mount_options must not contain a
-      subvol option — the role adds that itself — and every entry of
-      registry_storage_sources must be a source name: letters, digits,
-      dots, dashes and underscores, starting with a letter or a digit.
-      Every one of them is a path segment of a public URL.
+      subvol option — the role adds that itself — registry_storage_sources
+      must be a list of source names and not a plain string or a mapping
+      (a string is itself a Jinja sequence and would be iterated character
+      by character), and every entry of it must be a source name: letters,
+      digits, dots, dashes and underscores, starting with a letter or a
+      digit. Every one of them is a path segment of a public URL.
     quiet: true
 
 - name: Prepare the filesystem

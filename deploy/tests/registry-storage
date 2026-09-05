@@ -351,6 +351,35 @@ same "the tree was not built on the volume root" \
   "$([ -e "$work/interrupted/registry/working" ] && echo yes || echo no)" no
 release_device "$device"
 
+# --- registry_storage_sources given as a plain string -----------------
+#
+# A string is itself a Jinja sequence, so without an explicit type check
+# the role would silently iterate it character by character instead of
+# refusing it — this proves the refusal fires and touches nothing.
+
+note "registry_storage_sources given as a plain string"
+device="$(new_device sources-string)"
+same "the device really is empty" "$(probe_type "$device")$(probe_pttype "$device")" ""
+root="$(registry_root_for sources-string)"
+out="$work/output"
+set +e
+"$ansible_playbook" \
+  -i localhost, \
+  -e "registry_storage_device=$device" \
+  -e "registry_root=$root" \
+  -e "registry_storage_sources=alpha" \
+  "$work/play.yml" >"$out" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  ok "the run stopped"
+else
+  bad "the run did not stop"
+fi
+contains "it says why a plain string is refused" "$out" "iterated character by character"
+same "nothing was written to the device" "$(probe_type "$device")$(probe_pttype "$device")" ""
+release_device "$device"
+
 # --- an empty device -------------------------------------------------
 
 note "an empty device"
