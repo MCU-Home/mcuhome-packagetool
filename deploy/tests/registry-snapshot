@@ -7,12 +7,16 @@
 # again. Nothing outside its own temporary directory and its own loop
 # device is touched.
 #
-# What is checked: the snapshot is taken and is read-only, the working
-# tree and the served tree are independent afterwards, the docroot
-# symlink is switched to the new snapshot and stays a relative link, the
-# lock keeps a second run out, both retention bounds hold on their own
-# and together, the served snapshot is never deleted, entries that are
-# not snapshots are left alone, and the documented exit codes come out.
+# What is checked: every source is snapshotted on its own and only when
+# its content changed; the served tree is composed out of one snapshot per
+# source plus the files above them, and is read-only all the way down; a
+# tree is only complete once its manifest is there, and one from a run
+# that was interrupted is cleaned up; the docroot switch is atomic and
+# stays a relative link; the lock keeps a second run out; both snapshot
+# retention bounds hold per source; a snapshot a surviving tree was
+# composed from is kept whatever the bounds say; the tree the docroot
+# points at is never deleted; entries that are not snapshots are left
+# alone; and the documented exit codes come out.
 #
 # Needs root, btrfs-progs and loop devices; exits 77 ("skipped") without
 # them.
@@ -95,25 +99,33 @@ mkfs.btrfs --label registry-test "$loop_device" >/dev/null
 mount -o noatime "$loop_device" "$mount_point"
 note "btrfs on $loop_device, mounted at $mount_point"
 
-# Builds a registry root of the shape the storage role produces.
+# Builds a registry root of the shape the storage role produces, with one
+# subvolume per source named on the command line.
 make_registry() {
   local root=$1
+  shift
+  local source
   mkdir -p "$root"
   btrfs subvolume create "$root/working" >/dev/null
-  mkdir -p "$root/snapshots" "$root/mirror-sync" "$root/placeholder"
+  for source in "$@"; do
+    btrfs subvolume create "$root/working/$source" >/dev/null
+  done
+  mkdir -p "$root/snapshots" "$root/trees" "$root/mirror-sync" "$root/placeholder"
   ln -s placeholder "$root/current"
   cat >"$root/snapshot.conf" <<EOF
 registry_root='$root'
 registry_snapshot_keep_count=10
 registry_snapshot_keep_days=7
+registry_snapshot_keep_trees=10
 EOF
 }
 
-# A read-only snapshot under a name of our choosing, so retention can be
-# shown against snapshots of any age.
+# A read-only snapshot of one source under a name of our choosing, so
+# retention can be shown against snapshots of any age.
 make_snapshot() {
-  local root=$1 name=$2
-  btrfs subvolume snapshot -r "$root/working" "$root/snapshots/$name" >/dev/null
+  local root=$1 source=$2 name=$3
+  mkdir -p "$root/snapshots/$source"
+  btrfs subvolume snapshot -r "$root/working/$source" "$root/snapshots/$source/$name" >/dev/null
 }
 
 stamp_ago() {
@@ -121,7 +133,18 @@ stamp_ago() {
 }
 
 snapshot_count() {
-  find "$1/snapshots" -mindepth 1 -maxdepth 1 | wc -l
+  find "$1/snapshots/$2" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l
+}
+
+tree_count() {
+  find "$1/trees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l
+}
+
+# What the manifest of the tree the docroot points at says for one source.
+manifest_says() {
+  local root=$1 source=$2 tree
+  tree="$(basename "$(readlink "$root/current")")"
+  awk -v s="$source" '$1 == s {print $2}' "$root/trees/$tree.sources"
 }
 
 out=""
@@ -138,75 +161,175 @@ run_tool() {
 
 # --- a first publish -------------------------------------------------
 
-note "first publish"
+note "first publish, two sources and a file above them"
 registry="$mount_point/registry"
-make_registry "$registry"
+make_registry "$registry" alpha beta
+echo "alpha one" >"$registry/working/alpha/data"
+echo "beta one" >"$registry/working/beta/data"
 echo "index one" >"$registry/working/index.html"
 
 run_tool --config "$registry/snapshot.conf"
 same "exit code" "$rc" 0
 target="$(readlink "$registry/current")"
 case $target in
-snapshots/snapshot-*) ok "docroot points at the new snapshot ($target)" ;;
-*) bad "docroot points at '$target'" ;;
+trees/tree-*) ok "the docroot points at the new tree ($target)" ;;
+*) bad "the docroot points at '$target'" ;;
 esac
 case $target in
 /*) bad "docroot target is absolute" ;;
 *) ok "docroot target is relative" ;;
 esac
-same "served content" "$(cat "$registry/current/index.html")" "index one"
-same "snapshots on disk" "$(snapshot_count "$registry")" 1
+same "the served tree carries alpha" "$(cat "$registry/current/alpha/data")" "alpha one"
+same "and beta" "$(cat "$registry/current/beta/data")" "beta one"
+same "and the file above them" "$(cat "$registry/current/index.html")" "index one"
+same "one snapshot of alpha" "$(snapshot_count "$registry" alpha)" 1
+same "one snapshot of beta" "$(snapshot_count "$registry" beta)" 1
+same "one tree" "$(tree_count "$registry")" 1
 
-if echo "tampered" 2>/dev/null >"$registry/current/index.html"; then
-  bad "the snapshot is read-only"
+first_tree="$target"
+same "the manifest names alpha's snapshot" \
+  "$(manifest_says "$registry" alpha)" \
+  "$(find "$registry/snapshots/alpha" -mindepth 1 -maxdepth 1 -printf '%f\n')"
+same "the manifest names beta's snapshot" \
+  "$(manifest_says "$registry" beta)" \
+  "$(find "$registry/snapshots/beta" -mindepth 1 -maxdepth 1 -printf '%f\n')"
+
+if echo "tampered" 2>/dev/null >"$registry/current/alpha/data"; then
+  bad "the source in the served tree is read-only"
 else
-  ok "the snapshot is read-only"
+  ok "the source in the served tree is read-only"
 fi
+if echo "tampered" 2>/dev/null >"$registry/current/index.html"; then
+  bad "the file above the sources is read-only too"
+else
+  ok "the file above the sources is read-only too"
+fi
+same "a source in the tree is a subvolume of its own" \
+  "$(btrfs subvolume show "$registry/current/alpha" >/dev/null 2>&1 && echo yes || echo no)" yes
 
-# --- the working tree and the served tree are independent ------------
+# --- only what changed is snapshotted --------------------------------
 
-note "second publish"
-echo "index two" >"$registry/working/index.html"
-same "served content is still the old one" "$(cat "$registry/current/index.html")" "index one"
+note "one source changes"
+echo "alpha two" >"$registry/working/alpha/data"
+same "the served tree is still the old one" \
+  "$(cat "$registry/current/alpha/data")" "alpha one"
 
-first_target="$target"
 run_tool --config "$registry/snapshot.conf"
 same "exit code" "$rc" 0
-target="$(readlink "$registry/current")"
-if [ "$target" != "$first_target" ]; then
-  ok "docroot moved to the newer snapshot"
+same "alpha was snapshotted again" "$(snapshot_count "$registry" alpha)" 2
+same "beta was not" "$(snapshot_count "$registry" beta)" 1
+same "a second tree" "$(tree_count "$registry")" 2
+second_tree="$(readlink "$registry/current")"
+if [ "$second_tree" != "$first_tree" ]; then
+  ok "the docroot moved to the new tree"
 else
-  bad "docroot did not move"
+  bad "the docroot did not move"
 fi
-same "served content is the new one" "$(cat "$registry/current/index.html")" "index two"
-same "snapshots on disk" "$(snapshot_count "$registry")" 2
-same "the older snapshot still has the older content" \
-  "$(cat "$registry/$first_target/index.html")" "index one"
+same "the new tree serves the new alpha" "$(cat "$registry/current/alpha/data")" "alpha two"
+same "and the unchanged beta" "$(cat "$registry/current/beta/data")" "beta one"
+same "the old tree still serves what it served" \
+  "$(cat "$registry/$first_tree/alpha/data")" "alpha one"
+same "the manifest names beta's old snapshot" \
+  "$(manifest_says "$registry" beta)" \
+  "$(find "$registry/snapshots/beta" -mindepth 1 -maxdepth 1 -printf '%f\n')"
+
+# --- a file above the sources changes on its own ---------------------
+
+note "only a file above the sources changes"
+echo "index two" >"$registry/working/index.html"
+run_tool --config "$registry/snapshot.conf"
+same "exit code" "$rc" 0
+same "no source was snapshotted for it" \
+  "$(snapshot_count "$registry" alpha)$(snapshot_count "$registry" beta)" "21"
+same "but a tree was composed" "$(tree_count "$registry")" 3
+same "and it serves the new file" "$(cat "$registry/current/index.html")" "index two"
+same "with the sources unchanged" "$(cat "$registry/current/alpha/data")" "alpha two"
+third_tree="$(readlink "$registry/current")"
+
+# --- a run with nothing to do ----------------------------------------
+
+note "nothing changed"
+run_tool --config "$registry/snapshot.conf"
+same "exit code" "$rc" 0
+if grep -q "nothing changed" "$out"; then
+  ok "the run says it had nothing to do"
+else
+  bad "the run did not say it had nothing to do"
+fi
+same "no tree was composed" "$(tree_count "$registry")" 3
+same "the docroot did not move" "$(readlink "$registry/current")" "$third_tree"
+same "no snapshot was taken" \
+  "$(snapshot_count "$registry" alpha)$(snapshot_count "$registry" beta)" "21"
+
+# --- a caller that says which source to look at ----------------------
+
+note "a caller naming the source"
+echo "alpha three" >"$registry/working/alpha/data"
+echo "beta two" >"$registry/working/beta/data"
+run_tool --config "$registry/snapshot.conf" --source alpha
+same "exit code" "$rc" 0
+same "alpha was snapshotted" "$(snapshot_count "$registry" alpha)" 3
+same "beta was left alone although it changed" "$(snapshot_count "$registry" beta)" 1
+same "the tree serves the new alpha" "$(cat "$registry/current/alpha/data")" "alpha three"
+same "and beta as it was published last" "$(cat "$registry/current/beta/data")" "beta one"
+
+run_tool --config "$registry/snapshot.conf" --source nosuch
+same "a source that does not exist" "$rc" 1
+
+# and back to a consistent state for what follows
+run_tool --config "$registry/snapshot.conf"
+same "exit code" "$rc" 0
+same "beta caught up" "$(cat "$registry/current/beta/data")" "beta two"
+
+# --- a tree a run did not finish -------------------------------------
+
+note "a tree left behind by a run that was interrupted"
+partial="$registry/trees/tree-19700101T000000Z"
+btrfs subvolume create "$partial" >/dev/null
+echo "half a tree" >"$partial/index.html"
+before_trees="$(tree_count "$registry")"
+run_tool --config "$registry/snapshot.conf"
+same "exit code" "$rc" 0
+true_that "the unfinished tree is gone" \
+  "$([ ! -e "$partial" ] && echo true || echo false)"
+if grep -q "did not finish" "$out"; then
+  ok "the run says what it removed"
+else
+  bad "the run did not say what it removed"
+fi
+same "and no finished tree went with it" "$(tree_count "$registry")" "$((before_trees - 1))"
 
 # --- one run at a time -----------------------------------------------
 
 note "lock"
 exec 8>"$registry/.snapshot.lock"
 flock -n 8
+echo "alpha four" >"$registry/working/alpha/data"
+before_trees="$(tree_count "$registry")"
 run_tool --config "$registry/snapshot.conf"
 same "exit code while the lock is held" "$rc" 6
-same "snapshots on disk are unchanged" "$(snapshot_count "$registry")" 2
+same "trees on disk are unchanged" "$(tree_count "$registry")" "$before_trees"
 exec 8>&-
 
 # --- retention: the count bound alone --------------------------------
 
 note "retention, everything older than the day bound"
 old="$mount_point/old"
-make_registry "$old"
+make_registry "$old" alpha beta
+echo "old" >"$old/working/alpha/data"
 for index in $(seq 1 15); do
-  make_snapshot "$old" "snapshot-$(stamp_ago "$((index + 30)) days ago")"
+  make_snapshot "$old" alpha "snapshot-$(stamp_ago "$((index + 30)) days ago")"
 done
+make_snapshot "$old" beta "snapshot-$(stamp_ago "40 days ago")"
+echo "changed" >"$old/working/alpha/data"
 run_tool --config "$old/snapshot.conf"
 same "exit code" "$rc" 0
-same "the newest ten survive, the run's own snapshot included" "$(snapshot_count "$old")" 10
-same "the docroot is one of them" \
+same "the newest ten of alpha survive, the run's own snapshot included" \
+  "$(snapshot_count "$old" alpha)" 10
+same "beta's only snapshot is kept" "$(snapshot_count "$old" beta)" 1
+same "the tree the docroot points at is there" \
   "$([ -d "$old/$(readlink "$old/current")" ] && echo yes)" yes
-if grep -q "^deleted snapshots/" "$out"; then
+if grep -q "^deleted snapshots/alpha/" "$out"; then
   ok "the run reports what it deleted"
 else
   bad "the run did not report any deletion"
@@ -216,73 +339,45 @@ fi
 
 note "retention, more than the count bound but all younger than the day bound"
 young="$mount_point/young"
-make_registry "$young"
+make_registry "$young" alpha
+echo "young" >"$young/working/alpha/data"
 for index in $(seq 1 15); do
-  make_snapshot "$young" "snapshot-$(stamp_ago "$((index * 3)) hours ago")"
+  make_snapshot "$young" alpha "snapshot-$(stamp_ago "$((index * 3)) hours ago")"
 done
+echo "changed" >"$young/working/alpha/data"
 run_tool --config "$young/snapshot.conf"
 same "exit code" "$rc" 0
-same "nothing is deleted while the day bound covers it" "$(snapshot_count "$young")" 16
+same "nothing is deleted while the day bound covers it" "$(snapshot_count "$young" alpha)" 16
 
 # --- retention: both bounds together ---------------------------------
 
 note "retention, old snapshots but fewer than the count bound"
 few="$mount_point/few"
-make_registry "$few"
+make_registry "$few" alpha
+echo "few" >"$few/working/alpha/data"
 for index in $(seq 1 5); do
-  make_snapshot "$few" "snapshot-$(stamp_ago "$((index + 300)) days ago")"
+  make_snapshot "$few" alpha "snapshot-$(stamp_ago "$((index + 300)) days ago")"
 done
+echo "changed" >"$few/working/alpha/data"
 run_tool --config "$few/snapshot.conf"
 same "exit code" "$rc" 0
-same "nothing is deleted while the count bound covers it" "$(snapshot_count "$few")" 6
-
-# --- retention: the served snapshot is never deleted -----------------
-
-note "retention, the docroot pointing at a snapshot beyond both bounds"
-served="$mount_point/served"
-make_registry "$served"
-for index in $(seq 1 12); do
-  make_snapshot "$served" "snapshot-$(stamp_ago "$((index + 90)) days ago")"
-done
-mapfile -t existing < <(find "$served/snapshots" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
-oldest="${existing[0]}"
-rm "$served/current"
-ln -s "snapshots/$oldest" "$served/current"
-# A dry run, because a real run switches the docroot to the new snapshot
-# before retention gets to look at it — the guard only ever matters for a
-# docroot that was moved back by hand.
-run_tool --config "$served/snapshot.conf" --dry-run
-same "exit code" "$rc" 0
-if grep -q "would delete snapshots/$oldest\$" "$out"; then
-  bad "the served snapshot was up for deletion"
-else
-  ok "the served snapshot was left alone"
-fi
-if grep -q "it is the snapshot being served" "$err"; then
-  ok "the run says why it kept it"
-else
-  bad "the run did not say why it kept it"
-fi
-if grep -q "^would delete snapshots/" "$out"; then
-  ok "other snapshots beyond both bounds were still up for deletion"
-else
-  bad "the dry run proposed no deletion at all"
-fi
-same "a dry run changes nothing" "$(snapshot_count "$served")" 12
+same "nothing is deleted while the count bound covers it" "$(snapshot_count "$few" alpha)" 6
 
 # --- entries that are not snapshots ----------------------------------
 
-note "an entry in the snapshot area that is not a snapshot"
+note "an entry in a source's snapshot area that is not a snapshot"
 mixed="$mount_point/mixed"
-make_registry "$mixed"
+make_registry "$mixed" alpha
+echo "mixed" >"$mixed/working/alpha/data"
 for index in $(seq 1 12); do
-  make_snapshot "$mixed" "snapshot-$(stamp_ago "$((index + 60)) days ago")"
+  make_snapshot "$mixed" alpha "snapshot-$(stamp_ago "$((index + 60)) days ago")"
 done
-mkdir "$mixed/snapshots/not-a-snapshot"
+mkdir "$mixed/snapshots/alpha/not-a-snapshot"
+echo "changed" >"$mixed/working/alpha/data"
 run_tool --config "$mixed/snapshot.conf"
 same "exit code" "$rc" 0
 true_that "the foreign entry is still there" \
-  "$([ -d "$mixed/snapshots/not-a-snapshot" ] && echo true || echo false)"
+  "$([ -d "$mixed/snapshots/alpha/not-a-snapshot" ] && echo true || echo false)"
 if grep -q "not-a-snapshot" "$err"; then
   ok "the run names the foreign entry"
 else
@@ -292,9 +387,106 @@ fi
 # --- retention bounds from the command line --------------------------
 
 note "retention bounds from the command line"
-run_tool --config "$mixed/snapshot.conf" --keep-count 2 --keep-days 0
+echo "changed again" >"$mixed/working/alpha/data"
+run_tool --config "$mixed/snapshot.conf" --keep-count 2 --keep-days 0 --keep-trees 1
 same "exit code" "$rc" 0
-same "the command line overrides the settings file" "$(snapshot_count "$mixed")" 3
+same "the command line overrides the settings file" "$(snapshot_count "$mixed" alpha)" 3
+same "and the tree bound too" "$(tree_count "$mixed")" 1
+
+# --- a snapshot a kept tree was composed from ------------------------
+#
+# The two retention bounds are about age and count. A tree that is still
+# kept is a third claim on a snapshot: the tree names it, so as long as
+# the tree is there the snapshot has to be too, or the tree stops being
+# explainable and the mirror chain it belongs to loses its middle.
+
+note "a snapshot that both bounds have let go of but a kept tree names"
+held="$mount_point/held"
+make_registry "$held" alpha
+echo "one" >"$held/working/alpha/data"
+run_tool --config "$held/snapshot.conf"
+same "exit code" "$rc" 0
+first_snapshot="$(manifest_says "$held" alpha)"
+echo "two" >"$held/working/alpha/data"
+run_tool --config "$held/snapshot.conf"
+same "exit code" "$rc" 0
+same "two snapshots and two trees" \
+  "$(snapshot_count "$held" alpha)$(tree_count "$held")" "22"
+
+run_tool --config "$held/snapshot.conf" --keep-count 1 --keep-days 0 --keep-trees 2
+same "exit code" "$rc" 0
+same "the older snapshot is still there" "$(snapshot_count "$held" alpha)" 2
+if grep -q "a tree that is kept was composed from it" "$err"; then
+  ok "the run says why it kept it"
+else
+  bad "the run did not say why it kept it"
+fi
+
+note "and once the tree that named it is gone"
+run_tool --config "$held/snapshot.conf" --keep-count 1 --keep-days 0 --keep-trees 1
+same "exit code" "$rc" 0
+same "one tree is left" "$(tree_count "$held")" 1
+same "and the snapshot nothing names any more went with it" \
+  "$(snapshot_count "$held" alpha)" 1
+true_that "the one that is left is the one the tree names" \
+  "$([ -d "$held/snapshots/alpha/$(manifest_says "$held" alpha)" ] && echo true || echo false)"
+true_that "the first snapshot is the one that went" \
+  "$([ ! -e "$held/snapshots/alpha/$first_snapshot" ] && echo true || echo false)"
+
+# --- the tree the docroot points at ----------------------------------
+#
+# Two trees composed from the same snapshots — only the file above the
+# sources differs — so that the docroot can be moved back to the older one
+# without anything else being out of date. Retention then has a tree the
+# count bound has let go of and the docroot points at.
+
+note "retention, the docroot pointing at a tree beyond the count bound"
+served="$mount_point/served"
+make_registry "$served" alpha
+echo "one" >"$served/working/alpha/data"
+echo "top one" >"$served/working/index.html"
+run_tool --config "$served/snapshot.conf"
+same "exit code" "$rc" 0
+older_tree="$(readlink "$served/current")"
+echo "top two" >"$served/working/index.html"
+run_tool --config "$served/snapshot.conf"
+same "exit code" "$rc" 0
+same "two trees over one snapshot" \
+  "$(tree_count "$served")$(snapshot_count "$served" alpha)" "21"
+
+# Back to exactly the file the older tree carries, timestamp included:
+# what a tree holds above its sources is compared the same way a source
+# is, by metadata, so "the same bytes written again" is a change and this
+# has to be the same file.
+cp --preserve=timestamps "$served/$older_tree/index.html" "$served/working/index.html"
+rm "$served/current"
+ln -s "$older_tree" "$served/current"
+run_tool --config "$served/snapshot.conf" --keep-trees 1
+same "exit code" "$rc" 0
+same "nothing was composed, the served tree already says all of it" \
+  "$(readlink "$served/current")" "$older_tree"
+true_that "the served tree survived the count bound" \
+  "$([ -d "$served/$older_tree" ] && echo true || echo false)"
+if grep -q "it is the tree being served" "$err"; then
+  ok "the run says why it kept it"
+else
+  bad "the run did not say why it kept it"
+fi
+
+# --- a source that is not a subvolume --------------------------------
+
+note "a directory in the working tree that is not a subvolume"
+broken="$mount_point/broken"
+make_registry "$broken" alpha
+mkdir "$broken/working/plain"
+run_tool --config "$broken/snapshot.conf"
+same "exit code" "$rc" 2
+if grep -q "not a btrfs subvolume" "$err"; then
+  ok "the run says what is wrong and how to fix it"
+else
+  bad "the run did not say what is wrong"
+fi
+same "and nothing was published" "$(tree_count "$broken")" 0
 
 # --- exit codes ------------------------------------------------------
 
@@ -306,9 +498,11 @@ same "settings file that is not there" "$rc" 2
 run_tool --root "$work_dir/not-a-registry"
 same "registry root that is not there" "$rc" 2
 run_tool --root "$mount_point" --config "$registry/snapshot.conf"
-same "a root without a working subvolume" "$rc" 2
+same "a root without a working tree" "$rc" 2
 run_tool --config "$registry/snapshot.conf" --keep-count 0
 same "a count bound below one" "$rc" 2
+run_tool --config "$registry/snapshot.conf" --keep-trees 0
+same "a tree bound below one" "$rc" 2
 
 # --- result ----------------------------------------------------------
 

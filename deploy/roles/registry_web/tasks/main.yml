@@ -127,9 +127,13 @@
       http://{{ registry_web_listen_address }}:{{ registry_web_bootstrap_port }}
   when: registry_web_bootstrap_enabled | bool
 
+# The chain indexes live one directory down, one per source, and which
+# sources exist is not this role's business. So what is asked for here is
+# the root, which the vhost refuses by construction: a 404 from it is a
+# vhost that is configured and answering.
 - name: Check the mirror-sync vhost answers
   ansible.builtin.uri:
-    url: http://{{ registry_web_listen_address }}:{{ registry_web_mirror_sync_port }}/index.json
+    url: http://{{ registry_web_listen_address }}:{{ registry_web_mirror_sync_port }}/
     method: HEAD
-    status_code: [200, 404]
+    status_code: 404
   when: registry_web_mirror_sync_enabled | bool

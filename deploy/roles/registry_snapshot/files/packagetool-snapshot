@@ -4,41 +4,78 @@
 #
 # packagetool-snapshot — publish the registry working tree.
 #
-# One run does three things, in this order:
+# A registry is a set of sources that move at their own pace, plus a few
+# files above them. Each source is a btrfs subvolume of its own, so it can
+# be snapshotted on its own and followed on its own; what gets served is a
+# composition of one snapshot per source, and that composition is what the
+# docroot points at.
 #
-#   1. create a read-only btrfs snapshot of the working tree, named
-#      snapshot-<ISO 8601 basic, UTC>, in the snapshot area;
-#   2. point the served docroot symlink "current" at that snapshot with a
-#      rename, so the switch is atomic and no client ever sees a tree
-#      that is half published;
-#   3. delete snapshots that both retention bounds have let go of.
+# One run does four things, in this order:
 #
-# Retention keeps a snapshot while EITHER bound still covers it: it is
-# among the newest <keep count>, or it is younger than <keep days>. Only
-# a snapshot that neither bound covers is deleted, and the snapshot the
-# docroot points at is never deleted.
+#   1. take a read-only snapshot of every source whose working content
+#      changed, into <root>/snapshots/<source>/snapshot-<ISO 8601 basic,
+#      UTC>;
+#   2. compose <root>/trees/tree-<same timestamp>/ out of one read-only
+#      snapshot COPY of each source's newest snapshot plus the files that
+#      live above the sources;
+#   3. point the served docroot symlink "current" at that tree with a
+#      rename, so the switch is atomic and no client ever sees a tree that
+#      is half published;
+#   4. delete the trees and the snapshots that retention has let go of.
+#
+# Why copies and not symlinks: the served tree is copied by plain rsync
+# and served by a file server, and neither dereferences a symlink that
+# leaves the tree — an rsync daemon chroots into the docroot, where such a
+# link points nowhere at all. A btrfs snapshot of a snapshot costs almost
+# nothing and is a real directory of real files everywhere it is read
+# from, mount or no mount, reboot or no reboot.
+#
+# Retention keeps a per-source snapshot while EITHER bound still covers
+# it: it is among the newest <keep count> of its source, or it is younger
+# than <keep days>. A snapshot a surviving tree was composed from is kept
+# whatever the bounds say, and so is a tree or a snapshot the docroot
+# points at.
 #
 # The layout below is fixed rather than configurable, because the web
-# server, the rsync export, the publish pipeline and the mirror export
-# all have to agree on it; only the root is configurable.
+# server, the rsync export, the publish pipeline and the mirror export all
+# have to agree on it; only the root is configurable.
 #
-#   <root>/working        the working tree, a btrfs subvolume, never served
-#   <root>/snapshots/     the read-only snapshots, one per publish
-#   <root>/mirror-sync/   dumps for official mirrors
-#   <root>/current        symlink to the snapshot that is served
+#   <root>/working/           what is being prepared, never served
+#   <root>/working/<source>   one btrfs subvolume per source
+#   <root>/working/<file>     the files above the sources (pages, the
+#                             source catalogue, the trust anchor)
+#   <root>/snapshots/<source>/snapshot-<ts>
+#                             the read-only snapshots of one source
+#   <root>/trees/tree-<ts>/   a served composition: one snapshot copy per
+#                             source, plus the files above them
+#   <root>/trees/tree-<ts>.sources
+#                             which snapshot of which source that tree was
+#                             composed from; written last, so a tree
+#                             without one is a run that was interrupted
+#   <root>/mirror-sync/       dumps for official mirrors, per source
+#   <root>/current            symlink to the tree that is served
 #
-# The timestamp in a snapshot name is ISO 8601 basic format in UTC
+# The timestamp in a snapshot or tree name is ISO 8601 basic format in UTC
 # (20260904T093000Z), not the extended one: the name ends up in file
-# names, URLs and rsync arguments, and a colon is awkward in all three.
-# It sorts chronologically as plain text, which is what retention uses.
+# names, URLs and rsync arguments, and a colon is awkward in all three. It
+# sorts chronologically as plain text, which is what retention uses. One
+# run uses one timestamp for everything it creates, so a tree and the
+# snapshots it was composed from can be read as one publish.
+#
+# Which sources changed is worked out from the trees themselves: the
+# metadata of every file in a source is compared against the metadata in
+# that source's newest snapshot. No state is kept anywhere for it, nothing
+# is read that is not on disk, and the worst a mistake can do is take a
+# snapshot that was not needed. A caller that already knows better can
+# name the sources with --source.
 #
 # Exit codes:
 #   0  success
 #   1  usage error
 #   2  precondition not met: configuration, layout, or missing tools
-#   3  the snapshot could not be created
+#   3  a snapshot or the composed tree could not be created
 #   4  the docroot could not be switched
-#   5  snapshot and switch succeeded, retention did not
+#   5  everything was published, retention did not finish
 #   6  another run holds the lock
 #
 # Everything the run does goes to stdout, everything that went wrong or
@@ -58,7 +95,16 @@ readonly EXIT_LOCKED=6
 readonly DEFAULT_CONFIG_FILE=/etc/packagetool/snapshot.conf
 readonly SNAPSHOT_PREFIX=snapshot-
 readonly SNAPSHOT_NAME_PATTERN='^snapshot-[0-9]{8}T[0-9]{6}Z$'
+readonly TREE_PREFIX=tree-
+readonly TREE_NAME_PATTERN='^tree-[0-9]{8}T[0-9]{6}Z$'
+readonly MANIFEST_SUFFIX=.sources
+# A source name is a path segment of every URL the registry serves and an
+# argument of every rsync a mirror runs. Anything outside this is refused
+# rather than published.
+readonly SOURCE_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 readonly SECONDS_PER_DAY=86400
+
+readonly MANIFEST_HEADER='# packagetool tree manifest: <source> <snapshot>, one per line.'
 
 # Settings, in the order they are applied: these built-in values, then
 # the configuration file, then the command line. The names are the ones
@@ -67,6 +113,7 @@ readonly SECONDS_PER_DAY=86400
 registry_root=/srv/registry
 registry_snapshot_keep_count=10
 registry_snapshot_keep_days=7
+registry_snapshot_keep_trees=10
 
 config_file=$DEFAULT_CONFIG_FILE
 config_file_given=false
@@ -76,15 +123,24 @@ quiet=false
 opt_root=
 opt_keep_count=
 opt_keep_days=
+opt_keep_trees=
+selected_sources=()
 
 working_dir=
 snapshots_dir=
+trees_dir=
 current_link=
 lock_file=
 
 # Removed by the exit trap if a switch was interrupted between creating
 # the replacement symlink and renaming it over the docroot.
 tmp_link=
+
+# The sources this run found, and per source the snapshot the composed
+# tree is to be built from. Filled by plan_sources().
+sources=()
+declare -A planned_snapshot=()
+declare -A source_changed=()
 
 err() {
   printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
@@ -103,6 +159,8 @@ die() {
   exit "$code"
 }
 
+# Invoked by the EXIT trap, not from the flow.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   if [ -n "$tmp_link" ] && [ -L "$tmp_link" ]; then
     rm -f "$tmp_link"
@@ -113,20 +171,24 @@ usage() {
   cat <<'EOF'
 Usage: packagetool-snapshot [OPTIONS]
 
-Snapshots the registry working tree, points the served docroot at the new
-snapshot, and applies the retention bounds.
+Snapshots the sources whose working content changed, composes the tree
+that is served out of one snapshot per source, points the docroot at it,
+and applies the retention bounds.
 
 Options:
   --config PATH    settings file to read (default /etc/packagetool/snapshot.conf)
   --root PATH      registry root (default /srv/registry)
-  --keep-count N   keep at least the newest N snapshots (default 10)
+  --source NAME    only consider this source for a new snapshot; repeatable.
+                   Every source is still part of the composed tree.
+  --keep-count N   keep at least the newest N snapshots per source (default 10)
   --keep-days D    keep every snapshot younger than D days (default 7)
+  --keep-trees N   keep at least the newest N composed trees (default 10)
   --dry-run        report what a run would do; changes nothing, takes no lock
   --quiet          report only problems
   --help           this text
 
-Exit codes: 0 success, 1 usage, 2 precondition, 3 snapshot, 4 switch,
-5 retention, 6 locked.
+Exit codes: 0 success, 1 usage, 2 precondition, 3 snapshot or tree,
+4 switch, 5 retention, 6 locked.
 EOF
 }
 
@@ -144,6 +206,11 @@ parse_args() {
       opt_root=$2
       shift 2
       ;;
+    --source)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--source needs a source name"
+      selected_sources+=("$2")
+      shift 2
+      ;;
     --keep-count)
       [ $# -ge 2 ] || die "$EXIT_USAGE" "--keep-count needs a number"
       opt_keep_count=$2
@@ -152,6 +219,11 @@ parse_args() {
     --keep-days)
       [ $# -ge 2 ] || die "$EXIT_USAGE" "--keep-days needs a number"
       opt_keep_days=$2
+      shift 2
+      ;;
+    --keep-trees)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--keep-trees needs a number"
+      opt_keep_trees=$2
       shift 2
       ;;
     --dry-run)
@@ -194,6 +266,9 @@ load_config() {
   if [ -n "$opt_keep_days" ]; then
     registry_snapshot_keep_days=$opt_keep_days
   fi
+  if [ -n "$opt_keep_trees" ]; then
+    registry_snapshot_keep_trees=$opt_keep_trees
+  fi
 }
 
 validate_config() {
@@ -219,16 +294,29 @@ validate_config() {
     die "$EXIT_PRECONDITION" \
       "the number of days to keep must be a whole number, not '$registry_snapshot_keep_days'"
   fi
+  if ! [[ $registry_snapshot_keep_trees =~ ^[0-9]+$ ]] ||
+    [ "$registry_snapshot_keep_trees" -lt 1 ]; then
+    die "$EXIT_PRECONDITION" \
+      "the tree count to keep must be a whole number of at least 1, not '$registry_snapshot_keep_trees'"
+  fi
+
+  local name
+  for name in ${selected_sources[@]+"${selected_sources[@]}"}; do
+    if ! [[ $name =~ $SOURCE_NAME_PATTERN ]]; then
+      die "$EXIT_USAGE" "'$name' is not a source name"
+    fi
+  done
 
   working_dir=$registry_root/working
   snapshots_dir=$registry_root/snapshots
+  trees_dir=$registry_root/trees
   current_link=$registry_root/current
   lock_file=$registry_root/.snapshot.lock
 }
 
 check_preconditions() {
   local tool
-  for tool in btrfs date find flock ln mv readlink; do
+  for tool in btrfs cp date find flock ln mv readlink sha256sum sort; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       die "$EXIT_PRECONDITION" "$tool is not installed"
     fi
@@ -237,12 +325,16 @@ check_preconditions() {
   if [ ! -d "$registry_root" ]; then
     die "$EXIT_PRECONDITION" "the registry root $registry_root does not exist"
   fi
-  if ! btrfs subvolume show "$working_dir" >/dev/null 2>&1; then
+  if [ ! -d "$working_dir" ]; then
     die "$EXIT_PRECONDITION" \
-      "$working_dir is not a btrfs subvolume — set the registry storage up first"
+      "$working_dir does not exist — set the registry storage up first"
   fi
   if [ ! -d "$snapshots_dir" ]; then
     die "$EXIT_PRECONDITION" "the snapshot area $snapshots_dir does not exist"
+  fi
+  if [ ! -d "$trees_dir" ]; then
+    die "$EXIT_PRECONDITION" \
+      "the tree area $trees_dir does not exist — set the registry storage up first"
   fi
   if [ -e "$current_link" ] && [ ! -L "$current_link" ]; then
     die "$EXIT_PRECONDITION" \
@@ -260,19 +352,41 @@ take_lock() {
   fi
 }
 
-# Prints a snapshot name that is not taken yet. Two runs in the same
-# second are the only way to collide, so waiting a second is enough.
-pick_snapshot_name() {
-  local name
-  for _ in 1 2 3; do
-    name=$SNAPSHOT_PREFIX$(date -u +%Y%m%dT%H%M%SZ)
-    if [ ! -e "$snapshots_dir/$name" ]; then
-      printf '%s' "$name"
-      return 0
+is_subvolume() {
+  btrfs subvolume show "$1" >/dev/null 2>&1
+}
+
+# The names of one kind below a directory that match a pattern, sorted.
+# Plain text order is chronological order for both timestamps this script
+# uses.
+list_entries() {
+  local dir=$1 kind=$2 pattern=$3 name
+  [ -d "$dir" ] || return 0
+  while IFS= read -r name; do
+    if [[ $name =~ $pattern ]]; then
+      printf '%s\n' "$name"
     fi
-    sleep 1
-  done
-  return 1
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -type "$kind" -printf '%f\n' | LC_ALL=C sort)
+}
+
+# What a source looks like, as metadata rather than as bytes: type, mode,
+# size, modification time and relative path of everything in it. A btrfs
+# snapshot preserves all five exactly, so two trees with the same
+# fingerprint hold the same files — and a publish that rewrites a document
+# moves its modification time whatever else it does. Reading half a
+# gigabyte of package on every run to learn the same thing is not worth
+# it.
+fingerprint_tree() {
+  find "$1" -mindepth 1 -printf '%y\t%m\t%s\t%T@\t%P\n' |
+    LC_ALL=C sort | sha256sum | cut -d' ' -f1
+}
+
+# The files above the sources: everything that is a plain file directly in
+# a tree. Compared the same way, so a new page or a regenerated catalogue
+# is a reason to publish even when no source moved.
+fingerprint_top_files() {
+  find "$1" -mindepth 1 -maxdepth 1 -type f -printf '%m\t%s\t%T@\t%f\n' |
+    LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
 
 # The epoch second a snapshot name stands for.
@@ -282,14 +396,206 @@ snapshot_epoch() {
   date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2} ${stamp:9:2}:${stamp:11:2}:${stamp:13:2} UTC" +%s
 }
 
+manifest_path() {
+  printf '%s/%s%s' "$trees_dir" "$1" "$MANIFEST_SUFFIX"
+}
+
+# The tree the docroot points at, or nothing if it points somewhere else —
+# at the placeholder before the first publish, for instance.
+current_tree() {
+  local target
+  [ -L "$current_link" ] || return 0
+  target=$(readlink "$current_link")
+  case $target in
+  trees/*) ;;
+  *) return 0 ;;
+  esac
+  target=${target#trees/}
+  if [[ $target =~ $TREE_NAME_PATTERN ]] && [ -d "$trees_dir/$target" ]; then
+    printf '%s' "$target"
+  fi
+}
+
+# ------------------------------------------------------------- planning
+
+# Which sources there are, and for each of them whether this run has to
+# snapshot it. Refuses a working tree it cannot publish rather than
+# publishing part of it: a directory that is not a subvolume cannot be
+# snapshotted, and leaving it out would serve a registry that quietly lost
+# a source.
+plan_sources() {
+  local name newest selected=false
+  local -A wanted=()
+
+  if [ ${#selected_sources[@]} -gt 0 ]; then
+    selected=true
+    for name in "${selected_sources[@]}"; do
+      wanted["$name"]=yes
+    done
+  fi
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if ! [[ $name =~ $SOURCE_NAME_PATTERN ]]; then
+      die "$EXIT_PRECONDITION" \
+        "$working_dir/$name is not a usable source name — a source name may hold letters, digits, dots, dashes and underscores"
+    fi
+    if ! is_subvolume "$working_dir/$name"; then
+      die "$EXIT_PRECONDITION" \
+        "$working_dir/$name is not a btrfs subvolume — every source has to be one, because that is what can be snapshotted. Create it with: btrfs subvolume create $working_dir/$name"
+    fi
+    sources+=("$name")
+  done < <(find "$working_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort)
+
+  if [ "$selected" = true ]; then
+    for name in "${!wanted[@]}"; do
+      if [ ! -d "$working_dir/$name" ]; then
+        die "$EXIT_USAGE" "$working_dir/$name is not a source of this registry"
+      fi
+    done
+  fi
+
+  for name in ${sources[@]+"${sources[@]}"}; do
+    newest=$(list_entries "$snapshots_dir/$name" d "$SNAPSHOT_NAME_PATTERN" | tail -1)
+    source_changed["$name"]=false
+    if [ "$selected" = true ] && [ -z "${wanted["$name"]:-}" ]; then
+      if [ -z "$newest" ]; then
+        die "$EXIT_PRECONDITION" \
+          "$name was not named with --source and has no snapshot yet — the composed tree would have nothing to take for it"
+      fi
+      planned_snapshot["$name"]=$newest
+      continue
+    fi
+    if [ -z "$newest" ] ||
+      [ "$(fingerprint_tree "$working_dir/$name")" != "$(fingerprint_tree "$snapshots_dir/$name/$newest")" ]; then
+      source_changed["$name"]=true
+    else
+      planned_snapshot["$name"]=$newest
+    fi
+  done
+}
+
+# Whether anything about the served tree would change. A run that would
+# compose a tree identical to the one being served takes no snapshot, no
+# tree and no flip: publishing an unchanged registry costs a mirror a
+# full re-sync of nothing.
+anything_to_publish() {
+  local name tree manifest
+  for name in ${sources[@]+"${sources[@]}"}; do
+    if [ "${source_changed["$name"]}" = true ]; then
+      return 0
+    fi
+  done
+
+  tree=$(current_tree)
+  if [ -z "$tree" ]; then
+    return 0
+  fi
+  manifest=$(manifest_path "$tree")
+  if [ ! -f "$manifest" ]; then
+    return 0
+  fi
+  if [ "$(read_manifest "$manifest")" != "$(printf_planned)" ]; then
+    return 0
+  fi
+  if [ "$(fingerprint_top_files "$working_dir")" != "$(fingerprint_top_files "$trees_dir/$tree")" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# The manifest lines a tree composed now would carry, in the order they
+# are written.
+printf_planned() {
+  local name
+  for name in ${sources[@]+"${sources[@]}"}; do
+    printf '%s %s\n' "$name" "${planned_snapshot["$name"]}"
+  done
+}
+
+read_manifest() {
+  grep -v '^#' -- "$1" 2>/dev/null || true
+}
+
+# --------------------------------------------------------------- publish
+
+create_snapshots() {
+  local stamp=$1 name
+  for name in ${sources[@]+"${sources[@]}"}; do
+    [ "${source_changed["$name"]}" = true ] || continue
+    if [ "$dry_run" = true ]; then
+      say "would create snapshots/$name/$SNAPSHOT_PREFIX$stamp"
+      planned_snapshot["$name"]=$SNAPSHOT_PREFIX$stamp
+      continue
+    fi
+    mkdir -p "$snapshots_dir/$name"
+    if ! btrfs subvolume snapshot -r "$working_dir/$name" \
+      "$snapshots_dir/$name/$SNAPSHOT_PREFIX$stamp" >/dev/null; then
+      die "$EXIT_SNAPSHOT" "could not snapshot $working_dir/$name"
+    fi
+    planned_snapshot["$name"]=$SNAPSHOT_PREFIX$stamp
+    say "created snapshots/$name/$SNAPSHOT_PREFIX$stamp"
+  done
+}
+
+# The served composition. A subvolume rather than a plain directory, so
+# that it can be made read-only when it is finished: what is served is
+# then exactly as unwritable as the snapshots inside it, and a stray
+# process cannot edit the catalogue of a published tree.
+#
+# The manifest is written last, after everything is in place and the tree
+# is read-only. A tree without one is the leftover of a run that was
+# interrupted, which is how the next run recognises it.
+compose_tree() {
+  local tree=$1 name file
+  local dir=$trees_dir/$tree
+
+  if ! btrfs subvolume create "$dir" >/dev/null; then
+    die "$EXIT_SNAPSHOT" "could not create the tree $dir"
+  fi
+
+  for name in ${sources[@]+"${sources[@]}"}; do
+    if ! btrfs subvolume snapshot -r "$snapshots_dir/$name/${planned_snapshot["$name"]}" \
+      "$dir/$name" >/dev/null; then
+      die "$EXIT_SNAPSHOT" \
+        "could not put snapshots/$name/${planned_snapshot["$name"]} into $dir"
+    fi
+  done
+
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    # A reflink, so a page or a catalogue is shared with the working tree
+    # rather than copied into every tree that is kept.
+    if ! cp --reflink=auto --preserve=timestamps -- "$working_dir/$file" "$dir/$file"; then
+      die "$EXIT_SNAPSHOT" "could not put $file into $dir"
+    fi
+  done < <(find "$working_dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+
+  if ! btrfs property set "$dir" ro true; then
+    die "$EXIT_SNAPSHOT" "could not make $dir read-only"
+  fi
+
+  # Force a transaction commit, so the tree and its snapshots survive a
+  # crash and can be sent to a mirror without waiting for the next commit.
+  if ! btrfs filesystem sync "$registry_root" >/dev/null; then
+    die "$EXIT_SNAPSHOT" "could not commit the new tree to disk"
+  fi
+
+  {
+    printf '%s\n' "$MANIFEST_HEADER"
+    printf_planned
+  } >"$(manifest_path "$tree")"
+  say "composed trees/$tree from ${#sources[@]} source(s)"
+}
+
 # The docroot switch. A symlink cannot be repointed in place, so the
 # replacement is built next to it and renamed over it: rename(2) is
-# atomic, so every reader sees either the old snapshot or the new one.
+# atomic, so every reader sees either the old tree or the new one.
 flip_docroot() {
-  local name=$1
+  local tree=$1
   tmp_link=$registry_root/.current.$$
   rm -f "$tmp_link"
-  if ! ln -s "snapshots/$name" "$tmp_link"; then
+  if ! ln -s "trees/$tree" "$tmp_link"; then
     return 1
   fi
   if ! mv -T "$tmp_link" "$current_link"; then
@@ -297,16 +603,140 @@ flip_docroot() {
     return 1
   fi
   tmp_link=
-  [ "$(readlink "$current_link")" = "snapshots/$name" ]
+  [ "$(readlink "$current_link")" = "trees/$tree" ]
 }
 
-# Deletes the snapshots that neither retention bound covers. The name of
-# the snapshot this run is about to create is passed in during a dry run,
-# where it is not on disk yet but does shift the newest-N window.
-run_retention() {
+# ------------------------------------------------------------- retention
+
+# A composed tree, gone: the snapshot copies inside it first, because a
+# subvolume with subvolumes in it cannot be deleted, and the read-only
+# property has to come off before anything inside can be unlinked.
+delete_tree() {
+  local tree=$1 entry
+  local dir=$trees_dir/$tree
+  if ! btrfs property set "$dir" ro false; then
+    return 1
+  fi
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    if is_subvolume "$dir/$entry"; then
+      btrfs subvolume delete "$dir/$entry" >/dev/null || return 1
+    fi
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort)
+  btrfs subvolume delete "$dir" >/dev/null || return 1
+  rm -f -- "$(manifest_path "$tree")"
+}
+
+# Trees a run was interrupted in the middle of: composed, never finished,
+# never served. Recognised by having no manifest, which is written last
+# and only once everything else is in place.
+remove_incomplete_trees() {
+  local tree served
+  served=$(current_tree)
+  while IFS= read -r tree; do
+    [ -n "$tree" ] || continue
+    [ "$tree" != "$served" ] || continue
+    [ ! -f "$(manifest_path "$tree")" ] || continue
+    if [ "$dry_run" = true ]; then
+      say "would remove trees/$tree (composed by a run that did not finish)"
+      continue
+    fi
+    if delete_tree "$tree"; then
+      say "removed trees/$tree (composed by a run that did not finish)"
+    else
+      err "could not remove the unfinished trees/$tree"
+    fi
+  done < <(list_entries "$trees_dir" d "$TREE_NAME_PATTERN")
+}
+
+# Deletes the trees beyond the count bound. The name of the tree this run
+# is about to compose is passed in during a dry run, where it is not on
+# disk yet but does shift the newest-N window.
+#
+# Prints the trees that survive, so snapshot retention knows what is still
+# referenced.
+surviving_trees=()
+run_tree_retention() {
   local pending=${1:-}
+  local -a names=()
+  local tree served failures=0 total unprotected index
+
+  while IFS= read -r tree; do
+    names+=("$tree")
+  done < <(list_entries "$trees_dir" d "$TREE_NAME_PATTERN")
+  if [ -n "$pending" ]; then
+    names+=("$pending")
+  fi
+
+  served=$(current_tree)
+  if [ -n "$pending" ]; then
+    served=$pending
+  fi
+
+  total=${#names[@]}
+  unprotected=0
+  if [ "$total" -gt "$registry_snapshot_keep_trees" ]; then
+    unprotected=$((total - registry_snapshot_keep_trees))
+  fi
+
+  surviving_trees=()
+  for ((index = 0; index < total; index++)); do
+    tree=${names[index]}
+    if [ "$index" -ge "$unprotected" ]; then
+      surviving_trees+=("$tree")
+      continue
+    fi
+    if [ "$tree" = "$served" ]; then
+      err "keeping trees/$tree although the count bound has let it go: it is the tree being served"
+      surviving_trees+=("$tree")
+      continue
+    fi
+    if [ "$dry_run" = true ]; then
+      say "would delete trees/$tree"
+      continue
+    fi
+    if delete_tree "$tree"; then
+      say "deleted trees/$tree"
+    else
+      err "could not delete trees/$tree"
+      surviving_trees+=("$tree")
+      failures=$((failures + 1))
+    fi
+  done
+
+  [ "$failures" -eq 0 ]
+}
+
+# Every snapshot a surviving tree was composed from, as "<source>/<name>".
+# Those are never deleted: a served or kept tree has to stay explainable,
+# and the mirror chain of a source is the same chain these names come
+# from.
+declare -A protected_snapshot=()
+collect_protected_snapshots() {
+  local pending=${1:-}
+  local tree manifest name snapshot
+  for tree in ${surviving_trees[@]+"${surviving_trees[@]}"}; do
+    if [ -n "$pending" ] && [ "$tree" = "$pending" ]; then
+      for name in ${sources[@]+"${sources[@]}"}; do
+        protected_snapshot["$name/${planned_snapshot["$name"]}"]=yes
+      done
+      continue
+    fi
+    manifest=$(manifest_path "$tree")
+    [ -f "$manifest" ] || continue
+    while read -r name snapshot; do
+      [ -n "$name" ] || continue
+      protected_snapshot["$name/$snapshot"]=yes
+    done < <(read_manifest "$manifest")
+  done
+}
+
+# Deletes the snapshots of one source that neither retention bound covers
+# and no surviving tree was composed from.
+run_snapshot_retention_for() {
+  local source=$1 pending=${2:-}
   local -a names=() unexpected=()
-  local name
+  local name total unprotected now cutoff failures=0 deleted=0 index epoch
 
   while IFS= read -r name; do
     if [[ $name =~ $SNAPSHOT_NAME_PATTERN ]]; then
@@ -314,65 +744,115 @@ run_retention() {
     else
       unexpected+=("$name")
     fi
-  done < <(find "$snapshots_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+  done < <(find "$snapshots_dir/$source" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null |
+    LC_ALL=C sort)
 
   if [ ${#unexpected[@]} -gt 0 ]; then
-    err "leaving ${#unexpected[@]} entries in $snapshots_dir alone, they are not named like a snapshot: ${unexpected[*]}"
+    err "leaving ${#unexpected[@]} entries in $snapshots_dir/$source alone, they are not named like a snapshot: ${unexpected[*]}"
   fi
   if [ -n "$pending" ]; then
     names+=("$pending")
   fi
 
-  local total=${#names[@]}
-  local unprotected=0
+  total=${#names[@]}
+  unprotected=0
   if [ "$total" -gt "$registry_snapshot_keep_count" ]; then
     unprotected=$((total - registry_snapshot_keep_count))
   fi
 
-  local now cutoff
   now=$(date -u +%s)
   cutoff=$((now - registry_snapshot_keep_days * SECONDS_PER_DAY))
 
-  local served=
-  if [ -L "$current_link" ]; then
-    served=$(basename "$(readlink "$current_link")")
-  fi
-
-  local failures=0 deleted=0 index epoch
   for ((index = 0; index < unprotected; index++)); do
     name=${names[index]}
     if ! epoch=$(snapshot_epoch "$name" 2>/dev/null); then
-      err "keeping $name: its name carries no readable timestamp"
+      err "keeping $source/$name: its name carries no readable timestamp"
       continue
     fi
     if [ "$epoch" -ge "$cutoff" ]; then
       continue
     fi
-    if [ "$name" = "$served" ]; then
-      err "keeping $name although both retention bounds have let it go: it is the snapshot being served"
+    if [ -n "${protected_snapshot["$source/$name"]:-}" ]; then
+      err "keeping snapshots/$source/$name although both retention bounds have let it go: a tree that is kept was composed from it"
       continue
     fi
     if [ "$dry_run" = true ]; then
-      say "would delete snapshots/$name"
+      say "would delete snapshots/$source/$name"
       deleted=$((deleted + 1))
       continue
     fi
-    if btrfs subvolume delete "$snapshots_dir/$name" >/dev/null; then
-      say "deleted snapshots/$name"
+    if btrfs subvolume delete "$snapshots_dir/$source/$name" >/dev/null; then
+      say "deleted snapshots/$source/$name"
       deleted=$((deleted + 1))
     else
-      err "could not delete snapshots/$name"
+      err "could not delete snapshots/$source/$name"
       failures=$((failures + 1))
     fi
   done
 
-  local remaining=$((total - deleted))
-  if [ "$remaining" -eq 1 ]; then
-    say "kept 1 snapshot"
-  else
-    say "kept $remaining snapshots"
-  fi
+  say "$source: kept $((total - deleted)) snapshot(s)"
   [ "$failures" -eq 0 ]
+}
+
+# Retention over the whole registry: the trees first, because a tree that
+# goes releases the snapshots it was holding on to.
+run_retention() {
+  local pending_tree=${1:-}
+  local failures=0 source
+
+  if ! run_tree_retention "$pending_tree"; then
+    failures=$((failures + 1))
+  fi
+  collect_protected_snapshots "$pending_tree"
+
+  while IFS= read -r source; do
+    [ -n "$source" ] || continue
+    # A source's snapshot area is a plain directory holding subvolumes. A
+    # subvolume directly in the snapshot area is not one — a snapshot of
+    # something else, left there by hand or by an older layout — and
+    # neither its retention nor its deletion is this command's business.
+    if is_subvolume "$snapshots_dir/$source"; then
+      err "leaving $snapshots_dir/$source alone: it is a subvolume, not a source's snapshot area"
+      continue
+    fi
+    local pending=
+    if [ -n "$pending_tree" ] && [ "${source_changed["$source"]:-false}" = true ]; then
+      pending=${planned_snapshot["$source"]}
+    fi
+    if ! run_snapshot_retention_for "$source" "$pending"; then
+      failures=$((failures + 1))
+    fi
+  done < <(find "$snapshots_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null |
+    LC_ALL=C sort)
+
+  [ "$failures" -eq 0 ]
+}
+
+# ------------------------------------------------------------------ main
+
+# A timestamp no tree and no snapshot of a source about to be snapshotted
+# is using yet. Two runs in the same second are the only way to collide,
+# so waiting a second is enough.
+pick_stamp() {
+  local stamp taken name
+  for _ in 1 2 3; do
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    taken=false
+    if [ -e "$trees_dir/$TREE_PREFIX$stamp" ]; then
+      taken=true
+    fi
+    for name in ${sources[@]+"${sources[@]}"}; do
+      if [ -e "$snapshots_dir/$name/$SNAPSHOT_PREFIX$stamp" ]; then
+        taken=true
+      fi
+    done
+    if [ "$taken" = false ]; then
+      printf '%s' "$stamp"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 main() {
@@ -382,36 +862,44 @@ main() {
   validate_config
   check_preconditions
 
-  local name
-  if ! name=$(pick_snapshot_name); then
-    die "$EXIT_SNAPSHOT" "a snapshot for the current second already exists in $snapshots_dir"
+  if [ "$dry_run" = false ]; then
+    take_lock
   fi
 
+  remove_incomplete_trees
+  plan_sources
+
+  if ! anything_to_publish; then
+    say "nothing changed — no snapshot taken, no tree composed"
+    if ! run_retention; then
+      exit "$EXIT_RETENTION"
+    fi
+    return 0
+  fi
+
+  local stamp tree
+  if ! stamp=$(pick_stamp); then
+    die "$EXIT_SNAPSHOT" "a tree or a snapshot for the current second already exists"
+  fi
+  tree=$TREE_PREFIX$stamp
+
+  create_snapshots "$stamp"
+
   if [ "$dry_run" = true ]; then
-    say "would create snapshots/$name"
-    say "would point current at snapshots/$name"
-    if ! run_retention "$name"; then
+    say "would compose trees/$tree"
+    say "would point current at trees/$tree"
+    if ! run_retention "$tree"; then
       exit "$EXIT_RETENTION"
     fi
     exit 0
   fi
 
-  take_lock
+  compose_tree "$tree"
 
-  if ! btrfs subvolume snapshot -r "$working_dir" "$snapshots_dir/$name" >/dev/null; then
-    die "$EXIT_SNAPSHOT" "could not snapshot $working_dir"
+  if ! flip_docroot "$tree"; then
+    die "$EXIT_FLIP" "could not point $current_link at trees/$tree"
   fi
-  # Force a transaction commit, so the new snapshot survives a crash and
-  # can be sent to a mirror without waiting for the next commit.
-  if ! btrfs filesystem sync "$registry_root" >/dev/null; then
-    die "$EXIT_SNAPSHOT" "could not commit the new snapshot to disk"
-  fi
-  say "created snapshots/$name"
-
-  if ! flip_docroot "$name"; then
-    die "$EXIT_FLIP" "could not point $current_link at snapshots/$name"
-  fi
-  say "current -> snapshots/$name"
+  say "current -> trees/$tree"
 
   if ! run_retention; then
     exit "$EXIT_RETENTION"

@@ -17,15 +17,17 @@ against the checksum the build published beside them, records them in the
 source, verifies the result with the reference verifier, and only then
 takes a snapshot and switches the served tree onto it.
 
-One run covers every source at once. A release set that spans several
-sources — an SDK, its build tools, its workspace — becomes one snapshot
-and one flip, because a client that pins a version has to find every part
-of it at the same moment.
+One run covers every source at once. Each source is snapshotted on its
+own and only if its content changed, but the served tree is composed once
+per run out of one snapshot per source: a release set that spans several
+sources — an SDK, its build tools, its workspace — becomes one tree and
+one flip, because a client that pins a version has to find every part of
+it at the same moment.
 
 The command is idempotent. A version already recorded is never recorded
 again (and the tool would refuse: a published version is immutable), a
 tree file that already has the right content is not rewritten, and a run
-that changed nothing takes no snapshot and generates no dumps.
+that changed nothing composes no tree and generates no dumps.
 
 ## Who runs what
 
@@ -35,7 +37,7 @@ that changed nothing takes no snapshot and generates no dumps.
 | record and sign | the publishing account | it is the only identity that can read the publisher key |
 | pages, extra files, `sources.json` | the publishing account | it owns the working tree |
 | verify | the publishing account | reading |
-| snapshot and docroot switch | root | creating a read-only btrfs snapshot needs `CAP_SYS_ADMIN` |
+| snapshots, the composed tree and the docroot switch | root | creating read-only btrfs snapshots needs `CAP_SYS_ADMIN` |
 | mirror dumps | root | `btrfs send` needs it too |
 
 The unit starts as root and the command drops out of it for everything
@@ -113,12 +115,16 @@ rather read it in the journal.
 
 ## A source that is not there yet
 
-A source directory that does not exist is reported and skipped, not an
-error. Laying a source down needs the offline root keys, which are
-deliberately not on this machine, so an empty working tree is a state the
-command has to survive rather than fix. Everything else — the pages, the
-extra tree files, `sources.json` — is installed all the same, so a
-registry that has no sources yet still serves a landing page.
+A source that has not been laid down is reported and skipped, not an
+error. Its directory exists from the moment the storage was set up —
+every source is a btrfs subvolume of its own and those are created there,
+not here — so what decides the question is whether the two documents a
+source is made of, `keys.json` and `index.json`, are in it. Writing them
+needs the offline root keys, which are deliberately not on this machine,
+so an empty source is a state the command has to survive rather than fix.
+Everything else — the pages, the extra tree files, `sources.json` — is
+installed all the same, so a registry that has no sources yet still
+serves a landing page.
 
 ## Settings
 
@@ -139,10 +145,11 @@ it against the one their tool already has.
 ## Ordering
 
 Run this after `registry_storage`, `registry_snapshot` and `mirror_sync`.
-It calls the last two, and it is what gives the working tree to the
-publishing account — `registry_storage` deliberately leaves that
-directory's ownership alone, because the account is created here and
-cannot exist when the storage is first laid down.
+It calls the last two, and it is what gives the working tree and every
+source subvolume in it to the publishing account — `registry_storage`
+deliberately leaves those directories' ownership alone, because the
+account is created here and cannot exist when the storage is first laid
+down.
 
 ## The clock
 

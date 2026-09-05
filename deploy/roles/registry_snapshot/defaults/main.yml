@@ -12,11 +12,20 @@
 # linter's role-prefix rule.
 registry_root: /srv/registry  # noqa: var-naming[no-role-prefix]
 
-# Retention. A snapshot is deleted only when both bounds have let go of
-# it: it is not among the newest registry_snapshot_keep_count, and it is
-# older than registry_snapshot_keep_days days.
+# Retention of the per-source snapshots. A snapshot is deleted only when
+# both bounds have let go of it: it is not among the newest
+# registry_snapshot_keep_count of its own source, and it is older than
+# registry_snapshot_keep_days days. A snapshot a surviving composed tree
+# was built from is kept whatever the bounds say.
 registry_snapshot_keep_count: 10
 registry_snapshot_keep_days: 7
+
+# Retention of the composed trees — the served compositions, one per
+# publish. Only a count, because a tree is a set of snapshot copies and
+# costs almost nothing while the snapshots it points at exist anyway; and
+# because it is the trees that decide how far back the served tree can be
+# rolled by hand. The tree the docroot points at is never deleted.
+registry_snapshot_keep_trees: 10
 
 # Where the role puts the script and its settings file.
 registry_snapshot_script_path: /usr/local/sbin/packagetool-snapshot

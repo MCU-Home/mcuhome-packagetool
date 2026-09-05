@@ -18,11 +18,12 @@
     that:
       - registry_snapshot_keep_count | int >= 1
       - registry_snapshot_keep_days | int >= 0
+      - registry_snapshot_keep_trees | int >= 1
       - registry_root | default('', true) is match('^/.+')
     fail_msg: >-
-      registry_snapshot_keep_count must be at least 1,
-      registry_snapshot_keep_days at least 0, and registry_root must be
-      an absolute path.
+      registry_snapshot_keep_count and registry_snapshot_keep_trees must
+      be at least 1, registry_snapshot_keep_days at least 0, and
+      registry_root must be an absolute path.
     quiet: true
 
 - name: Create the settings directory

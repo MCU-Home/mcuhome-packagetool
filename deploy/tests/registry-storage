@@ -182,6 +182,11 @@ cat >"$work/play.yml" <<'EOF'
     # The test host already has btrfs-progs — that is a prerequisite of
     # the test — and installing packages is not what is under test here.
     registry_storage_packages: []
+    # Two sources, so that the per-source subvolumes the layout is built
+    # around are really created and not just defaulted away.
+    registry_storage_sources:
+      - alpha
+      - beta
   roles:
     - role: registry_storage
 EOF
@@ -359,11 +364,18 @@ same "a btrfs filesystem was created" "$(probe_type "$device")" btrfs
 same "it carries the configured label" "$(blkid -o value -s LABEL "$device")" registry
 same "the registry subvolume is what is mounted" \
   "$(findmnt --noheadings --output OPTIONS --mountpoint "$root" | grep -c 'subvol=/@registry')" 1
-for entry in working snapshots mirror-sync placeholder; do
+for entry in working snapshots trees mirror-sync placeholder; do
   same "the tree has $entry" "$([ -d "$root/$entry" ] && echo yes || echo no)" yes
 done
 same "working is a subvolume" \
   "$(btrfs subvolume show "$root/working" >/dev/null 2>&1 && echo yes || echo no)" yes
+for entry in alpha beta; do
+  same "the source $entry is a subvolume of its own" \
+    "$(btrfs subvolume show "$root/working/$entry" >/dev/null 2>&1 && echo yes || echo no)" yes
+done
+same "and nothing else was laid down beside them" \
+  "$(find "$root/working" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')" \
+  "alpha beta "
 same "the docroot points at the placeholder" "$(readlink "$root/current")" placeholder
 empty_uuid="$(fs_uuid "$device")"
 contains "the fstab entry names the filesystem by UUID" "$fstab" "UUID=$empty_uuid"

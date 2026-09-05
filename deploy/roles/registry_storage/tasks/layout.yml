@@ -3,23 +3,32 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The tree inside the registry subvolume. Its shape is fixed, because the
-# web server, the rsync export, the publish pipeline and the mirror
-# export all have to agree on it:
+# web server, the rsync export, the publish pipeline and the mirror export
+# all have to agree on it:
 #
-#   working/       the working tree, a subvolume of its own, never served
-#   snapshots/     the read-only snapshots, one per publish
-#   mirror-sync/   dumps for official mirrors, filled by the mirror export
-#   placeholder/   an empty directory, only ever the docroot before the
-#                  first publish
-#   current        symlink to the directory that is served
+#   working/            what is being prepared, never served
+#   working/<source>    one btrfs subvolume per source
+#   snapshots/<source>/ the read-only snapshots of one source
+#   trees/              the served compositions, one per publish: one
+#                       snapshot copy per source, plus the files above
+#                       the sources
+#   mirror-sync/        dumps for official mirrors, per source, filled by
+#                       the mirror export
+#   placeholder/        an empty directory, only ever the docroot before
+#                       the first publish
+#   current             symlink to the tree that is served
 #
 # One more directory appears beside these where a publish pipeline is
 # installed: staging/, where a fetched package waits until its checksum
 # has been checked. It is created by the role that installs the pipeline,
 # because it belongs to it and is worthless without it.
 #
-# "working" is a subvolume rather than a plain directory because a
-# snapshot can only be taken of a subvolume. "current" exists from the
+# Every source is a subvolume of its own because a snapshot can only be
+# taken of a subvolume, and sources move at their own pace: publishing an
+# SDK release should not make every other source's mirror re-transfer a
+# snapshot holding exactly what the last one held. "working" is a
+# subvolume as well, so that the boundary between what is being prepared
+# and the rest of the volume is a real one. "current" exists from the
 # start so the servers have a valid docroot before anything is published;
 # an existing one is never touched, because it is what a running registry
 # is being served from.
@@ -50,6 +59,7 @@
     mode: "0755"
   loop:
     - snapshots
+    - trees
     - mirror-sync
     - placeholder
 
@@ -66,6 +76,33 @@
     owner: "{{ registry_storage_working_owner | default(omit, true) }}"
     group: "{{ registry_storage_working_group | default(omit, true) }}"
     mode: "0755"
+
+# One per source, and only ever created: a subvolume that is here and not
+# in the list is a source somebody published, and deleting one is not a
+# configuration run's decision. An existing plain directory is left as it
+# is and reported by the publish and snapshot commands, which refuse to
+# work on a source they cannot snapshot — turning a directory that already
+# holds a published source into a subvolume means moving its contents, and
+# that is a migration rather than a step of a role that is run on every
+# change.
+- name: Create a subvolume for every source
+  ansible.builtin.command:
+    argv:
+      - btrfs
+      - subvolume
+      - create
+      - "{{ registry_root }}/working/{{ item }}"
+    creates: "{{ registry_root }}/working/{{ item }}"
+  loop: "{{ registry_storage_sources }}"
+
+- name: Set owner and permissions on the sources
+  ansible.builtin.file:
+    path: "{{ registry_root }}/working/{{ item }}"
+    state: directory
+    owner: "{{ registry_storage_working_owner | default(omit, true) }}"
+    group: "{{ registry_storage_working_group | default(omit, true) }}"
+    mode: "0755"
+  loop: "{{ registry_storage_sources }}"
 
 - name: Look at the docroot symlink
   ansible.builtin.stat:

@@ -6,26 +6,39 @@
 #
 # A registry is mirrorable with plain rsync by design, and that stays the
 # way anybody can mirror it. This is the other path: a mirror that runs
-# btrfs itself can take the tree over as snapshots instead of as files,
+# btrfs itself can take a source over as snapshots instead of as files,
 # which costs a fraction of the transfer and gives the mirror the same
 # snapshot history the origin has.
 #
-# One run produces, out of the snapshots that exist:
+# Everything here is per source. A source is a btrfs subvolume of its own
+# and has a snapshot chain of its own, so it also gets a dump chain of its
+# own — and a mirror that only wants one source follows one chain and
+# copies one directory, instead of taking the whole registry to get at a
+# tenth of it.
 #
-#   snapshot-<ts>.btrfs.dump   the difference between a snapshot and the
-#                              one before it (btrfs send -p)
-#   full-<ts>.btrfs.dump       the newest snapshot on its own, for a
-#                              mirror that has nothing yet; only the
-#                              newest one is kept
-#   index.json                 the chain: which dump leads from which
-#                              snapshot to which, and the hash of each
+# One run produces, for every source, out of the snapshots that exist:
 #
-# How a mirror uses it: HEAD index.json and watch ETag/Last-Modified. On
-# a change, GET it and look for the snapshot it already has. Found —
-# apply every dump after it, in order, with `btrfs receive`. Not found —
-# take the full dump and start again from there. Both paths are decided
-# from the index alone, so a mirror never has to guess and never has to
-# be told anything out of band.
+#   <source>/snapshot-<ts>.btrfs.dump  the difference between a snapshot
+#                                      of that source and the one before
+#                                      it (btrfs send -p)
+#   <source>/full-<ts>.btrfs.dump      the newest snapshot of that source
+#                                      on its own, for a mirror that has
+#                                      nothing yet; only the newest kept
+#   <source>/index.json                the chain: which dump leads from
+#                                      which snapshot to which, and the
+#                                      hash of each
+#
+# How a mirror uses it, per source: HEAD <source>/index.json and watch
+# ETag/Last-Modified. On a change, GET it and look for the snapshot it
+# already has. Found — apply every dump after it, in order, with
+# `btrfs receive`. Not found — take the full dump and start again from
+# there. Both paths are decided from that one index alone, so a mirror
+# never has to guess and never has to be told anything out of band.
+#
+# What the dumps do NOT carry: the few files that live above the sources —
+# the pages, the source catalogue, the trust anchor. They belong to the
+# composed tree rather than to any source, and a mirror gets them the way
+# every other client does, over rsync or HTTPS.
 #
 # Retention needs no bounds of its own, and deliberately has none. A dump
 # is worth keeping exactly as long as the snapshot it carries and the
@@ -36,15 +49,15 @@
 #
 # Everything is written to a temporary name and renamed into place, so a
 # mirror polling in the middle of a run gets the previous complete answer
-# rather than half of the next one — a dump named by the index is always
-# a dump that is finished.
+# rather than half of the next one — a dump named by an index is always a
+# dump that is finished.
 #
 # Exit codes:
 #   0  success
 #   1  usage error
 #   2  precondition not met: configuration, layout, or missing tools
 #   3  a dump could not be generated
-#   4  the chain index could not be written
+#   4  a chain index could not be written
 #   5  another run holds the lock
 #
 # Everything the run did goes to stdout, everything that went wrong or
@@ -63,6 +76,7 @@ readonly EXIT_LOCKED=5
 readonly DEFAULT_CONFIG_FILE=/etc/packagetool/mirror-sync.conf
 readonly SNAPSHOT_PREFIX=snapshot-
 readonly SNAPSHOT_NAME_PATTERN='^snapshot-[0-9]{8}T[0-9]{6}Z$'
+readonly SOURCE_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 readonly DUMP_SUFFIX=.btrfs.dump
 readonly INDEX_FILE=index.json
 
@@ -71,11 +85,12 @@ readonly INDEX_FILE=index.json
 readonly INDEX_VERSION=1
 
 readonly INDEX_NOTE="\
-The dumps this registry's snapshots can be followed with. Apply the \
-dumps after the snapshot you already have, in the order they are listed; \
-if you have none of them, take the full dump and continue from its \
-snapshot. Every dump is a btrfs send stream, and its sha256 is the hash \
-of the stream as served."
+The dumps this source's snapshots can be followed with. Apply the dumps \
+after the snapshot you already have, in the order they are listed; if you \
+have none of them, take the full dump and continue from its snapshot. \
+Every dump is a btrfs send stream, and its sha256 is the hash of the \
+stream as served. This chain covers one source; the files above the \
+sources are not part of any dump."
 
 # Settings, in the order they are applied: these built-in values, then
 # the configuration file, then the command line. The names are the ones
@@ -87,10 +102,16 @@ config_file_given=false
 dry_run=false
 quiet=false
 opt_root=
+selected_sources=()
 
+snapshots_root=
+dumps_root=
+lock_file=
+
+# The source being worked on, and where its snapshots and its dumps live.
+source_name=
 snapshots_dir=
 dumps_dir=
-lock_file=
 
 # Removed by the exit trap if a run was interrupted between writing a
 # temporary file and renaming it into place.
@@ -125,13 +146,14 @@ usage() {
   cat <<'EOF'
 Usage: packagetool-mirror-sync [OPTIONS]
 
-Generates the btrfs dumps official mirrors follow — one difference per
-snapshot, one full dump of the newest — and rewrites the chain index that
-says how they fit together.
+Generates the btrfs dumps official mirrors follow — per source, one
+difference per snapshot and one full dump of the newest — and rewrites
+each source's chain index.
 
 Options:
   --config PATH    settings file to read (default /etc/packagetool/mirror-sync.conf)
   --root PATH      registry root (default /srv/registry)
+  --source NAME    limit the run to this source; repeatable
   --dry-run        report what a run would do; changes nothing, takes no lock
   --quiet          report only problems
   --help           this text
@@ -155,6 +177,11 @@ parse_args() {
     --root)
       [ $# -ge 2 ] || die "$EXIT_USAGE" "--root needs a path"
       opt_root=$2
+      shift 2
+      ;;
+    --source)
+      [ $# -ge 2 ] || die "$EXIT_USAGE" "--source needs a source name"
+      selected_sources+=("$2")
       shift 2
       ;;
     --dry-run)
@@ -204,8 +231,15 @@ validate_config() {
     die "$EXIT_PRECONDITION" "the registry root must not be /"
   fi
 
-  snapshots_dir=$registry_root/snapshots
-  dumps_dir=$registry_root/mirror-sync
+  local name
+  for name in ${selected_sources[@]+"${selected_sources[@]}"}; do
+    if ! [[ $name =~ $SOURCE_NAME_PATTERN ]]; then
+      die "$EXIT_USAGE" "'$name' is not a source name"
+    fi
+  done
+
+  snapshots_root=$registry_root/snapshots
+  dumps_root=$registry_root/mirror-sync
   lock_file=$registry_root/.mirror-sync.lock
 }
 
@@ -219,12 +253,12 @@ check_preconditions() {
   if [ "$(id -u)" -ne 0 ]; then
     die "$EXIT_PRECONDITION" "this command has to run as root — btrfs send does"
   fi
-  if [ ! -d "$snapshots_dir" ]; then
+  if [ ! -d "$snapshots_root" ]; then
     die "$EXIT_PRECONDITION" \
-      "the snapshot area $snapshots_dir does not exist — set the registry storage up first"
+      "the snapshot area $snapshots_root does not exist — set the registry storage up first"
   fi
-  if [ ! -d "$dumps_dir" ]; then
-    die "$EXIT_PRECONDITION" "the dump area $dumps_dir does not exist"
+  if [ ! -d "$dumps_root" ]; then
+    die "$EXIT_PRECONDITION" "the dump area $dumps_root does not exist"
   fi
 }
 
@@ -235,8 +269,29 @@ take_lock() {
   fi
 }
 
-# The snapshots that exist, oldest first. The names carry an ISO 8601
-# basic timestamp, so plain text order is chronological order.
+# The sources that have a snapshot area, oldest naming order first.
+list_sources() {
+  local name
+  while IFS= read -r name; do
+    if ! [[ $name =~ $SOURCE_NAME_PATTERN ]]; then
+      err "leaving $snapshots_root/$name alone, it is not named like a source"
+      continue
+    fi
+    # A source's snapshot area is a plain directory holding subvolumes. A
+    # subvolume directly in the snapshot area is not one — a snapshot of
+    # something else, left there by hand or by an older layout — and
+    # dumping it is not what a mirror asked for.
+    if btrfs subvolume show "$snapshots_root/$name" >/dev/null 2>&1; then
+      err "leaving $snapshots_root/$name alone: it is a subvolume, not a source's snapshot area"
+      continue
+    fi
+    printf '%s\n' "$name"
+  done < <(find "$snapshots_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort)
+}
+
+# The snapshots of the source being worked on, oldest first. The names
+# carry an ISO 8601 basic timestamp, so plain text order is chronological
+# order.
 list_snapshots() {
   local name
   while IFS= read -r name; do
@@ -244,6 +299,20 @@ list_snapshots() {
       printf '%s\n' "$name"
     fi
   done < <(find "$snapshots_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+}
+
+# Whole-registry dumps from the layout this command used to write, left
+# beside the per-source directories. Nothing generates them any more and
+# no index names them; they are reported rather than deleted, because
+# deleting a gigabyte of somebody's file is not a decision this command
+# gets to make on its own.
+report_stray_dumps() {
+  local file
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    err "$dumps_root/$file is not part of any source's chain — dumps are per source now. Remove it once no mirror is following it."
+  done < <(find "$dumps_root" -mindepth 1 -maxdepth 1 -type f \
+    \( -name "*$DUMP_SUFFIX" -o -name "$INDEX_FILE" \) -printf '%f\n' | LC_ALL=C sort)
 }
 
 # The parent a dump was actually generated against, read from the index
@@ -316,35 +385,39 @@ remove_stale_tmp_files() {
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     if [ "$dry_run" = true ]; then
-      say "would remove stale $file (left behind by an interrupted run)"
+      say "  would remove stale $file (left behind by an interrupted run)"
     else
       rm -f -- "$dumps_dir/$file"
-      say "removed stale $file (left behind by an interrupted run)"
+      say "  removed stale $file (left behind by an interrupted run)"
     fi
   done < <(find "$dumps_dir" -mindepth 1 -maxdepth 1 -type f \
     -name '.*.tmp' -mmin "+$STALE_TMP_MINUTES" -printf '%f\n' | LC_ALL=C sort)
 }
 
-main() {
-  trap cleanup EXIT
-  parse_args "$@"
-  load_config
-  validate_config
-  check_preconditions
+# ------------------------------------------------------------ one source
 
+sync_source() {
   local -a snapshots=()
   local name
+
   while IFS= read -r name; do
     snapshots+=("$name")
   done < <(list_snapshots)
 
   if [ ${#snapshots[@]} -eq 0 ]; then
-    say "no snapshot to dump"
+    say "$source_name: no snapshot to dump"
     return 0
   fi
 
-  if [ "$dry_run" = false ]; then
-    take_lock
+  say "$source_name"
+
+  if [ "$dry_run" = false ] && [ ! -d "$dumps_dir" ]; then
+    mkdir -p "$dumps_dir"
+    chmod 0755 "$dumps_dir"
+  fi
+  if [ ! -d "$dumps_dir" ]; then
+    say "  would create $dumps_dir"
+    return 0
   fi
 
   remove_stale_tmp_files
@@ -368,15 +441,15 @@ main() {
       # adjacency, which a vanished snapshot in between would get wrong.
       entry_parent=$(previous_parent_for "$dump")
       if [ -z "$entry_parent" ]; then
-        err "$dump exists but the previous index names no parent for it, assuming $parent"
+        err "$source_name/$dump exists but the previous index names no parent for it, assuming $parent"
         entry_parent=$parent
       fi
     elif [ "$dry_run" = true ]; then
-      say "would send $child against $parent"
+      say "  would send $child against $parent"
     else
-      say "sending $child against $parent"
+      say "  sending $child against $parent"
       send_dump "$dump" -p "$snapshots_dir/$parent" "$snapshots_dir/$child" ||
-        die "$EXIT_DUMP" "could not send $child against $parent"
+        die "$EXIT_DUMP" "could not send $source_name/$child against $parent"
       # The parent this dump was just created against, captured here at
       # creation time rather than re-derived later from adjacency.
       entry_parent=$parent
@@ -391,11 +464,11 @@ main() {
   full_dump=full-$stamp$DUMP_SUFFIX
   if [ ! -f "$dumps_dir/$full_dump" ]; then
     if [ "$dry_run" = true ]; then
-      say "would send $newest in full"
+      say "  would send $newest in full"
     else
-      say "sending $newest in full"
+      say "  sending $newest in full"
       send_dump "$full_dump" "$snapshots_dir/$newest" ||
-        die "$EXIT_DUMP" "could not send $newest in full"
+        die "$EXIT_DUMP" "could not send $source_name/$newest in full"
     fi
   fi
 
@@ -403,16 +476,16 @@ main() {
   # A dump's parent is now immutable (captured above, never recomputed),
   # so it can only ever describe the truth. What can still go stale is
   # which snapshot that truth points at: if a middle snapshot disappeared
-  # (retention "continue" on one still served or one whose delete failed,
-  # or a manual removal), a surviving dump's real parent is simply not
-  # there for a mirror to already have, and the entry no longer connects
-  # to anything this index can vouch for. Walk the chain oldest first and
-  # cut at the first parent nothing accounts for — the preceding entry's
-  # own snapshot, or, for the very first entry, the oldest snapshot this
-  # run still finds on disk. Everything after the cut necessarily hangs
-  # off the same gap, so it goes too. The newest snapshot stays reachable
-  # regardless: the full dump covers it on its own, independent of any
-  # chain entry.
+  # (retention "continue" on one that is still referenced, or one whose
+  # delete failed, or a manual removal), a surviving dump's real parent is
+  # simply not there for a mirror to already have, and the entry no longer
+  # connects to anything this index can vouch for. Walk the chain oldest
+  # first and cut at the first parent nothing accounts for — the preceding
+  # entry's own snapshot, or, for the very first entry, the oldest
+  # snapshot this run still finds on disk. Everything after the cut
+  # necessarily hangs off the same gap, so it goes too. The newest
+  # snapshot stays reachable regardless: the full dump covers it on its
+  # own, independent of any chain entry.
   if [ "$dry_run" = false ] && [ ${#chain[@]} -gt 0 ]; then
     local -a contiguous_chain=()
     local expected=${snapshots[0]} broken=false centry cchild cparent cfile
@@ -423,7 +496,7 @@ main() {
         expected=$cchild
       else
         broken=true
-        err "dropping $cfile from the chain: its recorded parent $cparent is not $expected — a snapshot in between is gone"
+        err "dropping $source_name/$cfile from the chain: its recorded parent $cparent is not $expected — a snapshot in between is gone"
       fi
     done
     chain=(${contiguous_chain[@]+"${contiguous_chain[@]}"})
@@ -457,7 +530,7 @@ main() {
       done
       ;;
     *)
-      err "leaving $file alone, it is not a dump this command wrote"
+      err "leaving $source_name/$file alone, it is not a dump this command wrote"
       continue
       ;;
     esac
@@ -469,9 +542,9 @@ main() {
 
   if [ "$dry_run" = true ]; then
     for file in ${obsolete[@]+"${obsolete[@]}"}; do
-      say "would remove $file"
+      say "  would remove $file"
     done
-    say "would rewrite $dumps_dir/$INDEX_FILE"
+    say "  would rewrite $dumps_dir/$INDEX_FILE"
     return 0
   fi
 
@@ -485,7 +558,7 @@ main() {
       --arg snapshot "$child" --arg parent "$parent" --arg file "$dump" \
       --arg sha256 "$digest" --argjson size "$size" \
       '. + [{snapshot: $snapshot, parent: $parent, file: $file, sha256: $sha256, size: $size}]' \
-      <<<"$entries") || die "$EXIT_INDEX" "could not build the chain entry for $dump"
+      <<<"$entries") || die "$EXIT_INDEX" "could not build the chain entry for $source_name/$dump"
   done
 
   size=$(stat -c%s "$dumps_dir/$full_dump")
@@ -496,6 +569,7 @@ main() {
     --argjson version "$INDEX_VERSION" \
     --arg note "$INDEX_NOTE" \
     --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg source "$source_name" \
     --arg snapshot "$newest" --arg file "$full_dump" \
     --arg sha256 "$digest" --argjson size "$size" \
     --argjson chain "$entries" \
@@ -503,14 +577,15 @@ main() {
        version: $version,
        note: $note,
        generated: $generated,
+       source: $source,
        full: {snapshot: $snapshot, parent: null, file: $file, sha256: $sha256, size: $size},
        chain: $chain
-     }' >"$tmp_file" || die "$EXIT_INDEX" "could not write the chain index"
+     }' >"$tmp_file" || die "$EXIT_INDEX" "could not write the chain index of $source_name"
   chmod 0644 "$tmp_file"
   # A rename, so a mirror polling right now reads the previous index or
   # this one and never a torn file.
   mv -f -- "$tmp_file" "$dumps_dir/$INDEX_FILE" ||
-    die "$EXIT_INDEX" "could not put the chain index in place"
+    die "$EXIT_INDEX" "could not put the chain index of $source_name in place"
   tmp_file=
 
   # Only now, with the new index in place, can a file the old index
@@ -518,11 +593,61 @@ main() {
   # every dump either index promised.
   for file in ${obsolete[@]+"${obsolete[@]}"}; do
     rm -f -- "$dumps_dir/$file"
-    say "removed $file"
+    say "  removed $file"
   done
 
   local count=${#chain[@]}
-  say "chain index: 1 full dump of $newest, $count difference(s)"
+  say "  chain index: 1 full dump of $newest, $count difference(s)"
+}
+
+# ------------------------------------------------------------------ main
+
+main() {
+  trap cleanup EXIT
+  parse_args "$@"
+  load_config
+  validate_config
+  check_preconditions
+
+  local -a wanted_sources=()
+  local name
+  while IFS= read -r name; do
+    if [ ${#selected_sources[@]} -gt 0 ]; then
+      local keep=false chosen
+      for chosen in "${selected_sources[@]}"; do
+        if [ "$chosen" = "$name" ]; then
+          keep=true
+        fi
+      done
+      [ "$keep" = true ] || continue
+    fi
+    wanted_sources+=("$name")
+  done < <(list_sources)
+
+  for name in ${selected_sources[@]+"${selected_sources[@]}"}; do
+    if [ ! -d "$snapshots_root/$name" ]; then
+      die "$EXIT_USAGE" "$snapshots_root/$name does not exist — $name is not a source of this registry"
+    fi
+  done
+
+  if [ ${#wanted_sources[@]} -eq 0 ]; then
+    report_stray_dumps
+    say "no source to dump"
+    return 0
+  fi
+
+  if [ "$dry_run" = false ]; then
+    take_lock
+  fi
+
+  report_stray_dumps
+
+  for name in "${wanted_sources[@]}"; do
+    source_name=$name
+    snapshots_dir=$snapshots_root/$name
+    dumps_dir=$dumps_root/$name
+    sync_source
+  done
 }
 
 main "$@"

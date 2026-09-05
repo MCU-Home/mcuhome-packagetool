@@ -178,6 +178,31 @@
     mode: "0755"
   when: registry_publish_working.stat.exists
 
+# Every source is a subvolume of its own, created by the storage role as
+# root because creating one needs root. The account that publishes has to
+# own each of them, or it cannot write a document into a source. Not
+# recursive on purpose: what is inside a source was written by that
+# account already, and walking half a gigabyte of packages on every
+# configuration run to confirm it would cost more than it proves.
+- name: Look for the sources in the working tree
+  ansible.builtin.find:
+    paths: "{{ registry_root }}/working"
+    file_type: directory
+    recurse: false
+  register: registry_publish_sources
+  when: registry_publish_working.stat.exists
+
+- name: Give every source to the publishing account
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ registry_publish_user }}"
+    group: "{{ registry_publish_group }}"
+    mode: "0755"
+  loop: "{{ registry_publish_sources.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
 # Where a fetched asset lands before its checksum has been checked.
 # Beside the working tree rather than inside it, so nothing half fetched
 # can end up in a snapshot, and on the same filesystem, so putting a

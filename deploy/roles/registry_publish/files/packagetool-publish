@@ -13,10 +13,13 @@
 # here, verifies the result with the reference verifier, and only then
 # takes a snapshot and switches the served tree onto it.
 #
-# One run does all sources at once. A release set that spans several
-# sources — an SDK, its build tools and its workspace — becomes one
-# snapshot and one flip, because a client that pins a version has to find
-# every part of it at the same moment.
+# One run does all sources at once. Each source is a btrfs subvolume of
+# its own and is snapshotted on its own, but the served tree is composed
+# once per run out of one snapshot per source: a release set that spans
+# several sources — an SDK, its build tools and its workspace — becomes
+# one tree and one flip, because a client that pins a version has to find
+# every part of it at the same moment. Sources nothing touched keep the
+# snapshot they already had; only the ones that changed get a new one.
 #
 # The same run with --refresh renews the signed documents instead of
 # looking for new releases. Expiry is what bounds a freeze: a mirror
@@ -39,9 +42,16 @@
 # The split is the point. Everything that touches the network, the
 # downloaded bytes and the publisher key runs as an unprivileged account
 # that owns nothing but the working tree and the keys; only the two steps
-# that genuinely need CAP_SYS_ADMIN — creating a read-only btrfs
-# snapshot, and sending it — run as root, and neither of them can be
-# reached with anything a download influenced.
+# that genuinely need CAP_SYS_ADMIN — creating read-only btrfs snapshots
+# and composing the served tree out of them, and sending them — run as
+# root, and neither of them can be reached with anything a download
+# influenced.
+#
+# The files that are not part of any source — the pages, the trust anchor,
+# the generated source catalogue — are assembled into the working tree
+# above the sources, and the snapshot command copies them into the tree it
+# composes. They are the one part of the served tree that is not inside a
+# source.
 #
 # Idempotent by construction. A version already recorded in a source is
 # never recorded again (and the tool would refuse: a published version is
@@ -407,6 +417,17 @@ source_field() {
     "$registry_publish_publishing_config"
 }
 
+# Whether a source has been laid down. Its directory exists from the
+# moment the storage was set up — every source is a btrfs subvolume of its
+# own and those are created there, not here — so the directory being there
+# says nothing. What says it is the two documents a source is made of.
+# Writing them needs the offline root keys, which are deliberately not on
+# this machine, so an empty source directory is a state this command has
+# to survive rather than fix.
+source_is_laid_down() {
+  [ -f "$1/keys.json" ] && [ -f "$1/index.json" ]
+}
+
 # Whether a source knows this package version already: the index head
 # first, then every part it names. A part is a file whose name carries
 # the hash of its own content, so reading it here is reading exactly what
@@ -679,7 +700,7 @@ publish_source() {
     '(.sources[$s].packages // [])[] | "\(.name)\t\(.asset)"' \
     "$registry_publish_publishing_config")
 
-  if [ ! -d "$source_dir" ]; then
+  if ! source_is_laid_down "$source_dir"; then
     if [ "$pending_count" -gt 0 ]; then
       err "  $source_dir is not laid down yet — $pending_count release asset(s) wait for it. A source is created with the offline root keys, which are deliberately not on this machine."
     else
@@ -742,7 +763,7 @@ refresh_sources() {
   local -a existing=()
   local name
   while IFS= read -r name; do
-    if [ -d "$working_dir/$name" ]; then
+    if source_is_laid_down "$working_dir/$name"; then
       existing+=("$working_dir/$name")
     else
       say "$name: not laid down yet — skipped"
@@ -822,7 +843,7 @@ assemble_tree() {
 verify_tree() {
   local name checked=0
   while IFS= read -r name; do
-    [ -d "$working_dir/$name" ] || continue
+    source_is_laid_down "$working_dir/$name" || continue
     as_publisher "$registry_publish_python" "$verifier" "$working_dir/$name" \
       --anchor "$registry_publish_anchor" ||
       die "$EXIT_VERIFY" "$name does not verify against $registry_publish_anchor"
@@ -847,7 +868,9 @@ report_status() {
   local -a existing=()
   local name
   while IFS= read -r name; do
-    [ -d "$working_dir/$name" ] && existing+=("$working_dir/$name")
+    if source_is_laid_down "$working_dir/$name"; then
+      existing+=("$working_dir/$name")
+    fi
   done < <(source_names)
   [ ${#existing[@]} -gt 0 ] || return 0
 

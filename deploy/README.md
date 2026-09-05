@@ -34,11 +34,20 @@ Everything below assumes one directory, the registry root, with a fixed
 shape inside it:
 
 ```
-<root>/working        the working tree, a btrfs subvolume, never served
-<root>/snapshots/     read-only snapshots, one per publish
-<root>/mirror-sync/   dumps for official mirrors
-<root>/placeholder/   empty; the docroot before the first publish
-<root>/current        symlink to the tree that is served
+<root>/working/           what is being prepared, never served
+<root>/working/<source>   one btrfs subvolume per source
+<root>/working/<file>     the files above the sources: the pages, the
+                          source catalogue, the trust anchor
+<root>/snapshots/<source>/snapshot-<ts>
+                          the read-only snapshots of one source
+<root>/trees/tree-<ts>/   a served composition: one snapshot copy per
+                          source, plus the files above them
+<root>/trees/tree-<ts>.sources
+                          which snapshot of which source that tree holds
+<root>/mirror-sync/<source>/
+                          the dumps official mirrors of that source follow
+<root>/placeholder/       empty; the docroot before the first publish
+<root>/current            symlink to the tree that is served
 ```
 
 Only the root is configurable. The names inside it are not, because the
@@ -48,29 +57,53 @@ but a registry that serves the wrong thing.
 
 ## Publishing by snapshot
 
-A publish edits `working`, which nothing serves. When the tree is
-complete, `packagetool-snapshot` takes a read-only btrfs snapshot of it
-and replaces the `current` symlink with one pointing at that snapshot.
-Replacing a symlink is a rename, and a rename is atomic: a client either
-gets the old tree or the new one, never a tree that is half published.
-Because snapshots share their data with the working tree, keeping the
-last few dozen publishes costs almost nothing.
+A source is a btrfs subvolume of its own, and sources move at their own
+pace: an SDK release should not make every mirror of the build workspace
+transfer a snapshot holding exactly what the last one held. So a publish
+snapshots the sources whose content changed, one snapshot each, and
+leaves the others on the snapshot they already had.
 
-Old snapshots are deleted only when both retention bounds have let go of
-them — not among the newest N, and older than D days — and the snapshot
-the docroot points at is never deleted.
+What is served is a *composition* of those snapshots. `packagetool-
+snapshot` creates `trees/tree-<timestamp>` and puts a read-only btrfs
+snapshot of each source's newest snapshot into it, plus the few files
+that live above the sources, makes the whole thing read-only, and
+replaces the `current` symlink with one pointing at it. Replacing a
+symlink is a rename, and a rename is atomic: a client either gets the old
+tree or the new one, never a tree that is half published. A release set
+that spans several sources is therefore still one flip — which it has to
+be, because a client that pins a version has to find every part of it at
+the same moment.
+
+The composition holds copies rather than links. A registry is mirrored
+with plain rsync and served by a file server, and neither follows a
+symlink that leaves the tree: an rsync daemon chroots into the docroot,
+where such a link points at nothing at all. A btrfs snapshot of a
+snapshot costs almost nothing, shares every extent, and is a directory of
+real files however it is read.
+
+The manifest beside a tree — `trees/tree-<ts>.sources`, one
+`<source> <snapshot>` line each — is what says where a tree came from. It
+is written last, after the tree is complete, so a tree without one is the
+leftover of a run that was interrupted, and the next run removes it.
+
+Retention has two halves. A source's snapshot is deleted only when both
+bounds have let go of it — not among the newest N of that source, and
+older than D days — and never while a tree that is still kept was
+composed from it. A tree is deleted when it falls out of the newest N
+trees. The tree the docroot points at is never deleted, and neither is a
+snapshot that tree holds.
 
 ## Roles
 
 | Role | What it does |
 |---|---|
-| `registry_storage` | btrfs filesystem on a dedicated device, the registry subvolume, the mount, and the tree inside it. |
-| `registry_snapshot` | installs `packagetool-snapshot`: snapshot, docroot switch, retention. |
+| `registry_storage` | btrfs filesystem on a dedicated device, the registry subvolume, the mount, the tree inside it, and one subvolume per source. |
+| `registry_snapshot` | installs `packagetool-snapshot`: per-source snapshots, the composed tree, the docroot switch, retention. |
 | `registry_web` | nginx, in a container, serving the tree on the loopback address: the full tree, the bootstrap subset, the mirror dumps. |
 | `registry_proxy` | Caddy, in a container: TLS, the host names, credentials where they are needed. |
 | `registry_rsync` | the anonymous read-only rsync export, native and started per connection. |
 | `registry_publish` | the publish pipeline: the tool in its own virtual environment, the account that signs, one command from "a release exists upstream" to "the mirror serves it", and the units that run it. |
-| `mirror_sync` | installs `packagetool-mirror-sync`: the btrfs dumps an official mirror follows, and the chain index that says how they fit together. |
+| `mirror_sync` | installs `packagetool-mirror-sync`: the btrfs dumps an official mirror follows, one chain per source, and the chain index that says how they fit together. |
 
 Each role has a README of its own next to it.
 
@@ -83,6 +116,7 @@ A playbook using all of them:
   vars:
     registry_root: /srv/registry
     registry_storage_device: /dev/disk/by-id/...
+    registry_storage_sources: ["sdk", "tools"]
     registry_rsync_listen_addresses: ["203.0.113.10", "2001:db8::10"]
     registry_proxy_sites:
       - name: mirror.example.org
@@ -102,11 +136,17 @@ A playbook using all of them:
 ```
 
 `registry_publish` comes last of the registry roles: it calls the
-snapshot and the dump commands, and it is what gives the working tree to
-the account that signs. `registry_storage` deliberately leaves that one
-directory's ownership alone, because the account is created by
-`registry_publish` and cannot exist the first time the storage is laid
-down.
+snapshot and the dump commands, and it is what gives the working tree and
+every source in it to the account that signs. `registry_storage`
+deliberately leaves those directories' ownership alone, because the
+account is created by `registry_publish` and cannot exist the first time
+the storage is laid down.
+
+`registry_storage_sources` is the list of sources, and it has to name the
+same ones the publishing configuration declares. The role only ever
+creates a subvolume: a source that is in the tree and not in the list is
+one somebody published, and deleting it is not a configuration run's
+decision.
 
 ## Publishing
 
@@ -185,10 +225,19 @@ to look at.
 
 ## Tests
 
-`tests/registry-snapshot` exercises the snapshot, the docroot switch and
-the retention bounds against a real btrfs filesystem in a loopback image,
-created and thrown away by the test itself. It needs root, `btrfs-progs`
-and loop devices, and exits 77 when it cannot have them.
+`tests/registry-snapshot` exercises the per-source snapshots, the
+composed tree, the docroot switch and the retention bounds against a real
+btrfs filesystem in a loopback image, created and thrown away by the test
+itself. It needs root, `btrfs-progs` and loop devices, and exits 77 when
+it cannot have them.
+
+`tests/mirror-sync` does the same for the dumps, against two loopback
+filesystems: one standing in for the registry, one for a mirror that
+follows a single source and really applies the dumps with `btrfs
+receive`.
+
+`tests/registry-publish` runs whole publish cycles against a real
+filesystem and a stand-in forge.
 
 `tests/registry-storage` runs the storage role itself, against loopback
 devices carrying the things it has to refuse: an ext4 filesystem with a
@@ -207,7 +256,7 @@ private mount namespace with a copy of `/etc` bound over the real one:
 the machine it runs on is left exactly as it was, whether the run
 finishes or not.
 
-Both are wired into this repository's test gate as
-`scripts/test registry-snapshot` and `scripts/test registry-storage`,
-which check the prerequisites themselves and fail rather than let a
-skipped check pass for a green one.
+All four are wired into this repository's test gate — `scripts/test
+registry-snapshot`, `mirror-sync`, `registry-publish` and
+`registry-storage` — through wrappers that check the prerequisites
+themselves and fail rather than let a skipped check pass for a green one.

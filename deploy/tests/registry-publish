@@ -18,12 +18,15 @@
 # the catalogue and is published; new releases are discovered, fetched,
 # checked against their sidecars, recorded, signed and verified; a family
 # of per-architecture packages gets its meta package once every member is
-# there; a source that is not laid down is reported and skipped rather
-# than failing the run; a second run is a no-op and takes no snapshot; a
-# draft release is ignored; a refresh renews the signed documents and
-# publishes them; an asset that does not match its checksum stops the run
-# with nothing recorded; and the whole repository's releases are asked
-# for exactly once per run however many sources are fed from it.
+# there; a source whose subvolume is there but which has never been laid
+# down is reported and skipped rather than failing the run or being
+# invented; each source is snapshotted on its own and gets a mirror chain
+# of its own, while one publish composes one served tree; a second run is
+# a no-op and composes no tree; a draft release is ignored; a refresh
+# renews the signed documents and publishes them; an asset that does not
+# match its checksum stops the run with nothing recorded; and the whole
+# repository's releases are asked for exactly once per run however many
+# sources are fed from it.
 #
 # The run creates a system account, so it re-executes itself in a private
 # mount namespace with a throwaway copy of /etc bound over the real one:
@@ -171,11 +174,20 @@ mount -o noatime "$loop_device" "$mount_point"
 mount_points+=("$mount_point")
 
 registry="$mount_point/registry"
-mkdir -p "$registry/snapshots" "$registry/mirror-sync" "$registry/placeholder"
+mkdir -p "$registry/snapshots" "$registry/trees" "$registry/mirror-sync" "$registry/placeholder"
 btrfs subvolume create "$registry/working" >/dev/null
 ln -s placeholder "$registry/current"
 chown "$publisher_user:$publisher_user" "$registry/working"
 install -d -o "$publisher_user" -g "$publisher_user" -m 0700 "$registry/staging"
+
+# One subvolume per configured source, the way the storage role lays them
+# down — including the one this run never lays a source into, because
+# that is exactly the state the pipeline has to survive: the directory is
+# there from the start and says nothing about whether a source is in it.
+for source in absent sdk tools; do
+  btrfs subvolume create "$registry/working/$source" >/dev/null
+  chown "$publisher_user:$publisher_user" "$registry/working/$source"
+done
 
 working="$registry/working"
 note "registry at $registry"
@@ -184,6 +196,7 @@ cat >"$work_dir/snapshot.conf" <<EOF
 registry_root='$registry'
 registry_snapshot_keep_count=10
 registry_snapshot_keep_days=7
+registry_snapshot_keep_trees=10
 EOF
 cat >"$work_dir/mirror-sync.conf" <<EOF
 registry_root='$registry'
@@ -389,8 +402,22 @@ ran_clean() {
   sed -e 's/^/    | /' "$out" "$err" >&2
 }
 
+# How many trees have been composed: one per publish that changed
+# something, which is what "was this published" means here.
+tree_count() {
+  find "$registry/trees" -mindepth 1 -maxdepth 1 -type d | wc -l
+}
+
 snapshot_count() {
-  find "$registry/snapshots" -mindepth 1 -maxdepth 1 | wc -l
+  find "$registry/snapshots/$1" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l
+}
+
+# The snapshot of one source the tree the docroot points at was composed
+# from.
+served_snapshot() {
+  local tree
+  tree="$(basename "$(readlink "$(served)")")"
+  awk -v s="$1" '$1 == s {print $2}' "$registry/trees/$tree.sources"
 }
 
 served() {
@@ -445,8 +472,9 @@ if grep -q "not laid down" "$err"; then
 else
   bad "the source that was never laid down went unmentioned"
 fi
-true_that "and was not invented" \
-  "$([ ! -e "$working/absent" ] && echo true || echo false)"
+true_that "and nothing was written into it" \
+  "$([ ! -e "$working/absent/index.json" ] && [ ! -e "$working/absent/keys.json" ] &&
+    echo true || echo false)"
 
 same "the pages are in the tree" \
   "$(cmp -s "$repo/pages/index.html" "$working/index.html" && echo yes)" yes
@@ -470,25 +498,33 @@ for source in sdk tools; do
 done
 
 note "and it was published"
-same "a snapshot was taken" "$(snapshot_count)" 1
-first_snapshot="$(readlink "$(served)")"
-case $first_snapshot in
-snapshots/snapshot-*) ok "the docroot points at it ($first_snapshot)" ;;
-*) bad "the docroot points at '$first_snapshot'" ;;
+same "one tree was composed" "$(tree_count)" 1
+same "one snapshot of sdk" "$(snapshot_count sdk)" 1
+same "one snapshot of tools" "$(snapshot_count tools)" 1
+same "and one of the source nothing was laid into" "$(snapshot_count absent)" 1
+first_tree="$(readlink "$(served)")"
+case $first_tree in
+trees/tree-*) ok "the docroot points at it ($first_tree)" ;;
+*) bad "the docroot points at '$first_tree'" ;;
 esac
+first_sdk_snapshot="$(served_snapshot sdk)"
 same "the served tree carries the package" \
   "$(cat "$registry/current/sdk/test-sdk-1.0.0.tar.zst")" "sdk one"
 if echo tampered 2>/dev/null >"$registry/current/sources.json"; then
-  bad "the served snapshot is read-only"
+  bad "the served tree is read-only"
 else
-  ok "the served snapshot is read-only"
+  ok "the served tree is read-only"
 fi
 
-same "the chain index exists" \
-  "$([ -f "$registry/mirror-sync/index.json" ] && echo yes)" yes
+same "sdk has a chain of its own" \
+  "$([ -f "$registry/mirror-sync/sdk/index.json" ] && echo yes)" yes
+same "so has tools" \
+  "$([ -f "$registry/mirror-sync/tools/index.json" ] && echo yes)" yes
 same "with a full dump of the snapshot that was just published" \
-  "$(jq -r '.full.snapshot' "$registry/mirror-sync/index.json")" \
-  "$(basename "$first_snapshot")"
+  "$(jq -r '.full.snapshot' "$registry/mirror-sync/sdk/index.json")" \
+  "$first_sdk_snapshot"
+true_that "and no whole-tree chain beside them" \
+  "$([ ! -e "$registry/mirror-sync/index.json" ] && echo true || echo false)"
 
 same "the whole repository was asked about once" \
   "$(grep -c '^/repos/testowner/testrepo/releases' "$requests")" 1
@@ -503,8 +539,9 @@ if grep -q "nothing changed" "$out"; then
 else
   bad "the run did not say it had nothing to do"
 fi
-same "no second snapshot" "$(snapshot_count)" 1
-same "the docroot did not move" "$(readlink "$(served)")" "$first_snapshot"
+same "no second tree" "$(tree_count)" 1
+same "no second snapshot of sdk" "$(snapshot_count sdk)" 1
+same "the docroot did not move" "$(readlink "$(served)")" "$first_tree"
 
 # --- a new release ---------------------------------------------------
 
@@ -518,18 +555,23 @@ true_that "the new version is recorded" \
   "$(recorded sdk test-sdk 1.1.0 && echo true || echo false)"
 true_that "the old one is still there" \
   "$(recorded sdk test-sdk 1.0.0 && echo true || echo false)"
-same "a second snapshot was taken" "$(snapshot_count)" 2
-second_snapshot="$(readlink "$(served)")"
-if [ "$second_snapshot" != "$first_snapshot" ]; then
+same "a second tree was composed" "$(tree_count)" 2
+same "sdk was snapshotted again" "$(snapshot_count sdk)" 2
+same "the sources nothing touched were not" \
+  "$(snapshot_count tools)$(snapshot_count absent)" "11"
+second_tree="$(readlink "$(served)")"
+if [ "$second_tree" != "$first_tree" ]; then
   ok "the docroot moved to it"
 else
   bad "the docroot did not move"
 fi
-same "the chain now has a difference" \
-  "$(jq -r '.chain | length' "$registry/mirror-sync/index.json")" 1
-same "it starts from the first snapshot" \
-  "$(jq -r '.chain[0].parent' "$registry/mirror-sync/index.json")" \
-  "$(basename "$first_snapshot")"
+same "sdk's chain now has a difference" \
+  "$(jq -r '.chain | length' "$registry/mirror-sync/sdk/index.json")" 1
+same "it starts from sdk's first snapshot" \
+  "$(jq -r '.chain[0].parent' "$registry/mirror-sync/sdk/index.json")" \
+  "$first_sdk_snapshot"
+same "tools' chain has no difference to make" \
+  "$(jq -r '.chain | length' "$registry/mirror-sync/tools/index.json")" 0
 if "$python" "$repo/verify.py" "$working/sdk" --anchor "$anchor" >/dev/null 2>&1; then
   ok "sdk still verifies"
 else
@@ -624,7 +666,7 @@ fi
 
 note "a refresh"
 before_issued="$(jq -r '.issued' "$working/sdk/index.json")"
-before_snapshots="$(snapshot_count)"
+before_trees="$(tree_count)"
 run_tool --refresh
 ran_clean "exit code"
 if [ "$(jq -r '.issued' "$working/sdk/index.json")" != "$before_issued" ]; then
@@ -632,7 +674,7 @@ if [ "$(jq -r '.issued' "$working/sdk/index.json")" != "$before_issued" ]; then
 else
   bad "the signed documents were not renewed"
 fi
-same "a snapshot was taken for it" "$(snapshot_count)" "$((before_snapshots + 1))"
+same "a tree was composed for it" "$(tree_count)" "$((before_trees + 1))"
 if "$python" "$repo/verify.py" "$working/sdk" --anchor "$anchor" >/dev/null 2>&1; then
   ok "the renewed documents verify"
 else
@@ -643,11 +685,11 @@ same "the refresh asked the forge nothing" "$(grep -c '^/repos' "$requests" || t
 # --- a dry run -------------------------------------------------------
 
 note "a dry run"
-before_snapshots="$(snapshot_count)"
+before_trees="$(tree_count)"
 before_index="$(sha256sum "$working/sdk/index.json" | cut -d' ' -f1)"
 run_tool --dry-run
 ran_clean "exit code"
-same "no snapshot" "$(snapshot_count)" "$before_snapshots"
+same "no tree" "$(tree_count)" "$before_trees"
 same "nothing signed" "$(sha256sum "$working/sdk/index.json" | cut -d' ' -f1)" "$before_index"
 
 # --- an asset that does not match its checksum -----------------------
@@ -658,7 +700,7 @@ printf '%s  %s\n' "$(printf 'not these bytes' | sha256sum | cut -d' ' -f1)" \
   test-sdk-3.0.0.tar.zst >"$forge/assets/v3.0.0/test-sdk-3.0.0.tar.zst.sha256"
 write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v2.0.0:true:false" \
   "v3.0.0:true:false" "v4.0.0:true:false" "v9.9.9:false:true"
-before_snapshots="$(snapshot_count)"
+before_trees="$(tree_count)"
 
 run_tool
 same "exit code" "$rc" 4
@@ -671,7 +713,7 @@ true_that "nothing was recorded" \
   "$(recorded sdk test-sdk 3.0.0 && echo false || echo true)"
 true_that "the file did not reach the source" \
   "$([ ! -e "$working/sdk/test-sdk-3.0.0.tar.zst" ] && echo true || echo false)"
-same "and nothing was published" "$(snapshot_count)" "$before_snapshots"
+same "and nothing was published" "$(tree_count)" "$before_trees"
 
 # --- a run without a publisher key -----------------------------------
 

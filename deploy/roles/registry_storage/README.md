@@ -19,10 +19,18 @@ carries the registry, the mount for it, and the tree inside it.
 4. Writes the fstab entry and mounts the subvolume. The entry names the
    filesystem by UUID and carries `nofail`, so a missing volume delays
    the boot but does not stop it.
-5. Creates `working` (a subvolume), `snapshots/`, `mirror-sync/`,
-   `placeholder/`, and the `current` symlink if it does not exist yet.
-   An existing `current` is never touched: it is what a running registry
-   is being served from.
+5. Creates `working` (a subvolume), `snapshots/`, `trees/`,
+   `mirror-sync/`, `placeholder/`, and the `current` symlink if it does
+   not exist yet. An existing `current` is never touched: it is what a
+   running registry is being served from.
+6. Creates one subvolume per name in `registry_storage_sources`, under
+   `working/`. A subvolume is what can be snapshotted, and publishing
+   snapshots the sources that changed rather than the whole tree.
+
+A source subvolume with nothing in it is a source that has not been laid
+down yet. Laying one down needs keys that are deliberately not on a
+registry server, so this role creates the subvolume and nothing else, and
+the publish pipeline reports such a source and carries on.
 
 The role can be run again at any time. It changes nothing once the state
 above is reached.
@@ -30,7 +38,14 @@ above is reached.
 ## What it does not do
 
 - It never deletes, moves or reformats anything that is already on the
-  device.
+  device. A source subvolume that is not in
+  `registry_storage_sources` is left exactly where it is: it is a source
+  somebody published, and removing one is not a configuration run's
+  decision.
+- It does not turn a plain directory under `working/` into a subvolume.
+  That means moving the contents of something that is already published,
+  which is a migration and not a step of a role that runs on every
+  change. The snapshot command refuses such a directory and says so.
 - It does not remount a filesystem whose options changed in fstab. A
   `subvol=` cannot be changed by a remount at all, and the rest is not
   worth unmounting a live registry for; the run reports the difference
@@ -46,6 +61,7 @@ above is reached.
 | `registry_root` | `/srv/registry` | Where the registry subvolume is mounted. Shared with the other registry roles. |
 | `registry_storage_subvolume` | `@registry` | Name of the subvolume that carries the registry. |
 | `registry_storage_label` | `registry` | Filesystem label, used only when the role creates the filesystem. |
+| `registry_storage_sources` | `[]` | The sources this registry carries. One subvolume each under `working/`. Every name is a path segment of a public URL, so only letters, digits, dots, dashes and underscores are accepted. |
 | `registry_storage_mount_options` | `noatime,compress=zstd:3,nodev,nosuid,nofail,x-systemd.device-timeout=15s` | Mount options. `subvol=` is added by the role and must not be listed. |
 | `registry_storage_owner` | `root` | Owner of the registry tree. |
 | `registry_storage_group` | `root` | Group of the registry tree. |

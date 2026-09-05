@@ -70,9 +70,24 @@ The module path is `<root>/current`, the symlink a publish replaces.
 rsync resolves it — and chroots into it — once per connection, in the
 process that serves that connection. A transfer already running keeps the
 tree it started with, the next connection gets the new one, and neither
-ever sees a tree that is half published. Snapshot retention is what makes
-the first half safe: the tree a running transfer holds open is not
-deleted out from under it.
+ever sees a tree that is half published. `<root>/current` points at a
+composed tree — a read-only btrfs subvolume with a read-only btrfs
+subvolume nested under it for each source. Tree retention, not snapshot
+retention, is what makes the first half safe: it is what keeps a tree a
+running transfer holds open from being deleted, and the tree the docroot
+currently points at is never the one a publish removes.
+
+### Per-source subvolumes and `--one-file-system`
+
+Each source's directory inside the served tree is its own btrfs
+subvolume, so it sits on a different device number than the tree around
+it. Plain `rsync -a` (or `-av`, `--delete`) does not care about device
+boundaries and copies everything regardless. `-x` / `--one-file-system`
+does care: against this module it would stop at every source's boundary
+and leave behind empty directories instead of their contents, so it must
+not be used here. A mirror that wants one source only does not need that
+option either — adding the source's name to the module path, as in
+`rsync://<host>/<module>/<source>/`, copies just that subvolume.
 
 `use chroot = yes` is set explicitly and should stay that way. Since
 rsync 3.2.7 an unset value means "try, and carry on without it if it

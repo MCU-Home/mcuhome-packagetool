@@ -262,15 +262,17 @@ http {
             return 405;
         }
 
-        # The chain index is polled, usually with HEAD against its ETag,
-        # and it is rewritten whenever a dump is added or dropped.
-        location = /index.json {
+        # One chain per source, so a mirror can follow one source without
+        # taking the whole registry. The index is polled, usually with
+        # HEAD against its ETag, and it is rewritten whenever a dump of
+        # that source is added or dropped.
+        location ~ ^/[^/]+/index\.json$ {
 {{ revalidate() }}
         }
 
         # A dump is named after the snapshot it carries and is written
         # once.
-        location ~ ^/(full|snapshot)-[^/]+\.btrfs\.dump$ {
+        location ~ ^/[^/]+/(full|snapshot)-[^/]+\.btrfs\.dump$ {
 {{ immutable() }}
         }
 

@@ -10,7 +10,7 @@ defaults. And running a registry of your own means writing your own
 version of this directory rather than editing the roles.
 
 ```
-vars/registry.yml   storage layout and snapshot retention
+vars/registry.yml   storage layout, the sources, snapshot and tree retention
 vars/serving.yml    the host names, what each one serves, the rsync limits
 vars/publish.yml    where the tool comes from, what it reads, what is on a timer
 publishing.json     which upstream release feeds which source
@@ -26,10 +26,17 @@ its own pair of them.
 ## What is here and what is not
 
 Here: values that describe the registry itself — where it is mounted,
-what the subvolume is called, how the filesystem is mounted, how many
-snapshots and how many days of them are kept, which host names it answers
-on and what each of them is allowed to answer with, which sources it
-publishes and which root keys those sources are rooted in.
+what the subvolume is called, how the filesystem is mounted, which
+sources it carries and therefore which subvolumes exist, how many
+snapshots per source and how many days of them are kept and how many
+composed trees, which host names it answers on and what each of them is
+allowed to answer with, which upstream release feeds which source and
+which root keys those sources are rooted in.
+
+The source list appears twice, in `vars/registry.yml` and in
+`publishing.json`: the first says which subvolumes exist, the second
+which releases feed them. The playbook that applies these files checks
+the two against each other, so they cannot drift apart.
 
 The anchor is configuration on both ends: it lives here because it says
 what *this* registry's trust is rooted in, and it is served from the
@@ -49,7 +56,7 @@ this repository.
 |---|---|
 | `mirror-1.packages.mcuhome.org` | the full tree over HTTPS, the browsable pages, and the anonymous rsync export |
 | `packages.mcuhome.org` | the bootstrap subset: the anchor, the source list, and each source's key set and mirror list |
-| `mirror-sync.packages.mcuhome.org` | the dumps official mirrors bootstrap and catch up from, behind per-mirror credentials |
+| `mirror-sync.packages.mcuhome.org` | the dumps official mirrors bootstrap and catch up from, one directory per source, behind per-mirror credentials |
 
 They are three names on one machine, and nothing about the split assumes
 they stay that way. A client that has an anchor asks the bootstrap host

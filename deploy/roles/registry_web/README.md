@@ -15,7 +15,7 @@ Docker.
 |---|---|---|
 | 8080 | `<root>/current` | the full registry tree, including the pages |
 | 8081 | `<root>/current` | the bootstrap subset, and nothing else |
-| 8082 | `<root>/mirror-sync` | the dumps for official mirrors |
+| 8082 | `<root>/mirror-sync` | the per-source dumps for official mirrors |
 
 Three servers rather than three locations of one server. A request that
 somehow reaches the wrong port then gets a server that serves a different
@@ -25,6 +25,12 @@ it, so no path under the public vhosts can reach it at all.
 
 Who may read 8082 is not decided here. Nothing on it is public, and the
 proxy in front is what asks for credentials.
+
+Under that docroot each source has its own directory: a mirror fetches
+`https://<host>/<source>/index.json` and the dumps it names, never a
+single index for the whole registry. The vhost's own root is a 404 by
+construction — nothing matches there, and a source directory requested
+without one of the two allowed file shapes is a 404 too.
 
 ### What the bootstrap vhost serves, and why exactly that
 
@@ -74,7 +80,7 @@ accident.
 | archived key sets under `<source>/keys/` | same |
 | `index.json`, `keys.json`, `mirrors.json` and their `.sig` | `no-cache` |
 | `sources.json`, `anchor.json`, HTML pages | `no-cache` |
-| the mirror-sync chain index | `no-cache` |
+| each source's mirror-sync chain index | `no-cache` |
 | everything else | `public, max-age=300` |
 
 The split follows one rule: a name that can never stand for different
@@ -86,8 +92,8 @@ kept for a year. The signed head documents are replaced in place on every
 publish and every refresh, and a stale copy of one of them is precisely
 what the `expires` field and the weekly refresh exist to catch, so they
 are revalidated every time. `no-cache` does not mean "do not store": with
-the `ETag` nginx sends, a poll costs a 304 and no body, which is what the
-mirror-sync chain index is polled with.
+the `ETag` nginx sends, a poll costs a 304 and no body, which is what
+each source's mirror-sync chain index is polled with.
 
 Nothing is compressed. Package files are compressed already, the
 documents are a kilobyte each, and on-the-fly compression is the classic
@@ -97,7 +103,8 @@ come from nginx unmodified and survive the proxy in front.
 ## The docroot is a symlink
 
 `<root>/current` is a symlink that a publish replaces by renaming a new
-one over it. nginx resolves it per request, so a request either gets the
+tree over it — a composed tree under `<root>/trees/`, not a single
+snapshot. nginx resolves it per request, so a request either gets the
 old tree or the new one. `open_file_cache` is therefore not configured
 and must not be: cached `stat()` results would keep serving the tree that
 was published before.

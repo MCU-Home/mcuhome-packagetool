@@ -21,7 +21,26 @@ registry_storage_label: registry
 registry_storage_mount_options: >-
   noatime,compress=zstd:3,nodev,nosuid,nofail,x-systemd.device-timeout=15s
 
-# Retention: at least the last ten publishes, and at least a week of
-# them. A snapshot has to fall outside both before it is deleted.
+# The sources this registry carries, one btrfs subvolume each. The same
+# three names publishing.json declares in this directory — they are the
+# first path segment of every URL a client fetches a package through, and
+# the directory an official mirror following one source copies. The
+# playbook that applies this checks the two lists against each other, so a
+# source added to publishing.json without being added here stops the run
+# instead of quietly never being laid down.
+registry_storage_sources:
+  - build-tools
+  - build-workspace
+  - sdk
+
+# Retention: at least the last ten publishes per source, and at least a
+# week of them. A snapshot has to fall outside both before it is deleted,
+# and one a composed tree that is still kept was built from is never
+# deleted at all.
 registry_snapshot_keep_count: 10
 registry_snapshot_keep_days: 7
+
+# And the served compositions themselves: the last ten, which is as far
+# back as the served tree can be rolled by hand. The one the docroot
+# points at is never deleted whatever this says.
+registry_snapshot_keep_trees: 10

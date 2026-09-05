@@ -25,6 +25,24 @@ registry_storage_subvolume: "@registry"
 # Filesystem label, used only when the role creates the filesystem.
 registry_storage_label: registry
 
+# The sources this registry carries, by name. Each one becomes a btrfs
+# subvolume of its own under <root>/working, because a subvolume is what
+# can be snapshotted, and publishing snapshots the sources that changed
+# rather than the whole tree. Names have to match the sources the
+# publishing configuration declares — they are the first path segment of
+# every URL the registry serves.
+#
+# An empty list lays the tree down without any source. Creating a source
+# needs keys that are deliberately not on a registry server, so this role
+# creates the subvolume and nothing else; a subvolume with nothing in it
+# is a source that has not been laid down yet, and every command here
+# survives that.
+#
+# The role never removes a subvolume it does not find in this list: a
+# source that has been published is not something a configuration run gets
+# to delete.
+registry_storage_sources: []
+
 # Mount options for the registry subvolume. The subvol= option is added
 # by the role and must not be listed here.
 #
