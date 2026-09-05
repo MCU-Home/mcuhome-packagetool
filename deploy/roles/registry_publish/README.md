@@ -45,7 +45,7 @@ happen to touch the same source.
 |---|---|---|
 | discover, download, checksum | the publishing account | it talks to the network and handles bytes nobody has checked yet |
 | record and sign | the publishing account | it is the only identity that can read the publisher key |
-| pages, extra files, `sources.json` | the publishing account | it owns the working tree |
+| the tree files above the sources, `sources.json` | the publishing account | it owns the working tree |
 | verify | the publishing account | reading |
 | snapshots, the composed tree and the docroot switch | root | creating read-only btrfs snapshots needs `CAP_SYS_ADMIN` |
 | mirror dumps | root | `btrfs send` needs it too |
@@ -132,9 +132,9 @@ not here — so what decides the question is whether the two documents a
 source is made of, `keys.json` and `index.json`, are in it. Writing them
 needs the offline root keys, which are deliberately not on this machine,
 so an empty source is a state the command has to survive rather than fix.
-Everything else — the pages, the extra tree files, `sources.json` — is
+Everything else — the tree files above the sources, `sources.json` — is
 installed all the same, so a registry that has no sources yet still
-serves a landing page.
+serves a catalogue that says so.
 
 ## Settings
 

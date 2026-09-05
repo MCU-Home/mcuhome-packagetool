@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCUHome package mirror</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.6; color: #222; }
+  a { color: #0b62a4; }
+  code { background: #f2f2f2; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
+  pre { background: #f2f2f2; padding: 0.7rem 0.9rem; border-radius: 4px; overflow-x: auto; font-size: 0.88rem; }
+  h1 { margin-bottom: 0.2rem; }
+  h2 { margin-top: 2.2rem; font-size: 1.1rem; }
+  .lead { color: #555; margin-top: 0; }
+  ul.sources { list-style: none; padding: 0; }
+  ul.sources li { border: 1px solid #e2e2e2; border-radius: 6px; padding: 0.6rem 0.9rem; margin: 0.6rem 0; }
+  ul.sources .name { font-weight: 600; }
+  ul.sources p { margin: 0.2rem 0 0; color: #555; font-size: 0.94rem; }
+  .meta { font-size: 0.85em; color: #666; }
+  .meta a { margin-right: 1rem; }
+  .error { background: #fff4f3; border: 1px solid #f0c4c0; border-radius: 6px; padding: 0.8rem 1rem; }
+</style>
+</head>
+<body>
+<h1>MCUHome package mirror</h1>
+<p class="lead">This host serves a copy of the MCUHome package registry: a plain file tree of
+signed documents and package files. Every directory below is browsable, and the whole tree can be
+copied.</p>
+
+<p>Which mirrors a source may be fetched from is not decided here — it is stated in that source's
+signed mirror list, which
+<a href="https://packages.mcuhome.org/">packages.mcuhome.org</a> serves. That page also explains
+what the registry is, how a copy of it is verified, and shows what is published.</p>
+
+<h2>Sources on this mirror</h2>
+
+<ul class="sources" id="sources"></ul>
+<p id="status" class="meta">Loading <code>sources.json</code>…</p>
+
+<noscript><p class="error">The list above is read from <code>sources.json</code> in your browser.
+Without JavaScript, open <a href="sources.json">sources.json</a> directly — every source is a
+directory of this host named after it.</p></noscript>
+
+<h2>Copying the whole tree</h2>
+
+<p>A mirror is a copy of the tree, with no path rewriting and no per-mirror layout. This one
+exports it read-only over anonymous rsync:</p>
+
+<pre id="rsync">rsync -a rsync://<span id="host">this-host</span>/registry/ ./registry/</pre>
+
+<p>Append a source's name to pull one source instead of all of them. <code>registry</code> is the
+module name a mirror set up with the deployment roles of
+<a href="https://github.com/mcu-home/mcuhome-packagetool">mcuhome-packagetool</a> uses; another
+operator may have chosen a different one, and <code>rsync rsync://&lt;host&gt;/</code> lists what
+a host exports.</p>
+
+<p>Whatever it was copied from, a copy is worth exactly as much as the original: what makes a
+source trustworthy is inside it. Verify it with the reference verifier against a root anchor you
+already hold — <code>verify.py &lt;source&gt; --anchor &lt;anchor.json&gt;</code> — never by
+trusting the host it came from, this one included.</p>
+
+<script>
+// Self-contained on purpose: a mirror that had to fetch a script from
+// somewhere else would hand that somewhere else a say in what a visitor
+// reads about integrity.
+"use strict";
+
+document.getElementById("host").textContent = location.host;
+
+const el = (tag, text, attrs) => {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+  return node;
+};
+
+// A source is a directory of this host named after itself; sources.json is
+// the unsigned directory of them, generated when the registry was published.
+// A path that is not a plain relative name is not one of this tree's
+// directories and is dropped rather than linked.
+const isPlainPath = (path) =>
+  typeof path === "string" && path.length > 0 && !path.startsWith("/") &&
+  !path.startsWith(".") && !path.includes("..") && !/^[a-z][a-z0-9+.-]*:/i.test(path);
+
+async function load() {
+  const list = document.getElementById("sources");
+  const status = document.getElementById("status");
+  let shown = 0;
+  try {
+    const response = await fetch("sources.json", { cache: "no-cache" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const catalog = await response.json();
+    // Also catches a "sources" that parsed as JSON but is not a list — a
+    // hostile or broken sources.json (a string, a number, an object) makes
+    // "for...of" throw, and without this in the same try the page would be
+    // left stuck on "Loading…" instead of showing the error message below.
+    for (const source of catalog.sources || []) {
+      if (!source || typeof source.name !== "string" || !isPlainPath(source.path)) continue;
+      const path = source.path.endsWith("/") ? source.path : source.path + "/";
+      const item = el("li");
+      item.append(el("a", source.title || source.name, { href: path, class: "name" }));
+      if (source.description) item.append(el("p", source.description));
+      const meta = el("p", null, { class: "meta" });
+      meta.append(el("a", "browse", { href: path }));
+      for (const file of ["index.json", "keys.json", "mirrors.json"]) {
+        meta.append(el("a", file, { href: path + file }));
+      }
+      item.append(meta);
+      list.append(item);
+      shown++;
+    }
+  } catch (failure) {
+    status.textContent = `sources.json could not be read: ${failure.message}`;
+    status.className = "error";
+    return;
+  }
+
+  status.textContent = shown
+    ? `${shown} source${shown === 1 ? "" : "s"}, as this mirror last received them.`
+    : "This mirror carries no source yet.";
+}
+
+load();
+</script>
+</body>
+</html>

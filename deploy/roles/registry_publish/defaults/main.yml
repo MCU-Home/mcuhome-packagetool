@@ -32,7 +32,7 @@ registry_publish_keys_dir: /etc/packagetool/publisher-keys
 
 # The tool runs from a checkout of its own repository in a virtual
 # environment of its own: the publish pipeline, the reference verifier
-# and the pages a registry serves all come out of the same tree, so there
+# and the instance configuration all come out of the same tree, so there
 # is one version of them on the machine and one thing to move forward.
 # Nothing is installed into the system Python.
 registry_publish_home: /opt/packagetool
@@ -61,11 +61,6 @@ registry_publish_publishing_config: ""
 # rather than something fetched: a verifier that downloaded its anchor
 # would only be checking that the host agrees with itself.
 registry_publish_anchor: ""
-
-# The browsable pages, installed into the working tree on every run. Each
-# file in this directory lands at the root of the served tree under its
-# own name. Empty means the registry serves no pages.
-registry_publish_pages_dir: "{{ registry_publish_checkout_dir }}/pages"
 
 # Anything else the served tree carries that is not part of a source, as
 # a space-separated list of paths on the server. The trust anchor belongs

@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+SPDX-License-Identifier: Apache-2.0
+
+{{ ansible_managed }}
+
+Directory listings for a registry tree.
+
+nginx is configured with "autoindex_format xml", which makes it emit a
+document of <directory> and <file> elements instead of its built-in
+listing, and this stylesheet turns that into the page a visitor sees. The
+transformation happens in the web server, so a listing needs no
+JavaScript and carries no assets — the same rule the registry's pages
+follow, for the same reason.
+
+The one thing the XML does not carry is the path being listed. nginx
+passes it in separately ("xslt_string_param uri $uri"), which is what the
+heading, the title and the parent link below are built from.
+
+Only nginx's own autoindex output is ever transformed here: the filter
+runs on "text/xml" responses, and the only thing this server produces
+with that type is this listing.
+
+Hrefs are built with a leading "./" on purpose: a file or directory name
+out of the XML is untrusted content (a mirror serves whatever landed in
+its tree), and without a relative prefix a name such as
+"javascript:alert(1)" would itself parse as an absolute URL with a
+"javascript:" scheme instead of a relative path. "./" forces every href
+to be read relative to the current directory no matter what the name
+looks like.
+
+The footer's extra content beyond the "This mirror" link is a deployment
+choice, not something a generic stylesheet has an opinion on — see
+registry_web_autoindex_footer_html.
+-->
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+
+<!-- HTML 5: the "html" method plus the legacy-compat system identifier is
+     the only way an XSLT 1.0 processor writes <!DOCTYPE html>. -->
+<xsl:output method="html" encoding="utf-8" indent="no"
+            doctype-system="about:legacy-compat"/>
+
+<xsl:param name="uri">/</xsl:param>
+
+<xsl:template match="/">
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Index of <xsl:value-of select="$uri"/></title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 64rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.6; color: #222; }
+  a { color: #0b62a4; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  h1 { font-size: 1.15rem; margin-bottom: 0.2rem; word-break: break-all; }
+  .lead { color: #555; margin-top: 0; font-size: 0.9rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; margin-top: 1.2rem; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; white-space: nowrap; }
+  th { border-bottom: 2px solid #ddd; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.when { color: #666; }
+  td.name { width: 100%; word-break: break-all; white-space: normal; }
+  .dir a { font-weight: 600; }
+  .empty { color: #666; padding: 1rem 0.6rem; }
+  footer { margin-top: 2rem; font-size: 0.85rem; color: #666; }
+</style>
+</head>
+<body>
+<h1>Index of <xsl:value-of select="$uri"/></h1>
+<p class="lead">A directory of this mirror's registry tree, as it is served. Nothing here is
+verified by being listed: what a source is worth is decided by its signatures and hashes, against
+an anchor you already hold.</p>
+
+<table>
+<tr><th>Name</th><th>Size</th><th>Last modified</th></tr>
+<xsl:if test="$uri != '/'">
+<tr class="dir"><td class="name"><a href="../">../</a></td><td/><td/></tr>
+</xsl:if>
+<xsl:apply-templates select="list/directory">
+  <xsl:sort select="." order="ascending"/>
+</xsl:apply-templates>
+<xsl:apply-templates select="list/file">
+  <xsl:sort select="." order="ascending"/>
+</xsl:apply-templates>
+</table>
+
+<xsl:if test="not(list/directory) and not(list/file)">
+<p class="empty">This directory is empty.</p>
+</xsl:if>
+
+<footer>
+<a href="/">This mirror</a>{{ registry_web_autoindex_footer_html | default('', true) }}
+</footer>
+</body>
+</html>
+</xsl:template>
+
+<xsl:template match="directory">
+<tr class="dir">
+  <td class="name">
+    <a href="./{.}/"><xsl:value-of select="."/>/</a>
+  </td>
+  <td class="num">—</td>
+  <td class="when"><xsl:call-template name="when"><xsl:with-param name="mtime" select="@mtime"/></xsl:call-template></td>
+</tr>
+</xsl:template>
+
+<xsl:template match="file">
+<tr>
+  <td class="name">
+    <a href="./{.}"><xsl:value-of select="."/></a>
+  </td>
+  <td class="num"><xsl:call-template name="size"><xsl:with-param name="bytes" select="@size"/></xsl:call-template></td>
+  <td class="when"><xsl:call-template name="when"><xsl:with-param name="mtime" select="@mtime"/></xsl:call-template></td>
+</tr>
+</xsl:template>
+
+<!-- Package files here are hundreds of megabytes and documents are a
+     kilobyte, so the exact byte count is worth less than a size anyone can
+     read at a glance. -->
+<xsl:template name="size">
+  <xsl:param name="bytes"/>
+  <xsl:choose>
+    <xsl:when test="$bytes &gt;= 1073741824">
+      <xsl:value-of select="format-number($bytes div 1073741824, '0.00')"/><xsl:text> GiB</xsl:text>
+    </xsl:when>
+    <xsl:when test="$bytes &gt;= 1048576">
+      <xsl:value-of select="format-number($bytes div 1048576, '0.0')"/><xsl:text> MiB</xsl:text>
+    </xsl:when>
+    <xsl:when test="$bytes &gt;= 1024">
+      <xsl:value-of select="format-number($bytes div 1024, '0.0')"/><xsl:text> KiB</xsl:text>
+    </xsl:when>
+    <xsl:otherwise>
+      <xsl:value-of select="$bytes"/><xsl:text> B</xsl:text>
+    </xsl:otherwise>
+  </xsl:choose>
+</xsl:template>
+
+<!-- nginx writes the modification time as 2026-09-05T19:33:12Z (UTC, as
+     long as autoindex_localtime stays off). Seconds are noise in a listing. -->
+<xsl:template name="when">
+  <xsl:param name="mtime"/>
+  <xsl:value-of select="substring($mtime, 1, 10)"/>
+  <xsl:text> </xsl:text>
+  <xsl:value-of select="substring($mtime, 12, 5)"/>
+  <xsl:text> UTC</xsl:text>
+</xsl:template>
+
+</xsl:stylesheet>

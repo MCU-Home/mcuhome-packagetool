@@ -28,6 +28,29 @@ with every rule spelled out.
             # being served stale for any length of time.
             add_header Cache-Control "no-cache" always;
 {%- endmacro %}
+{% macro cors() %}
+{%- if registry_web_cors_origin %}
+            # Readable by a browser on another host; see the head of this
+            # file. "always", so a 404 arrives at the page as a 404 rather
+            # than as an unexplained network error.
+            add_header Access-Control-Allow-Origin "{{ registry_web_cors_origin }}" always;
+{%- endif %}
+{%- endmacro %}
+{% macro static_page(file) %}
+            # Installed beside the tree, not in it: a registry is a file tree
+            # a mirror copies byte for byte, and a page belongs to the host
+            # that serves it rather than to what is published. Hence a root
+            # of its own for this one location.
+            #
+            # try_files and not "alias <file>": the request URI is "/", and
+            # for a URI ending in "/" nginx's index module appends the index
+            # file to whatever the path resolves to — which turns an alias
+            # naming a file into "<file>index.html". try_files hands the file
+            # out directly, and answers 404 if it is not there.
+            root {{ registry_web_assets_dir }};
+            try_files /{{ file }} =404;
+{{ revalidate() }}
+{%- endmacro %}
 {% macro tree_server_head(port) %}
     listen {{ registry_web_listen_address }}:{{ port }};
     server_name _;
@@ -37,7 +60,11 @@ with every rule spelled out.
     # open_file_cache would cache the old target and is therefore not
     # configured here.
     root {{ registry_root }}/current;
-    index index.html;
+
+    # No "index" directive: the tree carries no HTML at all any more.
+    # What a directory is answered with is each vhost's own business —
+    # a listing, or a 404 — and the pages are files of this server
+    # rather than of the registry.
 
     # A registry is read-only. "if" with nothing but a return in it is
     # one of the two uses of it that are safe.
@@ -60,11 +87,27 @@ with every rule spelled out.
 #   {{ registry_web_tree_port }}  the full registry tree, through <root>/current
 {% if registry_web_bootstrap_enabled %}
 #   {{ registry_web_bootstrap_port }}  the bootstrap subset: the documents a client needs to
-#         find a mirror, and nothing else
+#         find a mirror, and nothing else of the tree
 {% endif %}
 {% if registry_web_mirror_sync_enabled %}
 #   {{ registry_web_mirror_sync_port }}  the dump distribution for official mirrors, out of
 #         <root>/mirror-sync
+{% endif %}
+#
+# The tree carries no HTML. Where a browser gets a page at all — the root
+# of the tree vhost, the root of the bootstrap vhost — it is a file of
+# this server, installed beside this configuration, and never part of
+# what a mirror copies.
+{% if registry_web_cors_origin %}
+#
+# The JSON documents of the full tree are readable across origins
+# (Access-Control-Allow-Origin: {{ registry_web_cors_origin }}). The pages of a registry are
+# served by one host and the data by another — that is what a mirror list
+# is for — so the page's requests are cross-origin by construction, and a
+# browser refuses them unless the mirror says otherwise. Nothing is given
+# away by it: every document it applies to is public, unauthenticated and
+# fetchable with curl by anyone. Package files are left out of it, since
+# nothing reads them with a script.
 {% endif %}
 #
 # Nothing is compressed here, deliberately. Package files are compressed
@@ -72,6 +115,17 @@ with every rule spelled out.
 # is the classic way to lose byte ranges on the large files that need
 # them most.
 
+{% if registry_web_autoindex and registry_web_autoindex_xslt %}
+# Directory listings are rendered from nginx's own XML output by a
+# stylesheet, in the server, so a listing needs no JavaScript and no
+# assets. The filter is a dynamic module: the official nginx images ship
+# it, an image that does not have it makes this line fail at startup, and
+# an image without it can still serve listings by setting
+# registry_web_autoindex_xslt to false. Only this server's own autoindex
+# output is ever transformed — nothing else here is text/xml.
+load_module {{ registry_web_xslt_module }};
+
+{% endif %}
 worker_processes auto;
 error_log /dev/stderr warn;
 pid /var/run/nginx.pid;
@@ -123,25 +177,34 @@ http {
             return 404;
         }
 {% endif %}
+{% if registry_web_tree_index_page %}
+
+        # --- the page at the root --------------------------------------
+        # Exactly "/" and nothing else: every other directory is answered
+        # by the listing, and this page is not in the tree at all.
+        location = / {
+{{ static_page('tree-index.html') }}
+        }
+{% endif %}
 
         # --- the signed head documents ---------------------------------
         location = /sources.json {
-{{ revalidate() }}
+{{ revalidate() }}{{ cors() }}
         }
 
         location = /anchor.json {
-{{ revalidate() }}
+{{ revalidate() }}{{ cors() }}
         }
 
         location ~ ^/[^/]+/(index|keys|mirrors)\.json$ {
-{{ revalidate() }}
+{{ revalidate() }}{{ cors() }}
         }
 
         location ~ ^/[^/]+/(index|keys|mirrors)\.json\.sig$ {
             # A signature envelope is JSON; the extension is not in any
             # mime.types.
             default_type application/json;
-{{ revalidate() }}
+{{ revalidate() }}{{ cors() }}
         }
 
         # --- written once, never rewritten -----------------------------
@@ -149,18 +212,18 @@ http {
         # is never replaced, and an index part carries the hash of its own
         # content in its name. Both are safe to keep forever.
         location ~ ^/[^/]+/keys/[^/]+\.json$ {
-{{ immutable() }}
+{{ immutable() }}{{ cors() }}
         }
 
         location ~ ^/[^/]+/keys/[^/]+\.json\.sig$ {
             default_type application/json;
-{{ immutable() }}
+{{ immutable() }}{{ cors() }}
         }
 
         location ~ "^/[^/]+/index-.+-[0-9a-f]{16}\.json$" {
             # Quoted because of the braces: nginx would read them as the
             # start of a block otherwise.
-{{ immutable() }}
+{{ immutable() }}{{ cors() }}
         }
 
         # --- package files ---------------------------------------------
@@ -176,12 +239,10 @@ http {
 {{ immutable() }}
         }
 
-        # --- pages ------------------------------------------------------
-        location ~ \.html$ {
-{{ revalidate() }}
-        }
-
         # --- everything else --------------------------------------------
+        # Directories end up here too: none of the rules above matches a
+        # path that ends in "/", so this is also where a listing is
+        # rendered.
         location / {
             # Short-lived by design (5 min default), so "always" is fine
             # here even on a 404: this is also the conservative fallback
@@ -189,6 +250,21 @@ http {
             # location — a client caches "not here" for minutes, not a
             # year, and sees the file soon after it appears.
             add_header Cache-Control "public, max-age={{ registry_web_default_max_age }}" always;
+{% if registry_web_autoindex and registry_web_autoindex_xslt %}
+
+            # The listing nginx generates as XML, turned into a page by
+            # the stylesheet installed beside the configuration. Here and
+            # not in the server block, because xslt_stylesheet is a
+            # location directive — and this is the only location a
+            # directory can reach. The stylesheet is read and compiled
+            # while the configuration is loaded, so a broken or missing
+            # one is a server that refuses to start rather than one that
+            # answers with something odd. The XML carries no path, so the
+            # requested one is passed in separately.
+            autoindex_format xml;
+            xslt_stylesheet {{ registry_web_assets_dir }}/autoindex.xslt;
+            xslt_string_param uri $uri;
+{% endif %}
         }
     }
 {% if registry_web_bootstrap_enabled %}
@@ -232,7 +308,17 @@ http {
 {{ immutable() }}
         }
 
-{% if registry_web_bootstrap_redirect %}
+{% if registry_web_bootstrap_page %}
+        # The page that explains this registry and browses it. It is served
+        # here rather than from a mirror because this is the host a client
+        # starts at, and it reads exactly what this vhost serves: the
+        # source list and each source's mirror list. Everything it shows
+        # about packages it fetches from the mirror a visitor picked.
+        location = / {
+{{ static_page('bootstrap-index.html') }}
+        }
+
+{% elif registry_web_bootstrap_redirect %}
         location = / {
             return 302 {{ registry_web_bootstrap_redirect }};
         }

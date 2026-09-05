@@ -13,8 +13,8 @@ Docker.
 
 | Port | Docroot | Serves |
 |---|---|---|
-| 8080 | `<root>/current` | the full registry tree, including the pages |
-| 8081 | `<root>/current` | the bootstrap subset, and nothing else |
+| 8080 | `<root>/current` | the full registry tree, browsable, plus one page of its own at `/` |
+| 8081 | `<root>/current` | the bootstrap subset, plus one page of its own at `/` |
 | 8082 | `<root>/mirror-sync` | the per-source dumps for official mirrors |
 
 Three servers rather than three locations of one server. A request that
@@ -69,7 +69,97 @@ unmistakably a signpost rather than a mirror.
 
 The rule is written as an allow list. Everything not named above is a
 404, so a file that appears in the tree later is not served here by
-accident.
+accident. The page at `/` is the one exception, and it is not a file of
+the tree at all — see below.
+
+## The pages are not in the tree
+
+Neither vhost serves HTML out of the registry. The tree is what a mirror
+copies byte for byte, and a page is a property of the host that serves
+it: a mirror that is only an rsync target has no business carrying
+somebody else's landing page, and a page that lived in the tree would be
+copied, mirrored and dumped along with the packages.
+
+So each of the two public vhosts answers exactly `/` with one file
+installed beside the configuration, in `registry_web_assets_dir`, and
+nothing else:
+
+| Variable | Vhost | What the page is for |
+|---|---|---|
+| `registry_web_tree_index_page` | full tree | what this mirror is, and the sources it carries |
+| `registry_web_bootstrap_page` | bootstrap | what the registry is, how to verify a copy, and a browser over the mirrors |
+
+Both are paths on the machine running Ansible; the role copies them onto
+the server and bind-mounts that directory into the container read-only.
+Leave one empty and that vhost has no page: the tree vhost answers `/`
+with a listing, the bootstrap vhost with a 404 or with the redirect
+`registry_web_bootstrap_redirect` names. Setting a page and a redirect
+at once is refused — they are two answers to one question.
+
+The location is `location = /` with a `root` of its own and `try_files`,
+not an `alias` naming the file. For a URI ending in `/` nginx's index
+module appends the index file to whatever the path resolves to, which
+turns an alias naming a file into `<file>index.html` and a 500 into the
+first thing a visitor sees.
+
+## Browsing the tree
+
+With `registry_web_autoindex` on, a directory of the full tree is
+answered with a listing. With `registry_web_autoindex_xslt` on as well —
+the default — that listing is nginx's own XML output rendered by an XSLT
+stylesheet **in the server**: no JavaScript, no assets, and the same
+styling as the pages. The stylesheet this role ships is rendered from
+`templates/autoindex.xslt.j2`, not copied verbatim, so its footer can
+carry a deployment's own links without forking the file — see
+`registry_web_autoindex_footer_html` below. `registry_web_autoindex_stylesheet`
+replaces the whole thing with a file of your own instead, copied as-is
+with no templating applied.
+
+Every href in a listing is written with a leading `./`: a file or
+directory name comes out of nginx's own XML and is otherwise untrusted —
+a name such as `javascript:alert(1)` would otherwise parse as an
+absolute URL with a `javascript:` scheme instead of a relative link.
+nginx's own built-in autoindex (the one this stylesheet replaces) escapes
+the colon and is not affected; the XML/XSLT path is. `./` forces every
+href to read as relative regardless of what the name looks like.
+
+Two things about it are worth knowing before it is switched on:
+
+- The filter is a **dynamic module**. The generated configuration loads
+  it with `load_module`, and the official nginx images (Debian and
+  Alpine) ship it in `/usr/lib/nginx/modules`. An image without it makes
+  the server refuse to start; set `registry_web_autoindex_xslt` to false
+  there and get nginx's built-in listing instead.
+- The stylesheet is read and compiled **while the configuration is
+  loaded**, not per request. A missing or broken one is a server that
+  will not start, which is why the role installs it before it writes the
+  configuration, and why the configuration check runs with the asset
+  directory mounted.
+
+Only this server's own listings are ever transformed: the filter runs on
+`text/xml` responses, and nothing else here has that type.
+
+## Reading the documents from another host
+
+The pages of this registry are served by the bootstrap host and the data
+by the mirrors — that is what a mirror list is *for* — so the browser
+page's requests to a mirror are cross-origin, and a browser refuses them
+unless the mirror says otherwise. `registry_web_cors_origin` is that
+permission; `*` is the right value for a public registry, and empty (the
+default) switches the header off.
+
+It is set on the full-tree vhost and on the JSON documents only:
+`sources.json`, `anchor.json`, the signed head documents and their
+signatures, the archived key sets, and the content-named index parts.
+Package files are left out — nothing reads them with a script. The
+bootstrap vhost never sends it: its own page reads it from its own
+origin.
+
+Nothing is given away by it. Every document it covers is public,
+unauthenticated and fetchable with `curl` by anyone; the header only
+stops browsers from pretending otherwise. It is sent with `always`, so a
+404 arrives at the page as a 404 instead of as an unexplained network
+error.
 
 ## Cache headers
 
@@ -79,7 +169,7 @@ accident.
 | content-named index parts (`index-…-<hash>.json`) | same |
 | archived key sets under `<source>/keys/` | same |
 | `index.json`, `keys.json`, `mirrors.json` and their `.sig` | `no-cache` |
-| `sources.json`, `anchor.json`, HTML pages | `no-cache` |
+| `sources.json`, `anchor.json`, the two pages | `no-cache` |
 | each source's mirror-sync chain index | `no-cache` |
 | everything else | `public, max-age=300` |
 
@@ -161,7 +251,8 @@ Everything else about the container is closed down: read-only root
 filesystem with tmpfs for the two directories nginx writes to, all
 capabilities dropped except the three the master process needs to hand its
 workers to an unprivileged user (`CHOWN`, `SETGID`, `SETUID`),
-`no-new-privileges`, and the registry root bind-mounted read-only.
+`no-new-privileges`, and the registry root and the asset directory both
+bind-mounted read-only.
 
 ## The generated configuration replaces the image's own
 
@@ -190,7 +281,15 @@ do.
 | `registry_web_bootstrap_enabled` | `true` | Whether the bootstrap vhost exists. |
 | `registry_web_mirror_sync_enabled` | `true` | Whether the mirror-sync vhost exists. |
 | `registry_web_autoindex` | `false` | Directory listings on the full-tree vhost. |
-| `registry_web_bootstrap_redirect` | `""` | Where `/` on the bootstrap vhost redirects to. Empty means 404. |
+| `registry_web_autoindex_xslt` | `true` | Render those listings with a stylesheet in the server. Needs the xslt module. |
+| `registry_web_autoindex_stylesheet` | `""` | The stylesheet to render them with, copied verbatim. Empty means the one this role ships, rendered from a template instead. |
+| `registry_web_autoindex_footer_html` | `""` | Extra footer HTML on the shipped stylesheet's listings, right after the "This mirror" link. Ignored when `registry_web_autoindex_stylesheet` names a file of your own. |
+| `registry_web_xslt_module` | `modules/ngx_http_xslt_filter_module.so` | Where the xslt filter module is, as nginx resolves it. |
+| `registry_web_tree_index_page` | `""` | Page served at `/` on the full-tree vhost, as a path on the Ansible machine. |
+| `registry_web_bootstrap_page` | `""` | Page served at `/` on the bootstrap vhost, same. |
+| `registry_web_bootstrap_redirect` | `""` | Where `/` on the bootstrap vhost redirects to when it serves no page. Empty means 404. |
+| `registry_web_cors_origin` | `""` | Origin allowed to read the full tree's JSON documents. `*` for a public registry, empty for none. |
+| `registry_web_assets_dir` | `/etc/packagetool/web` | Where the pages and the stylesheet are installed. |
 | `registry_web_immutable_max_age` | `31536000` | Lifetime for files that cannot change under their name. |
 | `registry_web_default_max_age` | `300` | Lifetime for everything the rules do not name. |
 | `registry_web_config_path` | `/etc/packagetool/nginx.conf` | Generated configuration. |
@@ -207,7 +306,14 @@ do.
   place, untouched. Nothing was restarted.
 - *the unit will not start* — `journalctl -u packagetool-web` first. An
   assertion failure there means the registry root is not a mount point,
-  which is a storage problem, not a web server one.
+  which is a storage problem, not a web server one. A complaint about
+  `ngx_http_xslt_filter_module.so` means the image does not carry the
+  module: set `registry_web_autoindex_xslt` to false, or point
+  `registry_web_xslt_module` at where that image keeps it.
+- *the root of a vhost answers 404* — the page for it is not installed.
+  The role only installs one when `registry_web_tree_index_page` or
+  `registry_web_bootstrap_page` names a file it can read on the machine
+  running Ansible.
 - *every request is a 404* — check what `<root>/current` points at. An
   unpublished registry points at the empty placeholder, and 404 is the
   correct answer then.

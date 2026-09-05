@@ -1,10 +1,10 @@
 # deploy — hosting a packagetool registry
 
 A packagetool registry is a plain static file tree: signed index
-documents, package files, and a few HTML pages. Integrity comes from the
-signatures and hashes inside the tree, not from the server, so anything
-that can serve files can serve a registry, and anything that can copy
-files can mirror one.
+documents and package files, and nothing else — not even a page.
+Integrity comes from the signatures and hashes inside the tree, not from
+the server, so anything that can serve files can serve a registry, and
+anything that can copy files can mirror one.
 
 This directory holds the Ansible material that sets such a server up.
 
@@ -14,13 +14,12 @@ mcuhome/        the values the public MCUHome registry is run with
 tests/          checks that run on a throwaway filesystem, not on a server
 ```
 
-The HTML pages a registry serves are not here: they are `../pages/`, next
-to the tool, because they are part of what is published rather than part
-of how a server is set up. Putting them into the working tree is the
-publish pipeline's job, and `registry_publish` does it out of the
-checkout of this repository it installs on the server — so the tool, the
-reference verifier, the pages and the publishing configuration on a
-running registry are all one version of one tree.
+The pages a registry serves are in `../pages/`, next to the tool, and
+they are installed by `registry_web` — beside the served tree, never
+into it. A page belongs to the host that serves it: the tree is what a
+mirror copies byte for byte, and a third party who mirrors it over rsync
+alone gets the files and no pages at all (and gets a page of its own by
+using these roles).
 
 Nothing under `roles/` knows anything about a particular registry: every
 value it needs is a variable. `mcuhome/` is the other half — the settings
@@ -36,8 +35,8 @@ shape inside it:
 ```
 <root>/working/           what is being prepared, never served
 <root>/working/<source>   one btrfs subvolume per source
-<root>/working/<file>     the files above the sources: the pages, the
-                          source catalogue, the trust anchor
+<root>/working/<file>     the files above the sources: the source
+                          catalogue and the trust anchor
 <root>/snapshots/<source>/snapshot-<ts>
                           the read-only snapshots of one source
 <root>/trees/tree-<ts>/   a served composition: one snapshot copy per
@@ -99,7 +98,7 @@ snapshot that tree holds.
 |---|---|
 | `registry_storage` | btrfs filesystem on a dedicated device, the registry subvolume, the mount, the tree inside it, and one subvolume per source. |
 | `registry_snapshot` | installs `packagetool-snapshot`: per-source snapshots, the composed tree, the docroot switch, retention. |
-| `registry_web` | nginx, in a container, serving the tree on the loopback address: the full tree, the bootstrap subset, the mirror dumps. |
+| `registry_web` | nginx, in a container, serving the tree on the loopback address: the full tree, the bootstrap subset, the mirror dumps; the pages and the directory listings that go with them. |
 | `registry_proxy` | Caddy, in a container: TLS, the host names, credentials where they are needed. |
 | `registry_rsync` | the anonymous read-only rsync export, native and started per connection. |
 | `registry_publish` | the publish pipeline: the tool in its own virtual environment, the account that signs, one command from "a release exists upstream" to "the mirror serves it", and the units that run it. |
@@ -122,6 +121,9 @@ A playbook using all of them:
       - name: mirror.example.org
         bind: ["203.0.113.10", "2001:db8::10"]
         upstream: "127.0.0.1:8080"
+    registry_web_autoindex: true
+    registry_web_tree_index_page: /path/to/mcuhome-packagetool/pages/mirror-index.html
+    registry_web_cors_origin: "*"
     registry_publish_version: main
     registry_publish_publishing_config: /opt/packagetool/checkout/publishing.json
     registry_publish_anchor: /opt/packagetool/checkout/anchor.json

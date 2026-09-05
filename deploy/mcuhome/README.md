@@ -54,8 +54,8 @@ this repository.
 
 | Name | Serves |
 |---|---|
-| `mirror-1.packages.mcuhome.org` | the full tree over HTTPS, the browsable pages, and the anonymous rsync export |
-| `packages.mcuhome.org` | the bootstrap subset: the anchor, the source list, and each source's key set and mirror list |
+| `mirror-1.packages.mcuhome.org` | the full tree over HTTPS, browsable directory by directory, with a page at its root saying what this mirror is; and the anonymous rsync export |
+| `packages.mcuhome.org` | the bootstrap subset: the anchor, the source list, and each source's key set and mirror list; and at its root the page that explains the registry and browses it |
 | `mirror-sync.packages.mcuhome.org` | the dumps official mirrors bootstrap and catch up from, one directory per source, behind per-mirror credentials |
 
 They are three names on one machine, and nothing about the split assumes
@@ -82,6 +82,10 @@ hands the roles what is in them:
     - <this repository>/deploy/mcuhome/vars/serving.yml
     - <this repository>/deploy/mcuhome/vars/publish.yml
   vars:
+    # Where this repository is checked out on the machine running
+    # Ansible. vars/serving.yml names the two pages relative to it, and a
+    # vars file cannot know where it was read from.
+    packagetool_repo_dir: <this repository>
     # The public sites here, plus whatever this machine adds of its own.
     registry_proxy_sites: >-
       {{ registry_proxy_public_sites + (registry_proxy_private_sites | default([])) }}
@@ -95,8 +99,9 @@ hands the roles what is in them:
     - role: registry_publish
 ```
 
-Five values are deliberately not set here, because each of them describes
-one machine rather than the registry:
+Six values are deliberately not set here, because each of them describes
+one machine — or the machine Ansible is run from — rather than the
+registry:
 
 | Value | Where it belongs |
 |---|---|
@@ -104,15 +109,19 @@ one machine rather than the registry:
 | `registry_proxy_public_addresses` | the addresses the public sites bind |
 | `registry_rsync_listen_addresses` | the addresses the rsync export listens on |
 | `registry_mirror_sync_users` | the mirror-sync credentials — never in a repository |
+| `packagetool_repo_dir` | where this repository is checked out on the machine running Ansible; `vars/serving.yml` names the two pages relative to it |
 | the publisher keys | put on the server by whoever is entitled to move them, into the directory `registry_publish_keys_dir` names — never in a repository, and not by a configuration run either |
 
 ## Publishing
 
 `vars/publish.yml` says that the server follows the `main` branch of this
-repository for the tool it publishes with, reads `publishing.json` and
-`anchor.json` out of that checkout, and installs `pages/` from it into
-the served tree. One version of one tree, on the machine, recorded in
-`/opt/packagetool/installed-revision`.
+repository for the tool it publishes with and reads `publishing.json` and
+`anchor.json` out of that checkout. One version of one tree, on the
+machine, recorded in `/opt/packagetool/installed-revision`.
+
+The pages are not part of that: they are installed by `registry_web`
+from the checkout on the machine running Ansible, beside the served tree
+rather than into it, and a publish never touches them.
 
 A publish is `systemctl start packagetool-publish.service` and nothing
 else: it is deliberate, its timer is installed and off, and it batches —

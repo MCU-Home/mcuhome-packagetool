@@ -41,7 +41,7 @@ once: a run generates the ones that are missing and never rewrites one
 that is there, because a mirror may be reading it.
 
 What the dumps do **not** carry: the few files that live above the
-sources — the pages, the source catalogue, the trust anchor. They belong
+sources — the source catalogue and the trust anchor. They belong
 to the composed tree rather than to any source, and a mirror gets them
 the way every other client does, over rsync or HTTPS.
 

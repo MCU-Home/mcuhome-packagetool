@@ -14,8 +14,8 @@
 # because the one thing a test must not depend on is somebody else's
 # release schedule.
 #
-# What is checked: an empty working tree gets the pages, the anchor and
-# the catalogue and is published; new releases are discovered, fetched,
+# What is checked: an empty working tree gets the anchor and the
+# catalogue and is published; new releases are discovered, fetched,
 # checked against their sidecars, recorded, signed and verified; a family
 # of per-architecture packages gets its meta package once every member is
 # there; a source whose subvolume is there but which has never been laid
@@ -369,7 +369,6 @@ registry_publish_python='$python'
 registry_publish_checkout_dir='$repo'
 registry_publish_publishing_config='$publishing'
 registry_publish_anchor='$anchor'
-registry_publish_pages_dir='$repo/pages'
 registry_publish_tree_files='$anchor'
 registry_publish_github_api='$base'
 registry_publish_include_prereleases=true
@@ -476,9 +475,9 @@ true_that "and nothing was written into it" \
   "$([ ! -e "$working/absent/index.json" ] && [ ! -e "$working/absent/keys.json" ] &&
     echo true || echo false)"
 
-same "the pages are in the tree" \
-  "$(cmp -s "$repo/pages/index.html" "$working/index.html" && echo yes)" yes
-same "so is the anchor" \
+true_that "the working tree carries no page" \
+  "$([ -z "$(find "$working" -name '*.html')" ] && echo true || echo false)"
+same "the anchor is in the tree" \
   "$(cmp -s "$anchor" "$working/anchor.json" && echo yes)" yes
 same "the catalogue lists every configured source" \
   "$(jq -r '[.sources[].name] | join(",")' "$working/sources.json")" "absent,sdk,tools"

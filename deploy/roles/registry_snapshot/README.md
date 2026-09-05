@@ -64,7 +64,7 @@ without a mount of any kind.
 
 The tree itself is a subvolume so that it can be made read-only when it
 is finished. What is served is then exactly as unwritable as the
-snapshots inside it, down to the source catalogue and the pages.
+snapshots inside it, down to the source catalogue.
 
 ## Which sources changed
 

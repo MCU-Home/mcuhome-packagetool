@@ -1,8 +1,8 @@
 # mcuhome-packagetool
 
 `mcuhome-packagetool` is MCUHome's package tooling: the tool that publishes
-a registry, the pages that registry serves, the material that sets a server
-up to host one, and the reference verifier clients check it with. It is
+a registry, the pages a registry host serves, the material that sets such a
+server up, and the reference verifier clients check it with. It is
 where a released SDK package becomes something a build pins by hash and
 signature, not by trusting a URL.
 
@@ -10,7 +10,7 @@ signature, not by trusting a URL.
 
 - `mcuhome/packagetool/` — the publishing tool: it lays a source down, records a package, renews the publisher-signed documents and reports how much validity is left.
 - `verify.py` — the normative reference verifier, standalone so it can be copied next to a mirrored source and run with the standard library and `cryptography`.
-- `pages/` — the pages a registry serves: a front page and the browsable index of everything published. They are part of what is deployed, not part of this repository's own presentation.
+- `pages/` — the two pages a registry host serves: `index.html`, the page of the bootstrap host, which explains the registry and browses it over the mirrors each source names; and `mirror-index.html`, the page at the root of a mirror. They are installed by the deploy roles beside the served tree, never into it, and are not this repository's own presentation.
 - `deploy/` — the Ansible roles that turn a server into a registry host, and under `deploy/mcuhome/` the settings, source declarations and trust anchor the public MCUHome registry is run with.
 
 ### What it does not hold
@@ -62,7 +62,7 @@ exactly as much as the original.
 | Path | Purpose |
 |---|---|
 | `mcuhome/` | The publishing tool — keys, signed documents, sources, catalogue |
-| `pages/` | The pages a registry serves: the front page and the browsable index |
+| `pages/` | The two pages a registry host serves: the bootstrap host's page and a mirror's root page |
 | `deploy/` | Ansible roles for hosting a packagetool registry; details in `deploy/README.md` |
 | `deploy/mcuhome/` | How the public MCUHome registry is run: storage and serving settings, `publishing.json`, `anchor.json` |
 | `tests/` | The suite, and the fixed source directories it verifies, one per outcome |
@@ -210,8 +210,8 @@ compromise through
 - [`verify.py`](verify.py) — what a client must check, in executable form
 - [`mcuhome/packagetool/`](mcuhome/packagetool/) — the publishing tool, documented module by module
 - [`deploy/`](deploy/) — hosting a registry: the roles, the tree they lay down, and how a publish is made atomic
-- `packages.mcuhome.org` — the bootstrap host: where a client asks which mirrors a source has. It answers with signed documents and nothing else, so there is no page to open there
-- [mirror-1.packages.mcuhome.org](https://mirror-1.packages.mcuhome.org/) — the registry itself: the full tree, browsable, and the rsync export to copy it from
+- [packages.mcuhome.org](https://packages.mcuhome.org/) — the bootstrap host: where a client asks which mirrors a source has, and the page that explains the registry and browses what is published
+- [mirror-1.packages.mcuhome.org](https://mirror-1.packages.mcuhome.org/) — a mirror: the full tree, browsable directory by directory, and the rsync export to copy it from
 - [The MCUHome organization](https://github.com/mcu-home) — the other repositories of the project
 
 ## Contributing and support

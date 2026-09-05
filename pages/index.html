@@ -5,33 +5,127 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MCUHome packages</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.6; color: #222; }
+  body { font-family: system-ui, sans-serif; max-width: 64rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.6; color: #222; }
   a { color: #0b62a4; }
-  code { background: #f2f2f2; padding: 0.1em 0.3em; border-radius: 3px; }
-  pre { background: #f2f2f2; padding: 0.8rem; border-radius: 4px; overflow-x: auto; }
+  code { background: #f2f2f2; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
+  pre { background: #f2f2f2; padding: 0.7rem 0.9rem; border-radius: 4px; overflow-x: auto; font-size: 0.88rem; }
+  h1 { margin-bottom: 0.2rem; }
   h2 { margin-top: 2.5rem; font-size: 1.15rem; }
+  .lead { color: #555; margin-top: 0; }
+  .prose { max-width: 42rem; }
+  .banner { background: #fff8e6; border: 1px solid #e6c65c; border-left-width: 5px; border-radius: 5px; padding: 0.8rem 1rem; margin: 1.5rem 0; max-width: 42rem; }
+  .banner strong { display: block; margin-bottom: 0.2rem; }
+  .banner p { margin: 0.4rem 0 0; font-size: 0.94rem; }
+  .source { border: 1px solid #e2e2e2; border-radius: 6px; padding: 0.8rem 1rem; margin: 1rem 0; }
+  .source .head { display: flex; align-items: center; gap: 0.5rem; }
+  .source .head label { font-weight: 600; font-size: 1.05rem; cursor: pointer; }
+  .source p { margin: 0.2rem 0; color: #555; }
+  .mirror { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin: 0.5rem 0 0.2rem; font-size: 0.9rem; }
+  .mirror select { max-width: 100%; }
+  .meta { font-size: 0.85em; color: #666; }
+  .meta span { margin-right: 1rem; white-space: nowrap; }
+  .ok { color: #1a7f37; } .warn { color: #9a6700; } .bad { color: #b42318; }
+  .controls { display: flex; gap: 0.8rem; align-items: center; flex-wrap: wrap; margin: 1.5rem 0 0.5rem; }
+  input[type=search] { flex: 1 1 16rem; padding: 0.4rem 0.6rem; border: 1px solid #ccc; border-radius: 4px; font: inherit; }
+  select, button { padding: 0.35rem 0.6rem; border: 1px solid #ccc; border-radius: 4px; background: #fff; font: inherit; cursor: pointer; }
+  button:disabled { color: #aaa; cursor: default; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid #eee; white-space: nowrap; }
+  th { cursor: pointer; user-select: none; border-bottom: 2px solid #ddd; }
+  th[data-dir=asc]::after { content: ' ▲'; } th[data-dir=desc]::after { content: ' ▼'; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .hash { cursor: copy; }
+  .page { display: flex; gap: 0.6rem; align-items: center; margin-top: 0.8rem; font-size: 0.9em; color: #555; }
+  .empty { padding: 1.5rem; color: #666; text-align: center; }
+  .error { background: #fff4f3; border: 1px solid #f0c4c0; border-radius: 6px; padding: 0.8rem 1rem; }
+  dialog { max-width: 34rem; border: 1px solid #ccc; border-radius: 8px; padding: 1.2rem 1.4rem; color: #222; }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+  dialog h2 { margin-top: 0; font-size: 1.15rem; color: #b42318; }
+  dialog .actions { display: flex; gap: 0.6rem; justify-content: flex-end; margin-top: 1.2rem; }
+  dialog .go { padding: 0.35rem 0.6rem; border: 1px solid #ccc; border-radius: 4px; text-decoration: none; color: #555; }
 </style>
 </head>
 <body>
 <h1>MCUHome packages</h1>
+<p class="lead">The registry the MCUHome tools pin their packages against — what it is, how a
+copy of it is checked, and what is published in it right now.</p>
 
-<p>This host serves the hash-pinned packages MCUHome tools build against.
-Each directory below is a self-contained <strong>source</strong>: it
-carries its own keys, its own mirror list and its own index, and says
-nothing about any other directory.</p>
+<div class="prose">
+<p>This host is the <strong>bootstrap host</strong>. It carries no package bytes and no index: it
+answers the one question a client has before it can fetch anything — for a given source, which
+key set signs it and which mirrors may be fetched from — and it answers with signed documents.
+Everything else lives on the mirrors those documents name.</p>
 
-<ul>
-  <li><a href="/sdk/">/sdk/</a> — the <code>mcuhome-sdk</code> source package a build compiles from</li>
-  <li><a href="/build-workspace/">/build-workspace/</a> — <code>mcuhome-build-workspace</code>, the build environment's source world, the same on every architecture</li>
-  <li><a href="/build-tools/">/build-tools/</a> — <code>mcuhome-build-tools_&lt;os&gt;-&lt;arch&gt;</code>, the build environment's host tools, one package per platform, plus the meta package <code>mcuhome-build-tools</code> that stands for the whole family</li>
-</ul>
+<p>A <strong>source</strong> is one self-contained directory: its own root keys, its own mirror
+list, its own index, its own package files. It says nothing about any other source, and nothing
+above a source has authority — which is why the source list below is unsigned and why your tool
+resolves the source it was configured with rather than one it discovered here.</p>
+</div>
 
-<p><strong><a href="/browser.html">Inspect what is published →</a></strong> — every source and
-version in one table, for looking rather than for installing: that page verifies nothing and
-cannot, because it is served by the same host it reads. Packages are fetched and checked by the
-MCUHome tools, which carry a trust anchor of their own.
-<a href="/sources.json">sources.json</a> is the same list as data; it is unsigned
-discovery only, because nothing above a source has authority.</p>
+<div class="banner">
+  <strong>Nothing on this page is verified, and this page cannot verify it.</strong>
+  <p>The documents it reads <em>are</em> signed — but the check happens against a trust anchor a
+  tool carries with it, and a web page has nowhere to carry one. The mirror list arrives from
+  this host and the package data from a mirror this host named: one of them serving you a
+  modified package would have served you a matching hash, and this page with the check taken
+  out.</p>
+  <p><strong>So do not install anything you fetched here.</strong> The MCUHome command line
+  resolves, downloads and verifies packages by itself, against an anchor built into the tool —
+  it does the real thing, and it does it on every build.</p>
+</div>
+
+<h2>What is published</h2>
+
+<div id="sources"></div>
+
+<div class="controls">
+  <input type="search" id="q" placeholder="Filter by package, version or hash…" autocomplete="off">
+  <select id="size"><option>25</option><option>50</option><option>100</option><option value="0">all</option></select>
+</div>
+
+<div class="tablewrap">
+  <table>
+    <thead><tr>
+      <th data-key="source">Source</th>
+      <th data-key="name">Package</th>
+      <th data-key="version">Version</th>
+      <th data-key="size">Size</th>
+      <th data-key="sha256" title="As the mirror served it — useful to compare against what your tool resolved, never as proof on its own">SHA-256 (as served)</th>
+      <th>Files</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+<div id="status" class="empty">Loading…</div>
+<div class="page" id="pager" hidden>
+  <button id="prev">← Previous</button><span id="range"></span><button id="next">Next →</button>
+</div>
+
+<dialog id="warn">
+  <h2>This download is not verified</h2>
+  <p>You are about to fetch <code id="what"></code> from a mirror. Nothing checks it: not this
+  page, which cannot, and not your browser.</p>
+  <p>The hash shown next to it came from the same mirror as the file, so it proves nothing on its
+  own — a mirror serving a modified package would serve a matching index, and this page would
+  show you both.</p>
+  <p>The MCUHome command line is what does this properly: it carries its own trust anchor,
+  verifies the source's signatures and the package's bytes, and refuses on a mismatch. If you
+  continue anyway, check what you got against an anchor you already trust:</p>
+  <pre>python verify.py &lt;directory&gt; --anchor &lt;your anchor.json&gt;</pre>
+  <div class="actions">
+    <button id="cancel" autofocus>Cancel</button>
+    <a class="go" id="go" href="#" download>Download anyway</a>
+  </div>
+</dialog>
+
+<noscript><p class="error">This page reads the documents in your browser, so it needs JavaScript.
+Without it, fetch <code>/sources.json</code> and each source's <code>mirrors.json</code> from this
+host, then that source's <code>index.json</code> from one of the mirrors listed there — they are
+plain files and nothing here is generated server-side. Verifying them is <code>verify.py</code>'s
+job, never a web page's.</p></noscript>
+
+<div class="prose">
 
 <h2>What a source contains</h2>
 
@@ -41,10 +135,13 @@ index.json     index.json.sig     which file, and which bytes, for every version
 &lt;package files&gt;                   plus a .sha256 sidecar for each, and any
                                   further sidecar the build wrote beside it</pre>
 
-<p>Everything is signed with Ed25519. The signature covers the exact
-bytes of the document as served, and the hashes inside the index reach
-from there to every package file — so a mirror can be untrusted without
-anything else being.</p>
+<p>Everything is signed with Ed25519. The signature covers the exact bytes of the document as
+served, and the hashes inside the index reach from there to every package file — so a mirror can
+be untrusted without anything else being.</p>
+
+<p>This host serves the first two of those documents (plus the key sets they superseded) for
+every source, and deliberately not the third: an index head without the parts and without a
+single package byte would look like a source and would not be one.</p>
 
 <h2>Meta packages</h2>
 
@@ -66,16 +163,571 @@ directory you already have and at the root key set you trust:</p>
 <pre>verify.py sdk/ --anchor anchor.json</pre>
 
 <p>It is the executable form of the rule tools follow, and it is the
-same code the test corpus in the repository is checked against.</p>
+same code the test corpus in the repository is checked against. The anchor is served here as
+<a href="/anchor.json">anchor.json</a> so it can be <em>compared</em> against the one your tool
+already carries; fetching it at verification time is not verification.</p>
 
 <h2>Mirroring</h2>
 
 <p>A mirror is a copy of a source directory — no path rewriting, no
 per-mirror layout. Copy the whole directory, serve it over HTTPS under
 your own name, and it is complete. Mirrors may carry one source and not
-another. To be listed, open an issue in the repository below.</p>
+another. To be listed in a source's signed mirror list, open an issue in the repository below.</p>
 
-<p>Source code and the publishing workflows:
+<p>Source code, the reference verifier and the deployment material:
 <a href="https://github.com/mcu-home/mcuhome-packagetool">github.com/mcu-home/mcuhome-packagetool</a></p>
+</div>
+
+<script>
+// No external anything. This registry exists to make integrity checkable, and
+// a script fetched from somebody else's server would be one more party able to
+// rewrite what a visitor reads. Sorting, filtering and paging are a few
+// hundred lines; a dependency is forever.
+//
+// What this page can never do is verify. It is served by the host that names
+// the mirrors, and it reads the package data from those mirrors, so a host
+// that lies would simply serve a page that does not check. That is not a gap
+// to close here — it is why the trust anchor lives in the tool.
+//
+// Where each request goes is the one thing worth keeping straight:
+//
+//   sources.json            this host  — which sources exist (unsigned)
+//   <source>/mirrors.json   this host  — where that source may be fetched
+//   <mirror>/index.json     the mirror — what it publishes, and its parts
+//
+// The second hop is cross-origin, so a mirror has to allow browsers from
+// another host to read its documents; one that does not shows up as a mirror
+// this page cannot read, and another can be picked instead.
+"use strict";
+
+const STORAGE_KEY = "registry.mirrors";
+
+const el = (tag, text, attrs) => {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+  return node;
+};
+
+const getJSON = async (url) => {
+  let response;
+  try {
+    response = await fetch(url, { cache: "no-cache" });
+  } catch (failure) {
+    // A cross-origin refusal and a dead host are the same TypeError here;
+    // the browser deliberately tells a page nothing more.
+    throw new Error(`${url} could not be read (host unreachable, or it does ` +
+      `not allow browsers from another host to read it)`);
+  }
+  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+  return response.json();
+};
+
+const humanSize = (bytes) =>
+  bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + " MiB" : Math.round(bytes / 1024) + " KiB";
+
+// A display sort, not PEP 440: numeric runs compare as numbers, and a
+// version that continues into a pre-release marker sorts below the release
+// it belongs to. Good enough to look right; the resolver is what decides.
+const versionTokens = (v) => v.match(/\d+|\D+/g) || [];
+const isPre = (rest) => /dev|a|b|rc/.test(rest);
+function compareVersion(a, b) {
+  const ta = versionTokens(a), tb = versionTokens(b);
+  for (let i = 0; i < Math.max(ta.length, tb.length); i++) {
+    const x = ta[i], y = tb[i];
+    if (x === undefined) return isPre(tb.slice(i).join("")) ? 1 : -1;
+    if (y === undefined) return isPre(ta.slice(i).join("")) ? -1 : 1;
+    if (/^\d+$/.test(x) && /^\d+$/.test(y)) { if (+x !== +y) return +x - +y; }
+    else if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+// --- what a document is allowed to decide ---------------------------------
+// Everything below arrives in a document this page cannot verify, and two of
+// those values are used to build requests and links. So they are held to
+// their shape first: a mirror base has to be an https URL ending in "/", and
+// a file name has to be a plain relative name. Without that a mirror list
+// could name "javascript:..." and a link on this page would run it, or an
+// index could name an absolute URL and send a visitor somewhere else
+// entirely.
+
+function mirrorBase(url) {
+  let parsed;
+  try {
+    // No base URL on purpose: a mirror list states absolute URLs, and
+    // resolving a relative one against this page would turn a malformed
+    // entry into a request to the bootstrap host, which serves no packages.
+    parsed = new URL(String(url));
+  } catch (failure) {
+    return null;
+  }
+  if (parsed.protocol !== "https:") return null;
+  if (!parsed.pathname.endsWith("/")) return null;
+  if (parsed.search || parsed.hash) return null;
+  return parsed;
+}
+
+const isPlainFileName = (name) =>
+  typeof name === "string" && name.length > 0 && !name.startsWith("/") &&
+  !name.startsWith(".") && !name.includes("..") && !/^[a-z][a-z0-9+.-]*:/i.test(name);
+
+// --- the mirror a source is read from -------------------------------------
+// Selecting a mirror for one source adopts it for the others: mirror lists
+// are per source, so "the same mirror" means the same origin, which is the
+// unit an operator and a visitor both think in. A source keeps a choice of
+// its own once it was made deliberately — adoption only ever fills in the
+// ones nobody decided on.
+
+const storage = {
+  read() {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      const stored = parsed && typeof parsed === "object" ? parsed.sources : null;
+      return stored && typeof stored === "object" ? stored : {};
+    } catch (failure) {
+      // Storage can be absent, full, or switched off. None of that is worth
+      // a message: the page works, it just does not remember.
+      return {};
+    }
+  },
+  write(sources) {
+    try {
+      window.localStorage.setItem(STORAGE_KEY,
+        JSON.stringify({ version: 1, sources }));
+    } catch (failure) {
+      /* nothing to do about it, and nothing depends on it */
+    }
+  },
+};
+
+function rememberChoices() {
+  const sources = {};
+  for (const source of state.sources) {
+    if (source.choice) {
+      sources[source.name] = { url: source.choice.url, explicit: source.choice.explicit };
+    }
+  }
+  storage.write(sources);
+}
+
+const state = {
+  sources: [],
+  rows: [],
+  view: [],
+  enabled: new Set(),           // sources ticked on; a filter you can see, not guess
+  sort: { key: "version", dir: "desc" },
+  page: 0,
+  size: 25,
+};
+
+function freshness(document_) {
+  const expires = Date.parse(document_.expires);
+  if (!expires) return null;
+  const days = Math.floor((expires - Date.now()) / 86400000);
+  if (days < 0) return { className: "bad", text: `expired ${-days} day(s) ago` };
+  if (days < 7) return { className: "warn", text: `expires in ${days} day(s)` };
+  return { className: "ok", text: `valid for ${days} more day(s)` };
+}
+
+// --- the per-source card ---------------------------------------------------
+
+function buildCard(source) {
+  const card = el("div", null, { class: "source" });
+
+  const head = el("div", null, { class: "head" });
+  source.box = el("input", null, { type: "checkbox", id: `src-${source.name}` });
+  source.box.checked = false;
+  source.box.disabled = true;
+  source.box.addEventListener("change", () => {
+    if (source.box.checked) state.enabled.add(source.name);
+    else state.enabled.delete(source.name);
+    state.page = 0;
+    render();
+  });
+  head.append(source.box, el("label", source.title || source.name, { for: `src-${source.name}` }));
+  card.append(head);
+
+  if (source.description) card.append(el("p", source.description));
+
+  source.mirrorLine = el("div", null, { class: "mirror" });
+  card.append(source.mirrorLine);
+
+  source.metaLine = el("p", null, { class: "meta" });
+  card.append(source.metaLine);
+
+  source.linkLine = el("p", null, { class: "meta" });
+  card.append(source.linkLine);
+
+  source.card = card;
+  return card;
+}
+
+function drawMirrorLine(source) {
+  const line = source.mirrorLine;
+  line.replaceChildren();
+
+  if (!source.mirrors || !source.mirrors.length) {
+    line.append(el("span", source.mirrorError || "no mirror list", { class: "bad" }));
+    return;
+  }
+
+  const select = el("select", null, { id: `mirror-${source.name}` });
+  for (const mirror of source.mirrors) {
+    const option = el("option", mirror.label, { value: mirror.url, title: mirror.url });
+    if (source.choice && source.choice.url === mirror.url) option.setAttribute("selected", "");
+    select.append(option);
+  }
+  if (source.choice) select.value = source.choice.url;
+  select.addEventListener("change", () => { chooseMirror(source, select.value, true); });
+
+  line.append(el("label", "Mirror:", { for: `mirror-${source.name}` }), select);
+  if (source.note) line.append(el("span", source.note, { class: source.noteClass || "meta" }));
+}
+
+function drawMeta(source) {
+  const meta = source.metaLine;
+  meta.replaceChildren();
+  const count = (source.rows || []).length;
+  meta.append(el("span", `${count} package${count === 1 ? "" : "s"}`));
+  if (source.index) {
+    meta.append(el("span",
+      `issued ${(source.index.issued || "").replace("T", " ").replace("Z", " UTC")}`));
+    const state_ = freshness(source.index);
+    if (state_) meta.append(el("span", state_.text, { class: state_.className }));
+  }
+
+  const links = source.linkLine;
+  links.replaceChildren();
+  // Two of these are served here, the third only by a mirror — which is the
+  // whole split this host exists for, so the links say where they go.
+  for (const file of ["keys.json", "mirrors.json"]) {
+    const span = el("span");
+    span.append(el("a", file, { href: source.path + file }));
+    links.append(span);
+  }
+  if (source.choice) {
+    const span = el("span");
+    span.append(el("a", "index.json", { href: source.choice.url + "index.json" }));
+    links.append(span);
+  }
+}
+
+// --- reading a source from its mirror --------------------------------------
+
+// An index's entries live in the head and in any parts it names — a part
+// is fetched by the name and hash the head records, so listing only the
+// head would silently under-report a split index.
+async function collect(source, base) {
+  const index = await getJSON(base + "index.json");
+  const documents = [index];
+  for (const part of index.parts || []) {
+    if (!isPlainFileName(part.file)) continue;
+    documents.push(await getJSON(base + part.file));
+  }
+  const rows = [];
+  for (const document_ of documents) {
+    for (const [name, versions] of Object.entries(document_.packages || {})) {
+      for (const [version, entry] of Object.entries(versions)) {
+        // A meta entry names other packages instead of a file — it carries
+        // `meta` and deliberately no `file`/`size` (see "Meta packages"
+        // above). Nothing to fetch, so no href either.
+        const isMeta = Boolean(entry.meta) && !entry.file;
+        const named = !isMeta && isPlainFileName(entry.file);
+        rows.push({
+          source: source.name,
+          name,
+          version,
+          meta: isMeta ? entry.meta : null,
+          size: isMeta ? 0 : (Number(entry.size) || 0),
+          sha256: String(entry.sha256 || ""),
+          href: named ? base + entry.file : null,
+          file: named ? entry.file : null,
+        });
+      }
+    }
+  }
+  return { index, rows };
+}
+
+async function loadSource(source) {
+  source.note = "loading…";
+  source.noteClass = "meta";
+  drawMirrorLine(source);
+
+  source.index = null;
+  source.rows = [];
+  source.box.disabled = true;
+  source.box.checked = false;
+  state.enabled.delete(source.name);
+
+  try {
+    const { index, rows } = await collect(source, source.choice.url);
+    source.index = index;
+    source.rows = rows;
+    source.note = "";
+    source.box.disabled = false;
+    source.box.checked = true;
+    state.enabled.add(source.name);
+    drawMeta(source);
+  } catch (failure) {
+    // Also catches a hostile mirror answering with well-formed JSON that is
+    // not well-formed *data* (e.g. a non-string "issued") — drawMeta reads
+    // the index right after collect() returns it, and a source that broke
+    // there gets the same error box as one whose fetch failed outright,
+    // instead of silently losing its rows.
+    source.index = null;
+    source.rows = [];
+    source.box.disabled = true;
+    source.box.checked = false;
+    state.enabled.delete(source.name);
+    source.note = failure.message;
+    source.noteClass = "bad";
+    drawMeta(source);
+  }
+
+  drawMirrorLine(source);
+  refreshRows();
+}
+
+function refreshRows() {
+  state.rows = state.sources.flatMap((source) => source.rows || []);
+  render();
+}
+
+// Picking a mirror for one source fills the choice in for every other source
+// that has the same mirror and no choice of its own. `deliberate` is what
+// separates the two: a source the visitor picked for keeps its mirror, a
+// source that merely adopted one keeps adopting.
+function chooseMirror(source, url, deliberate) {
+  const mirror = (source.mirrors || []).find((entry) => entry.url === url);
+  if (!mirror) return;
+  const changed = !source.choice || source.choice.url !== url;
+  source.choice = { url: mirror.url, origin: mirror.origin, explicit: Boolean(deliberate) };
+  if (changed) loadSource(source);
+  else drawMirrorLine(source);
+
+  if (!deliberate) return;
+  for (const other of state.sources) {
+    if (other === source || !other.mirrors || !other.mirrors.length) continue;
+    if (other.choice && other.choice.explicit) continue;
+    const match = other.mirrors.find((entry) => entry.origin === mirror.origin);
+    if (!match || (other.choice && other.choice.url === match.url)) continue;
+    other.choice = { url: match.url, origin: match.origin, explicit: false };
+    loadSource(other);
+  }
+  rememberChoices();
+}
+
+// --- the table -------------------------------------------------------------
+
+// Every download goes past the warning first. Right-clicking a link still
+// gets around it, which is why the banner above is permanent rather than
+// something this dialog replaces.
+const dialog = document.getElementById("warn");
+function askBeforeDownloading(event, row) {
+  event.preventDefault();
+  document.getElementById("what").textContent = row.file;
+  const go = document.getElementById("go");
+  go.setAttribute("href", row.href);
+  go.setAttribute("download", row.file);
+  dialog.showModal();
+}
+document.getElementById("cancel").addEventListener("click", () => dialog.close());
+document.getElementById("go").addEventListener("click", () => dialog.close());
+
+function render() {
+  const needle = document.getElementById("q").value.trim().toLowerCase();
+  state.view = state.rows.filter((row) =>
+    state.enabled.has(row.source) &&
+    (!needle || `${row.name} ${row.version} ${row.sha256}`.toLowerCase().includes(needle))
+  );
+
+  const { key, dir } = state.sort;
+  const sign = dir === "asc" ? 1 : -1;
+  state.view.sort((a, b) => sign * (
+    key === "version" ? compareVersion(a.version, b.version)
+    : key === "size" ? a.size - b.size
+    : String(a[key]).localeCompare(String(b[key]))
+  ));
+
+  const size = state.size || state.view.length || 1;
+  const pages = Math.max(1, Math.ceil(state.view.length / size));
+  state.page = Math.min(state.page, pages - 1);
+  const from = state.page * size;
+  const shown = state.view.slice(from, from + size);
+
+  const body = document.getElementById("rows");
+  body.replaceChildren();
+  for (const row of shown) {
+    const tr = el("tr");
+    tr.append(el("td", row.source), el("td", row.name), el("td", row.version));
+    tr.append(row.meta
+      ? el("td", "meta", { class: "num", title: "a meta package: resolves to other packages, nothing to fetch" })
+      : el("td", humanSize(row.size), { class: "num", title: `${row.size} bytes` }));
+
+    const hash = el("td");
+    const code = el("code", row.sha256.slice(0, 12) + "…", {
+      class: "hash", title: row.sha256 + "  (click to copy)",
+    });
+    code.addEventListener("click", () => {
+      navigator.clipboard?.writeText(row.sha256);
+      code.textContent = "copied";
+      setTimeout(() => { code.textContent = row.sha256.slice(0, 12) + "…"; }, 900);
+    });
+    hash.append(code);
+    tr.append(hash);
+
+    const files = el("td");
+    if (row.meta) {
+      // No file to link to — show what the meta entry resolves to instead:
+      // dimension -> coordinate -> concrete package name.
+      const parts = [];
+      for (const [dimension, members] of Object.entries(row.meta)) {
+        for (const [key_, packageName] of Object.entries(members)) {
+          parts.push(`${dimension}=${key_} → ${packageName}`);
+        }
+      }
+      files.append(el("span", parts.join(", "), { title: "resolves to (dimension=coordinate → package)" }));
+    } else if (row.href) {
+      const link = el("a", row.file, { href: row.href });
+      link.addEventListener("click", (event) => askBeforeDownloading(event, row));
+      files.append(link, document.createTextNode(" · "));
+      files.append(el("a", "sha256", { href: row.href + ".sha256" }));
+    } else {
+      files.append(el("span", "the index names no file for this entry", { class: "bad" }));
+    }
+    tr.append(files);
+    body.append(tr);
+  }
+
+  const status = document.getElementById("status");
+  status.hidden = state.view.length > 0;
+  if (!state.view.length) {
+    status.textContent = !state.rows.length
+      ? "Nothing could be read from the mirrors above."
+      : !state.enabled.size
+        ? "Every source is switched off."
+        : "Nothing matches that filter.";
+  }
+
+  const pager = document.getElementById("pager");
+  pager.hidden = pages < 2;
+  document.getElementById("range").textContent =
+    `${from + 1}–${from + shown.length} of ${state.view.length}`;
+  document.getElementById("prev").disabled = state.page === 0;
+  document.getElementById("next").disabled = state.page >= pages - 1;
+
+  for (const th of document.querySelectorAll("th[data-key]")) {
+    if (th.dataset.key === key) th.setAttribute("data-dir", dir);
+    else th.removeAttribute("data-dir");
+  }
+}
+
+// --- loading ---------------------------------------------------------------
+
+async function readMirrors(source) {
+  const document_ = await getJSON(source.path + "mirrors.json");
+  const seen = new Set();
+  const mirrors = [];
+  for (const entry of document_.mirrors || []) {
+    const parsed = mirrorBase(entry && entry.url);
+    if (!parsed || seen.has(parsed.href)) continue;
+    seen.add(parsed.href);
+    mirrors.push({
+      url: parsed.href,
+      origin: parsed.origin,
+      // The host is what a visitor recognises a mirror by; the path is only
+      // shown when it is not the plain "<source>/" everything else uses.
+      label: parsed.pathname === `/${source.name}/` ? parsed.host : parsed.host + parsed.pathname,
+    });
+  }
+  return mirrors;
+}
+
+async function load() {
+  const container = document.getElementById("sources");
+  try {
+    const catalog = await getJSON("sources.json");
+    // Also catches a "sources" that parsed as JSON but is not a list — a
+    // hostile or broken sources.json (a string, a number, an object) makes
+    // "for...of" throw, and without this in the same try the page would be
+    // left stuck on "Loading…" instead of showing the error box below.
+    for (const entry of catalog.sources || []) {
+      if (!entry || typeof entry.name !== "string" || !isPlainFileName(entry.path)) continue;
+      const source = {
+        name: entry.name,
+        title: entry.title,
+        description: entry.description,
+        path: entry.path.endsWith("/") ? entry.path : entry.path + "/",
+        mirrors: [],
+        choice: null,
+        index: null,
+        rows: [],
+      };
+      state.sources.push(source);
+      container.append(buildCard(source));
+    }
+  } catch (failure) {
+    container.append(el("div", `Could not read sources.json: ${failure.message}`, { class: "error" }));
+    render();
+    return;
+  }
+
+  // Mirror lists first, all of them, before anything is read from a mirror:
+  // what a stored choice is checked against is the list that source has now,
+  // and a mirror that has been dropped from it must not be silently used.
+  const remembered = storage.read();
+  await Promise.all(state.sources.map(async (source) => {
+    try {
+      source.mirrors = await readMirrors(source);
+      if (!source.mirrors.length) source.mirrorError = "this source lists no usable mirror";
+    } catch (failure) {
+      source.mirrors = [];
+      source.mirrorError = failure.message;
+    }
+    drawMirrorLine(source);
+    drawMeta(source);
+  }));
+
+  for (const source of state.sources) {
+    if (!source.mirrors.length) continue;
+    const stored = remembered[source.name];
+    const known = stored && source.mirrors.find((entry) => entry.url === stored.url);
+    const chosen = known ? known : source.mirrors[0];
+    source.choice = {
+      url: chosen.url,
+      origin: chosen.origin,
+      // A remembered choice keeps whether it was made deliberately; a
+      // fallback to the first entry is nobody's decision and stays open to
+      // adoption.
+      explicit: Boolean(known && stored.explicit),
+    };
+  }
+
+  render();
+  await Promise.all(state.sources
+    .filter((source) => source.choice)
+    .map((source) => loadSource(source)));
+}
+
+document.getElementById("q").addEventListener("input", () => { state.page = 0; render(); });
+document.getElementById("size").addEventListener("change", (event) => {
+  state.size = Number(event.target.value); state.page = 0; render();
+});
+document.getElementById("prev").addEventListener("click", () => { state.page--; render(); });
+document.getElementById("next").addEventListener("click", () => { state.page++; render(); });
+for (const th of document.querySelectorAll("th[data-key]")) {
+  th.addEventListener("click", () => {
+    const key = th.dataset.key;
+    state.sort = { key, dir: state.sort.key === key && state.sort.dir === "desc" ? "asc" : "desc" };
+    state.page = 0;
+    render();
+  });
+}
+load();
+</script>
 </body>
 </html>

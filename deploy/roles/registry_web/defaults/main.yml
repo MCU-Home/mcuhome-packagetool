@@ -38,10 +38,62 @@ registry_web_mirror_sync_enabled: true
 # role does not switch that on for somebody else's server.
 registry_web_autoindex: false
 
-# What the bootstrap vhost answers at "/". Empty means 404, which is the
-# honest answer: the bootstrap host serves documents, not pages. Set it
-# to a URL to redirect a browser to the mirror that has the pages.
+# How a listing looks. With this on, nginx emits its listing as XML and
+# an XSLT stylesheet in the server turns it into a page — server-side, so
+# a listing needs no JavaScript and loads nothing. It needs the xslt
+# filter module in the image; the official nginx images ship it as a
+# dynamic module, and an image without it needs this off.
+registry_web_autoindex_xslt: true
+
+# The stylesheet used for that. Empty means the one this role ships,
+# rendered from templates/autoindex.xslt.j2 (see
+# registry_web_autoindex_footer_html below); set it to a file of your own
+# to render listings differently — that one is copied verbatim, with no
+# templating applied.
+registry_web_autoindex_stylesheet: ""
+
+# Extra footer content on a rendered directory listing, inserted right
+# after the "This mirror" link that is always there. Raw HTML, appended
+# as-is (no escaping) — it is meant for a link or two, not for arbitrary
+# markup from an untrusted source. Empty means the footer has nothing
+# beyond that one link: a generic deployment has no opinion on what else
+# belongs there. Only applies to the shipped stylesheet; a stylesheet
+# named by registry_web_autoindex_stylesheet decides its own footer.
+registry_web_autoindex_footer_html: ""
+
+# Where the xslt filter module is, as nginx resolves it: relative to the
+# configuration prefix, which is /etc/nginx in the official images.
+registry_web_xslt_module: modules/ngx_http_xslt_filter_module.so
+
+# The page served at exactly "/" on the full-tree vhost, as a path on the
+# machine running Ansible. It is installed beside the configuration and
+# is deliberately NOT part of the registry tree: a mirror copies the
+# tree, and a page belongs to the host that serves it. Empty means "/"
+# is answered like any other directory — a listing, or a 404 with
+# listings off.
+registry_web_tree_index_page: ""
+
+# The page served at exactly "/" on the bootstrap vhost, same rules. A
+# bootstrap host answers with signed documents, so this is the one place
+# a browser has anything to look at. Empty means 404 (or a redirect, see
+# below).
+registry_web_bootstrap_page: ""
+
+# What the bootstrap vhost answers at "/" when it serves no page of its
+# own. Empty means 404, which is the honest answer for a host that serves
+# documents. Set it to a URL to redirect a browser to a mirror instead.
+# Ignored when registry_web_bootstrap_page is set — the two are two
+# answers to one question, and the role refuses both at once.
 registry_web_bootstrap_redirect: ""
+
+# Whether the JSON documents of the full tree may be read by a browser
+# from another host, and by which one. A mirror needs this: the pages
+# live on the bootstrap host and the data on the mirrors, so the page's
+# requests are cross-origin. "*" is the right value for a public registry
+# — every one of those documents is fetchable with curl by anyone — and
+# empty switches the header off. It is never set on the bootstrap vhost,
+# whose documents the page reads from its own origin.
+registry_web_cors_origin: ""
 
 # Cache lifetimes. The long one is for files that can never change under
 # their name — package files, content-named index parts, archived key
@@ -53,6 +105,12 @@ registry_web_default_max_age: 300
 # Where the generated configuration goes on the host.
 registry_web_config_dir: /etc/packagetool
 registry_web_config_path: /etc/packagetool/nginx.conf
+
+# Where the files the web server serves from outside the tree go: the two
+# pages and the listing stylesheet. A directory of its own, because it is
+# bind-mounted into the container and the configuration directory holds
+# the publisher keys' directory beside it.
+registry_web_assets_dir: /etc/packagetool/web
 
 # The systemd unit and the container it runs.
 registry_web_service: packagetool-web

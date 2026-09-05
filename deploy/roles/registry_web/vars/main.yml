@@ -1,0 +1,57 @@
+---
+# SPDX-FileCopyrightText: 2026 The MCUHome Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Derived values, not settings. Everything a deployment may set is in
+# defaults/main.yml.
+
+# The files the web server serves from outside the registry tree, with
+# the name each of them gets on the host. The names are fixed: the
+# generated configuration names them, and one of them is compiled while
+# nginx loads that configuration.
+#
+# The listing stylesheet is deliberately NOT in this list when the
+# default (shipped) one is in use: that one is not copied but rendered
+# from templates/autoindex.xslt.j2, so its footer can carry a deployment's
+# own links (registry_web_autoindex_footer_html). It only appears here
+# when registry_web_autoindex_stylesheet names a file of the caller's own
+# to copy verbatim instead.
+registry_web_assets: >-
+  {{
+    ([{'name': 'tree-index.html', 'src': registry_web_tree_index_page}]
+     if registry_web_tree_index_page | default('', true) | length > 0 else [])
+    + ([{'name': 'bootstrap-index.html', 'src': registry_web_bootstrap_page}]
+       if registry_web_bootstrap_page | default('', true) | length > 0 else [])
+    + ([{'name': 'autoindex.xslt', 'src': registry_web_autoindex_stylesheet}]
+       if (registry_web_autoindex | bool and registry_web_autoindex_xslt | bool
+           and registry_web_autoindex_stylesheet | default('', true) | length > 0) else [])
+  }}
+
+# Whether the shipped default stylesheet needs rendering this run: listings
+# are on, the xslt filter is in use, and the caller did not point
+# registry_web_autoindex_stylesheet at a file of their own.
+registry_web_autoindex_default_stylesheet: >-
+  {{
+    registry_web_autoindex | bool and registry_web_autoindex_xslt | bool
+    and not (registry_web_autoindex_stylesheet | default('', true) | length > 0)
+  }}
+
+# Everything the role can install there. What is not in the list above is
+# removed, so switching a page or the stylesheet off really takes it off
+# the machine instead of leaving a file the configuration no longer names.
+registry_web_asset_names:
+  - tree-index.html
+  - bootstrap-index.html
+  - autoindex.xslt
+
+# Names that should exist on disk this run, regardless of which mechanism
+# put them there (copied verbatim, or rendered as the default stylesheet).
+# Used only to decide what to remove — kept separate from registry_web_assets
+# because that list drives ansible.builtin.copy specifically.
+registry_web_asset_present_names: >-
+  {{
+    (['tree-index.html'] if registry_web_tree_index_page | default('', true) | length > 0 else [])
+    + (['bootstrap-index.html'] if registry_web_bootstrap_page | default('', true) | length > 0 else [])
+    + (['autoindex.xslt']
+       if (registry_web_autoindex | bool and registry_web_autoindex_xslt | bool) else [])
+  }}

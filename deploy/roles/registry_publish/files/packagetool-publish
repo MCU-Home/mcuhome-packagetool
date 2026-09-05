@@ -33,8 +33,8 @@
 #   download        the publishing account   assets and their checksums
 #   record          the publishing account   packagetool add/add-meta,
 #                                            signing with the publisher key
-#   assemble        the publishing account   pages, extra tree files,
-#                                            sources.json
+#   assemble        the publishing account   the tree files above the
+#                                            sources, sources.json
 #   verify          the publishing account   verify.py per source
 #   publish         root                     packagetool-snapshot
 #   dumps           root                     packagetool-mirror-sync
@@ -47,11 +47,12 @@
 # root, and neither of them can be reached with anything a download
 # influenced.
 #
-# The files that are not part of any source — the pages, the trust anchor,
-# the generated source catalogue — are assembled into the working tree
-# above the sources, and the snapshot command copies them into the tree it
+# The files that are not part of any source — the trust anchor and the
+# generated source catalogue — are assembled into the working tree above
+# the sources, and the snapshot command copies them into the tree it
 # composes. They are the one part of the served tree that is not inside a
-# source.
+# source. Pages are not among them: the tree is what a mirror copies, and
+# the pages belong to the server that serves it.
 #
 # Idempotent by construction. A version already recorded in a source is
 # never recorded again (and the tool would refuse: a published version is
@@ -116,7 +117,6 @@ registry_publish_python=/opt/packagetool/venv/bin/python
 registry_publish_checkout_dir=/opt/packagetool/checkout
 registry_publish_publishing_config=
 registry_publish_anchor=
-registry_publish_pages_dir=
 registry_publish_tree_files=
 registry_publish_keys_dir=/etc/packagetool/publisher-keys
 registry_publish_github_api=https://api.github.com
@@ -818,21 +818,11 @@ install_tree_file() {
 }
 
 assemble_tree() {
-  local page file generated
+  local file generated
 
-  if [ -n "$registry_publish_pages_dir" ]; then
-    [ -d "$registry_publish_pages_dir" ] ||
-      die "$EXIT_PRECONDITION" "$registry_publish_pages_dir is not there"
-    while IFS= read -r page; do
-      [ -n "$page" ] || continue
-      install_tree_file "$page" "$working_dir/$(basename "$page")"
-    done < <(find "$registry_publish_pages_dir" -mindepth 1 -maxdepth 1 -type f |
-      LC_ALL=C sort)
-  fi
-
-  # Everything else the served tree carries that is not a source: the
-  # trust anchor above all, which is published so a mirror operator can
-  # compare it against the one their tool already has.
+  # Everything the served tree carries that is not a source: the trust
+  # anchor above all, which is published so a mirror operator can compare
+  # it against the one their tool already has.
   for file in $registry_publish_tree_files; do
     install_tree_file "$file" "$working_dir/$(basename "$file")"
   done

@@ -15,10 +15,13 @@
       - registry_web_image | default('', true) | length > 0
       - registry_web_listen_address | default('', true) | length > 0
       - registry_web_ports | unique | length == registry_web_ports | length
+      - not (registry_web_bootstrap_page | default('', true) | length > 0
+             and registry_web_bootstrap_redirect | default('', true) | length > 0)
     fail_msg: >-
       registry_root must be an absolute path, registry_web_image and
-      registry_web_listen_address must be set, and the vhost ports must
-      differ from each other.
+      registry_web_listen_address must be set, the vhost ports must
+      differ from each other, and the bootstrap vhost answers "/" with
+      either a page or a redirect, not with both.
     quiet: true
   vars:
     registry_web_ports:
@@ -33,6 +36,52 @@
     owner: root
     group: root
     mode: "0755"
+
+- name: Create the asset directory
+  ansible.builtin.file:
+    path: "{{ registry_web_assets_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Before the configuration is written, because the configuration names
+# them and because nginx compiles the stylesheet while it reads the
+# configuration — the check that follows the template step would fail on
+# a stylesheet that is not there yet. The stylesheet itself is handled by
+# the next task instead when the shipped default is in use; see there.
+- name: Install what the web server serves from outside the tree
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ registry_web_assets_dir }}/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ registry_web_assets }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: registry_web_assets_installed
+
+# The shipped default stylesheet is rendered rather than copied, so its
+# footer can carry a deployment's own links
+# (registry_web_autoindex_footer_html) without forking the file. A caller
+# who points registry_web_autoindex_stylesheet at a file of their own gets
+# that one copied verbatim above instead, and this step does nothing.
+- name: Render the shipped listing stylesheet
+  ansible.builtin.template:
+    src: autoindex.xslt.j2
+    dest: "{{ registry_web_assets_dir }}/autoindex.xslt"
+    owner: root
+    group: root
+    mode: "0644"
+  when: registry_web_autoindex_default_stylesheet | bool
+  register: registry_web_default_stylesheet_installed
+
+- name: Remove what this registry does not serve
+  ansible.builtin.file:
+    path: "{{ registry_web_assets_dir }}/{{ item }}"
+    state: absent
+  loop: "{{ registry_web_asset_names | difference(registry_web_asset_present_names) }}"
 
 # Pulled here rather than by the unit: a server that is restarted or
 # rebooted must come up with the image it was running, not with whatever
@@ -69,8 +118,13 @@
     validate: "{{ registry_web_validate_command if registry_web_validate_config | bool else omit }}"
   register: registry_web_config
   vars:
+    # The asset directory is mounted for the check as well: nginx reads
+    # and compiles the listing stylesheet while it loads the
+    # configuration, so a check without it would refuse a configuration
+    # the server will run perfectly.
     registry_web_validate_command: >-
       {{ registry_web_docker }} run --rm --volume %s:/etc/nginx/nginx.conf:ro
+      --volume {{ registry_web_assets_dir }}:{{ registry_web_assets_dir }}:ro
       --entrypoint nginx {{ registry_web_image }} -t -c /etc/nginx/nginx.conf
 
 - name: Write the web server unit
@@ -96,7 +150,10 @@
   ansible.builtin.systemd_service:
     name: "{{ registry_web_service }}.service"
     state: restarted
-  when: registry_web_config is changed or registry_web_unit is changed
+  when: >-
+    registry_web_config is changed or registry_web_unit is changed
+    or registry_web_assets_installed is changed
+    or registry_web_default_stylesheet_installed is changed
 
 - name: Wait for the full tree vhost
   ansible.builtin.wait_for:
@@ -113,6 +170,29 @@
     url: http://{{ registry_web_listen_address }}:{{ registry_web_tree_port }}/
     method: HEAD
     status_code: [200, 403, 404]
+
+# The pages are served through an alias out of a directory that is
+# mounted into the container, so "the file was copied" is not the same
+# statement as "the server hands it out". Only asked where a page was
+# configured; 200 is then the only acceptable answer, and it needs
+# nothing to have been published.
+- name: Check the tree vhost serves its page at the root
+  ansible.builtin.uri:
+    url: http://{{ registry_web_listen_address }}:{{ registry_web_tree_port }}/
+    method: GET
+    return_content: false
+    status_code: 200
+  when: registry_web_tree_index_page | default('', true) | length > 0
+
+- name: Check the bootstrap vhost serves its page at the root
+  ansible.builtin.uri:
+    url: http://{{ registry_web_listen_address }}:{{ registry_web_bootstrap_port }}/
+    method: GET
+    return_content: false
+    status_code: 200
+  when: >-
+    registry_web_bootstrap_enabled | bool
+    and registry_web_bootstrap_page | default('', true) | length > 0
 
 # The bootstrap vhost serves an allow list, so what proves it is
 # configured is a path that is not on the list being refused. This one

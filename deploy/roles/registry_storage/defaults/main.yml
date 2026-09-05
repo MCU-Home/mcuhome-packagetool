@@ -47,7 +47,7 @@ registry_storage_sources: []
 # by the role and must not be listed here.
 #
 #   noatime         a read from a mirror or a client should not write
-#   compress=zstd:3 the index documents and pages compress well; btrfs
+#   compress=zstd:3 the index documents compress well; btrfs
 #                   skips data it finds incompressible, so the already
 #                   compressed package files cost little
 #   nodev,nosuid    nothing under the registry root is ever a device or

@@ -40,6 +40,7 @@ ExecStart={{ registry_web_docker }} run --rm --name {{ registry_web_container }}
     --log-driver none \
     --volume {{ registry_root }}:{{ registry_root }}:ro \
     --volume {{ registry_web_config_path }}:/etc/nginx/nginx.conf:ro \
+    --volume {{ registry_web_assets_dir }}:{{ registry_web_assets_dir }}:ro \
     --entrypoint nginx \
     {{ registry_web_image }} -g "daemon off;"
 ExecStop={{ registry_web_docker }} stop --time 20 {{ registry_web_container }}

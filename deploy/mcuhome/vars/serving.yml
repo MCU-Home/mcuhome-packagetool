@@ -16,6 +16,11 @@
 # Values are spelled out even where they match a role default: this file
 # is what the running registry is, and a changed default in a role must
 # not quietly change a live server.
+#
+# One value has to come from outside: `packagetool_repo_dir`, where this
+# repository is checked out on the machine running Ansible. The pages
+# below are files of this repository, and only the playbook knows where
+# it found this file.
 
 # --- the web server -------------------------------------------------------
 
@@ -33,15 +38,49 @@ registry_web_mirror_sync_enabled: true
 
 # Directory listings on the mirror. The registry is a plain file tree,
 # the landing page links into it, and there is nothing in it that is not
-# published on purpose.
+# published on purpose. Rendered server-side from nginx's XML listing by
+# the stylesheet the role ships, so browsing costs a visitor no script.
 registry_web_autoindex: true
+registry_web_autoindex_xslt: true
 
-# What the bootstrap host answers at "/": nothing. It serves the
-# documents a client needs to find a mirror, and a browser that arrives
-# there is looking for the pages, which live on the mirror. Set this to
-# the mirror's URL if that 404 turns out to be the wrong answer for
-# people.
+# The generic stylesheet's footer names nothing beyond "This mirror" by
+# default; this is what MCUHome adds to it — the canonical origin and the
+# tool that built the tree being browsed. A leading space, since it is
+# appended right after that link with nothing in between.
+registry_web_autoindex_footer_html: "\
+  \ · <a href=\"https://packages.mcuhome.org/\">packages.mcuhome.org</a> ·\
+  \ <a href=\"https://github.com/mcu-home/mcuhome-packagetool\">mcuhome-packagetool</a>"
+
+# The two pages, out of this repository's pages/ directory — paths on the
+# machine that runs Ansible, not on the server. A vars file cannot know
+# where it was read from, so the playbook says where this repository is
+# checked out.
+#
+#   mirror-index.html  the root of the mirror: what this host is, and the
+#                      sources it carries, read from its own sources.json
+#   index.html         the root of the bootstrap host: what the registry
+#                      is, how a copy of it is verified, and the browser
+#                      over the mirrors each source names
+#
+# Neither is part of the registry tree. The tree is what a mirror copies,
+# and a page belongs to the host that serves it — a third party mirroring
+# by rsync alone gets the files and no pages at all, and gets a page of
+# its own by using these roles.
+registry_web_tree_index_page: "{{ packagetool_repo_dir }}/pages/mirror-index.html"
+registry_web_bootstrap_page: "{{ packagetool_repo_dir }}/pages/index.html"
+
+# Unused: the bootstrap host answers "/" with the page above rather than
+# by sending a browser somewhere else. The two cannot both be set.
 registry_web_bootstrap_redirect: ""
+
+# The mirror's JSON documents are readable by browsers from any origin.
+# The page that needs it is served by packages.mcuhome.org and reads the
+# index of whichever mirror a visitor picked, which is a different origin
+# by definition. Every document it applies to is public: signed,
+# unauthenticated, and fetchable with curl by anyone. It is set on the
+# full-tree vhost only — the bootstrap host's documents are read from the
+# page's own origin.
+registry_web_cors_origin: "*"
 
 registry_web_immutable_max_age: 31536000
 registry_web_default_max_age: 300

@@ -166,7 +166,7 @@ registry="$mount_point/registry"
 make_registry "$registry" alpha beta
 echo "alpha one" >"$registry/working/alpha/data"
 echo "beta one" >"$registry/working/beta/data"
-echo "index one" >"$registry/working/index.html"
+echo "index one" >"$registry/working/top.txt"
 
 run_tool --config "$registry/snapshot.conf"
 same "exit code" "$rc" 0
@@ -181,7 +181,7 @@ case $target in
 esac
 same "the served tree carries alpha" "$(cat "$registry/current/alpha/data")" "alpha one"
 same "and beta" "$(cat "$registry/current/beta/data")" "beta one"
-same "and the file above them" "$(cat "$registry/current/index.html")" "index one"
+same "and the file above them" "$(cat "$registry/current/top.txt")" "index one"
 same "one snapshot of alpha" "$(snapshot_count "$registry" alpha)" 1
 same "one snapshot of beta" "$(snapshot_count "$registry" beta)" 1
 same "one tree" "$(tree_count "$registry")" 1
@@ -199,7 +199,7 @@ if echo "tampered" 2>/dev/null >"$registry/current/alpha/data"; then
 else
   ok "the source in the served tree is read-only"
 fi
-if echo "tampered" 2>/dev/null >"$registry/current/index.html"; then
+if echo "tampered" 2>/dev/null >"$registry/current/top.txt"; then
   bad "the file above the sources is read-only too"
 else
   ok "the file above the sources is read-only too"
@@ -236,13 +236,13 @@ same "the manifest names beta's old snapshot" \
 # --- a file above the sources changes on its own ---------------------
 
 note "only a file above the sources changes"
-echo "index two" >"$registry/working/index.html"
+echo "index two" >"$registry/working/top.txt"
 run_tool --config "$registry/snapshot.conf"
 same "exit code" "$rc" 0
 same "no source was snapshotted for it" \
   "$(snapshot_count "$registry" alpha)$(snapshot_count "$registry" beta)" "21"
 same "but a tree was composed" "$(tree_count "$registry")" 3
-same "and it serves the new file" "$(cat "$registry/current/index.html")" "index two"
+same "and it serves the new file" "$(cat "$registry/current/top.txt")" "index two"
 same "with the sources unchanged" "$(cat "$registry/current/alpha/data")" "alpha two"
 third_tree="$(readlink "$registry/current")"
 
@@ -286,7 +286,7 @@ same "beta caught up" "$(cat "$registry/current/beta/data")" "beta two"
 note "a tree left behind by a run that was interrupted"
 partial="$registry/trees/tree-19700101T000000Z"
 btrfs subvolume create "$partial" >/dev/null
-echo "half a tree" >"$partial/index.html"
+echo "half a tree" >"$partial/top.txt"
 before_trees="$(tree_count "$registry")"
 run_tool --config "$registry/snapshot.conf"
 same "exit code" "$rc" 0
@@ -444,11 +444,11 @@ note "retention, the docroot pointing at a tree beyond the count bound"
 served="$mount_point/served"
 make_registry "$served" alpha
 echo "one" >"$served/working/alpha/data"
-echo "top one" >"$served/working/index.html"
+echo "top one" >"$served/working/top.txt"
 run_tool --config "$served/snapshot.conf"
 same "exit code" "$rc" 0
 older_tree="$(readlink "$served/current")"
-echo "top two" >"$served/working/index.html"
+echo "top two" >"$served/working/top.txt"
 run_tool --config "$served/snapshot.conf"
 same "exit code" "$rc" 0
 same "two trees over one snapshot" \
@@ -458,7 +458,7 @@ same "two trees over one snapshot" \
 # what a tree holds above its sources is compared the same way a source
 # is, by metadata, so "the same bytes written again" is a change and this
 # has to be the same file.
-cp --preserve=timestamps "$served/$older_tree/index.html" "$served/working/index.html"
+cp --preserve=timestamps "$served/$older_tree/top.txt" "$served/working/top.txt"
 rm "$served/current"
 ln -s "$older_tree" "$served/current"
 run_tool --config "$served/snapshot.conf" --keep-trees 1

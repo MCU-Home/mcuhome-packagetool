@@ -42,8 +42,8 @@
 #
 #   <root>/working/           what is being prepared, never served
 #   <root>/working/<source>   one btrfs subvolume per source
-#   <root>/working/<file>     the files above the sources (pages, the
-#                             source catalogue, the trust anchor)
+#   <root>/working/<file>     the files above the sources (the source
+#                             catalogue, the trust anchor)
 #   <root>/snapshots/<source>/snapshot-<ts>
 #                             the read-only snapshots of one source
 #   <root>/trees/tree-<ts>/   a served composition: one snapshot copy per

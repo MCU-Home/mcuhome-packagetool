@@ -32,12 +32,11 @@ registry_publish_venv_dir: /opt/packagetool/venv
 
 # --- what this registry publishes ----------------------------------------
 
-# Out of the checkout, so the tool, the reference verifier, the pages and
-# the configuration that says which release feeds which source are all
-# one version of one tree.
+# Out of the checkout, so the tool, the reference verifier and the
+# configuration that says which release feeds which source are all one
+# version of one tree.
 registry_publish_publishing_config: /opt/packagetool/checkout/deploy/mcuhome/publishing.json
 registry_publish_anchor: /opt/packagetool/checkout/deploy/mcuhome/anchor.json
-registry_publish_pages_dir: /opt/packagetool/checkout/pages
 
 # The anchor is served as well as used. A mirror operator or an auditor
 # compares it against the one their tool already carries — comparing is
