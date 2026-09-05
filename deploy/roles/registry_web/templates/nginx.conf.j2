@@ -9,12 +9,23 @@ with every rule spelled out.
 #}
 {% macro immutable() %}
             # Immutable: the name can never stand for different bytes.
-            add_header Cache-Control "public, max-age={{ registry_web_immutable_max_age }}, immutable" always;
+            # Deliberately WITHOUT "always": with it, nginx also attaches
+            # this header to error responses (notably 404), and a client
+            # or an intermediary that probes a not-yet-published name
+            # would then cache "not here" for a year and never see the
+            # file once it exists. Without "always", nginx only sends the
+            # header on 2xx/3xx, which is exactly the set of responses
+            # for which "this name is permanent" is true.
+            add_header Cache-Control "public, max-age={{ registry_web_immutable_max_age }}, immutable";
 {%- endmacro %}
 {% macro revalidate() %}
             # Always revalidated: this document is replaced in place, and
             # a stale copy is exactly what the freshness rules exist to
-            # catch.
+            # catch. "always" is safe and wanted here even on error
+            # responses: "no-cache" does not forbid storing the response,
+            # it only forbids serving it again without asking first, so a
+            # cached 404 is re-checked on the very next request instead of
+            # being served stale for any length of time.
             add_header Cache-Control "no-cache" always;
 {%- endmacro %}
 {% macro tree_server_head(port) %}
@@ -172,6 +183,11 @@ http {
 
         # --- everything else --------------------------------------------
         location / {
+            # Short-lived by design (5 min default), so "always" is fine
+            # here even on a 404: this is also the conservative fallback
+            # for a not-yet-published name that falls through to this
+            # location — a client caches "not here" for minutes, not a
+            # year, and sees the file soon after it appears.
             add_header Cache-Control "public, max-age={{ registry_web_default_max_age }}" always;
         }
     }
