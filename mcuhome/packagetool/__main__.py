@@ -4,8 +4,9 @@
 
 Everything an operator or a workflow does to a source goes through here,
 so that "how a document is written" has exactly one implementation. What
-a *client* does with the result is ``verify.py``, deliberately separate
-and deliberately standalone.
+a *client* does with the result is :mod:`mcuhome.packagetool.verify`,
+deliberately separate: nothing here can talk a verifier into a verdict,
+and nothing there needs the publishing side to reach one.
 
 Commands:
 

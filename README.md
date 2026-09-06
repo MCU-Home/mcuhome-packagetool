@@ -8,8 +8,8 @@ signature, not by trusting a URL.
 
 ## What this repository holds
 
-- `mcuhome/packagetool/` — the publishing tool: it lays a source down, records a package, renews the publisher-signed documents and reports how much validity is left.
-- `verify.py` — the normative reference verifier, standalone so it can be copied next to a mirrored source and run with the standard library and `cryptography`.
+- `mcuhome/packagetool/` — the publishing tool: it lays a source down, records a package, renews the publisher-signed documents and reports how much validity is left. `mcuhome/packagetool/verify.py` in it is the normative reference verifier: the rules a client must reach the same verdicts by, importable so that other MCUHome tools run them rather than transcribe them.
+- `verify.py` — the command line over that verifier. It decides nothing itself; run it from a checkout whose `.venv` has this repository installed.
 - `pages/` — the two pages a registry host serves: `index.html`, the page of the bootstrap host, which explains the registry and browses it over the mirrors each source names; and `mirror-index.html`, the page at the root of a mirror. They are installed by the deploy roles beside the served tree, never into it, and are not this repository's own presentation.
 - `deploy/` — the Ansible roles that turn a server into a registry host, and under `deploy/mcuhome/` the settings, source declarations and trust anchor the public MCUHome registry is run with.
 
@@ -167,7 +167,7 @@ Three rules hold, and both sides check them from the index alone:
 
 - **The hash.** It is the SHA-256 of the UTF-8 [RFC 8785][jcs] canonical
   JSON of the `meta` object with every leaf replaced by that package's
-  `{"name", "sha256"}`. `verify.py` recomputes it and refuses on a
+  `{"name", "sha256"}`. The verifier recomputes it and refuses on a
   mismatch — a meta entry is never believed.
 - **The version invariant.** A meta package at version V exists exactly when
   every one of its members exists at V; the meta version *is* its members'
@@ -208,7 +208,7 @@ compromise through
 
 ## Documentation
 
-- [`verify.py`](verify.py) — what a client must check, in executable form
+- [`mcuhome/packagetool/verify.py`](mcuhome/packagetool/verify.py) — what a client must check, in executable form; [`verify.py`](verify.py) is the command line over it
 - [`mcuhome/packagetool/`](mcuhome/packagetool/) — the publishing tool, documented module by module
 - [`deploy/`](deploy/) — hosting a registry: the roles, the tree they lay down, and how a publish is made atomic
 - [packages.mcuhome.org](https://packages.mcuhome.org/) — the bootstrap host: where a client asks which mirrors a source has, and the page that explains the registry and browses what is published

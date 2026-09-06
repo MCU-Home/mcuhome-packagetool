@@ -47,9 +47,12 @@ dev = [
 
 [tool.setuptools]
 packages = ["mcuhome.packagetool"]
-# The reference verifier is a single top-level file on purpose (see its
-# docstring): copyable next to a mirrored directory, importable here.
-py-modules = ["verify"]
+# `verify.py` at the root is the command line and is deliberately not
+# installed: other MCUHome tools depend on this distribution for the
+# verifier, and shipping a top-level module called `verify` into their
+# environments would claim a name this project has no business claiming.
+# The rules themselves are `mcuhome.packagetool.verify`, installed with
+# the rest of the package; the command line is run from a checkout.
 
 [tool.ruff]
 line-length = 100
