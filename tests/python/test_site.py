@@ -92,6 +92,53 @@ def test_every_source_declares_the_packages_it_carries(publishing: dict) -> None
             )
 
 
+def test_sources_fed_from_one_repository_declare_which_release_kind_is_theirs(
+    publishing: dict,
+) -> None:
+    """Three sources, one upstream repository, three independently numbered lines.
+
+    The SDK, the build workspace and the build tools are released from
+    `mcuhome-sdk` under tags of their own (`v…`, `workspace-v…`,
+    `tools-v…`), and each line counts on its own — so two of them will
+    sooner or later offer the same version. A source that did not say
+    which kind of release is its own would take whichever release
+    happened to carry a file name matching its asset pattern, and the
+    pipeline refuses outright when two of them do.
+    """
+    by_repository: dict[str, list[str]] = {}
+    for name, entry in publishing["sources"].items():
+        by_repository.setdefault(entry["repository"], []).append(name)
+    for repository, names in by_repository.items():
+        if len(names) < 2:
+            continue
+        patterns = {}
+        for name in names:
+            pattern = publishing["sources"][name].get("tag")
+            assert pattern, (
+                f"{name}: {repository} feeds more than one source, so this one has to say "
+                "which release tags are its own"
+            )
+            assert pattern not in patterns, (
+                f"{name} and {patterns[pattern]} both claim the tags {pattern}"
+            )
+            patterns[pattern] = name
+
+
+def test_every_build_environment_source_requires_a_meta_file(publishing: dict) -> None:
+    """What the three packages of the build environment are resolved through.
+
+    A build resolves the chain SDK → workspace → tools by reading each
+    stage's ``requires`` out of its meta file. A version published without
+    one is a hole in that chain that is only noticed by whoever tries to
+    resolve through it, so the sources say up front that they carry none
+    such and the pipeline stops at the release instead.
+    """
+    for name, entry in publishing["sources"].items():
+        assert entry.get("meta_file_required") is True, (
+            f"{name}: every package this registry carries brings its meta file"
+        )
+
+
 def test_a_declared_meta_package_names_packages_the_source_carries(publishing: dict) -> None:
     """The shape the publish pipeline turns into ``add-meta`` arguments.
 

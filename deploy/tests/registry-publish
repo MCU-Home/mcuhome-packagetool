@@ -16,7 +16,12 @@
 #
 # What is checked: an empty working tree gets the anchor and the
 # catalogue and is published; new releases are discovered, fetched,
-# checked against their sidecars, recorded, signed and verified; a family
+# checked against their sidecars, recorded, signed and verified; each
+# source takes only the releases of its own kind, so an archive offered
+# by a release the configuration does not point that source at is left
+# alone; a package's meta file travels with it into the source and into
+# the index, and a source that requires one stops the run where a release
+# publishes none; a family
 # of per-architecture packages gets its meta package once every member is
 # there; a source whose subvolume is there but which has never been laid
 # down is reported and skipped rather than failing the run or being
@@ -288,13 +293,36 @@ done
 base="http://127.0.0.1:$port"
 note "stand-in forge on $base"
 
-# One release asset: a file with content, its checksum sidecar, and the
-# entry the release listing carries for it.
+# One release asset: a file with content and the two sidecars a release
+# publishes beside an archive — the checksum, and the meta file that says
+# what the package is and what it requires. The meta file is derived from
+# the asset's own name, because that is the relation the tool checks: a
+# meta file next to an archive it does not describe is refused.
+#
+# A fourth argument of "no" leaves the meta file out, which is how a
+# release that publishes none is staged.
 make_asset() {
-  local tag=$1 name=$2 content=$3
+  local tag=$1 name=$2 content=$3 meta=${4:-yes}
+  local stem package version architecture=null
   mkdir -p "$forge/assets/$tag"
   printf '%s' "$content" >"$forge/assets/$tag/$name"
   (cd "$forge/assets/$tag" && sha256sum "$name" >"$name.sha256")
+  [ "$meta" = yes ] || return 0
+
+  stem=${name%.tar.zst}
+  version=${stem##*-}
+  package=${stem%-"$version"}
+  case $package in
+  *_*) architecture="\"${package#*_}\"" ;;
+  esac
+  jq -n --arg n "$package" --arg v "$version" --argjson a "$architecture" \
+    --arg i "$(printf '%s' "$content" | sha256sum | cut -d' ' -f1)" \
+    '{schema: 1,
+      package: {name: $n, version: $v, architecture: $a},
+      requires: {"test-tools": "~=1.0"},
+      inputs_sha256: $i,
+      contents: {"x-what-the-producer-knows": $n}}' \
+    >"$forge/assets/$tag/$name.meta.json"
 }
 
 # The release listing, built from a list of "<tag>:<prerelease>:<draft>"
@@ -326,15 +354,17 @@ cat >"$publishing" <<'EOF'
 {
   "sources": {
     "absent": {
-      "description": "A source that has never been laid down.",
+      "description": "A source that has never been laid down, and that declares no release kind — every tag is looked at, the way a repository with one kind of release is read.",
       "packages": [{"asset": "test-absent-*.tar.zst", "name": "test-absent"}],
       "repository": "testowner/testrepo",
       "title": "Absent"
     },
     "sdk": {
       "description": "One package, no family.",
+      "meta_file_required": true,
       "packages": [{"asset": "test-sdk-*.tar.zst", "name": "test-sdk"}],
       "repository": "testowner/testrepo",
+      "tag": "v*",
       "title": "Test SDK"
     },
     "tools": {
@@ -348,15 +378,17 @@ cat >"$publishing" <<'EOF'
         },
         "name": "test-tools"
       },
+      "meta_file_required": true,
       "packages": [
         {"asset": "test-tools_linux-amd64-*.tar.zst", "name": "test-tools_linux-amd64"},
         {"asset": "test-tools_linux-arm64-*.tar.zst", "name": "test-tools_linux-arm64"}
       ],
       "repository": "testowner/testrepo",
+      "tag": "tools-v*",
       "title": "Test tools"
     }
   },
-  "version": 3
+  "version": 4
 }
 EOF
 
@@ -432,11 +464,15 @@ recorded() {
 
 note "a first publish"
 make_asset v1.0.0 test-sdk-1.0.0.tar.zst "sdk one"
-make_asset v1.0.0 test-tools_linux-amd64-1.0.0.tar.zst "tools amd64 one"
-make_asset v1.0.0 test-tools_linux-arm64-1.0.0.tar.zst "tools arm64 one"
-printf '{"declared": true}' >"$forge/assets/v1.0.0/test-sdk-1.0.0.tar.zst.build-environment.json"
+make_asset tools-v1.0.0 test-tools_linux-amd64-1.0.0.tar.zst "tools amd64 one"
+make_asset tools-v1.0.0 test-tools_linux-arm64-1.0.0.tar.zst "tools arm64 one"
 make_asset v9.9.9 test-sdk-9.9.9.tar.zst "a draft nobody released"
-write_releases "v1.0.0:true:false" "v9.9.9:false:true"
+# An archive of the sdk's own kind, offered by a release of the tools'
+# kind: the two lines number independently, so sooner or later they offer
+# the same version, and a source has to take the release that is about it
+# rather than whichever one carries a matching file name.
+make_asset tools-v1.0.0 test-sdk-1.0.0.tar.zst "an sdk archive on a tools release"
+write_releases "v1.0.0:true:false" "tools-v1.0.0:true:false" "v9.9.9:false:true"
 
 run_tool
 ran_clean "exit code"
@@ -455,10 +491,34 @@ true_that "the draft release was left alone" \
 
 same "the package file is in the source" \
   "$(cat "$working/sdk/test-sdk-1.0.0.tar.zst")" "sdk one"
+# The sdk source took the archive from the release of its own kind, not
+# the one of the same name on the tools release: same version, different
+# bytes, and only one of the two is what "v1.0.0 of the sdk" means.
+same "from the release of its own kind" \
+  "$(cat "$working/sdk/test-sdk-1.0.0.tar.zst")" \
+  "$(cat "$forge/assets/v1.0.0/test-sdk-1.0.0.tar.zst")"
 true_that "so is its checksum sidecar" \
   "$([ -f "$working/sdk/test-sdk-1.0.0.tar.zst.sha256" ] && echo true || echo false)"
-true_that "so is the declaration the build published beside it" \
-  "$([ -f "$working/sdk/test-sdk-1.0.0.tar.zst.build-environment.json" ] && echo true || echo false)"
+true_that "so is the meta file the release published beside it" \
+  "$([ -f "$working/sdk/test-sdk-1.0.0.tar.zst.meta.json" ] && echo true || echo false)"
+same "the index records the meta file by name" \
+  "$(jq -r '.packages["test-sdk"]["1.0.0"].meta_file.file' "$working/sdk/index.json")" \
+  test-sdk-1.0.0.tar.zst.meta.json
+same "by hash" \
+  "$(jq -r '.packages["test-sdk"]["1.0.0"].meta_file.sha256' "$working/sdk/index.json")" \
+  "$(sha256sum "$working/sdk/test-sdk-1.0.0.tar.zst.meta.json" | cut -d' ' -f1)"
+same "and by size" \
+  "$(jq -r '.packages["test-sdk"]["1.0.0"].meta_file.size' "$working/sdk/index.json")" \
+  "$(stat -c%s "$working/sdk/test-sdk-1.0.0.tar.zst.meta.json")"
+same "and nothing of what it says" \
+  "$(jq -r '.packages["test-sdk"]["1.0.0"].meta_file | keys | join(",")' \
+    "$working/sdk/index.json")" "file,sha256,size"
+same "the per-platform package's meta file is recorded too" \
+  "$(jq -r '.packages["test-tools_linux-amd64"]["1.0.0"].meta_file.file' \
+    "$working/tools/index.json")" test-tools_linux-amd64-1.0.0.tar.zst.meta.json
+same "the meta package has none — it has no archive to have one beside" \
+  "$(jq -r '.packages["test-tools"]["1.0.0"] | has("meta_file")' \
+    "$working/tools/index.json")" false
 same "the recorded size is the file's" \
   "$(jq -r '.packages["test-sdk"]["1.0.0"].size' "$working/sdk/index.json")" \
   "$(stat -c%s "$working/sdk/test-sdk-1.0.0.tar.zst")"
@@ -605,7 +665,8 @@ before_trees="$(tree_count)"
 before_sdk_snapshots="$(snapshot_count sdk)"
 before_sdk_chain_length="$(jq -r '.chain | length' "$registry/mirror-sync/sdk/index.json")"
 make_asset v1.1.0 test-sdk-1.1.0.tar.zst "sdk two"
-write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v9.9.9:false:true"
+write_releases "v1.0.0:true:false" "tools-v1.0.0:true:false" "v1.1.0:true:false" \
+  "v9.9.9:false:true"
 
 run_tool
 ran_clean "exit code"
@@ -645,8 +706,9 @@ fi
 # --- a partly released family ----------------------------------------
 
 note "a family where only one platform has been released"
-make_asset v2.0.0 test-tools_linux-amd64-2.0.0.tar.zst "tools amd64 two"
-write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v2.0.0:true:false" "v9.9.9:false:true"
+make_asset tools-v2.0.0 test-tools_linux-amd64-2.0.0.tar.zst "tools amd64 two"
+write_releases "v1.0.0:true:false" "tools-v1.0.0:true:false" "v1.1.0:true:false" \
+  "tools-v2.0.0:true:false" "v9.9.9:false:true"
 
 run_tool
 ran_clean "exit code"
@@ -661,8 +723,9 @@ else
 fi
 
 note "and then the other platform arrives"
-make_asset v2.0.0 test-tools_linux-arm64-2.0.0.tar.zst "tools arm64 two"
-write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v2.0.0:true:false" "v9.9.9:false:true"
+make_asset tools-v2.0.0 test-tools_linux-arm64-2.0.0.tar.zst "tools arm64 two"
+write_releases "v1.0.0:true:false" "tools-v1.0.0:true:false" "v1.1.0:true:false" \
+  "tools-v2.0.0:true:false" "v9.9.9:false:true"
 
 run_tool
 ran_clean "exit code"
@@ -683,14 +746,15 @@ fi
 # by hand.
 
 note "a family whose members are recorded but whose meta package is not"
-make_asset v4.0.0 test-tools_linux-amd64-4.0.0.tar.zst "tools amd64 four"
-make_asset v4.0.0 test-tools_linux-arm64-4.0.0.tar.zst "tools arm64 four"
-write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v2.0.0:true:false" \
-  "v4.0.0:true:false" "v9.9.9:false:true"
+make_asset tools-v4.0.0 test-tools_linux-amd64-4.0.0.tar.zst "tools amd64 four"
+make_asset tools-v4.0.0 test-tools_linux-arm64-4.0.0.tar.zst "tools arm64 four"
+write_releases "v1.0.0:true:false" "tools-v1.0.0:true:false" "v1.1.0:true:false" \
+  "tools-v2.0.0:true:false" "tools-v4.0.0:true:false" "v9.9.9:false:true"
 
 for arch in linux-amd64 linux-arm64; do
   asset="test-tools_$arch-4.0.0.tar.zst"
-  cp "$forge/assets/v4.0.0/$asset" "$forge/assets/v4.0.0/$asset.sha256" "$working/tools/"
+  cp "$forge/assets/tools-v4.0.0/$asset" "$forge/assets/tools-v4.0.0/$asset.sha256" \
+    "$forge/assets/tools-v4.0.0/$asset.meta.json" "$working/tools/"
   packagetool add \
     --source "$working/tools" \
     --name "test-tools_$arch" \
@@ -698,6 +762,7 @@ for arch in linux-amd64 linux-arm64; do
     --file "$asset" \
     --sha256 "$(sha256sum "$working/tools/$asset" | cut -d' ' -f1)" \
     --size "$(stat -c%s "$working/tools/$asset")" \
+    --require-meta \
     --publisher-key "$keys/publisher-1.pem" >/dev/null
   sleep 1
 done
@@ -751,14 +816,48 @@ ran_clean "exit code"
 same "no tree" "$(tree_count)" "$before_trees"
 same "nothing signed" "$(sha256sum "$working/sdk/index.json" | cut -d' ' -f1)" "$before_index"
 
+# --- a release that publishes no meta file ---------------------------
+#
+# Both sources here declare that every package they carry brings its meta
+# file. A release without one is therefore a release this registry cannot
+# take: recording the archive anyway would put a version into the index
+# whose requirements nobody can read, and the gap would only be noticed
+# by whoever tried to resolve a chain through it, long afterwards.
+#
+# The offending release is taken back out again afterwards, so the checks
+# below start from a forge that is merely missing nothing.
+
+note "a release that publishes no meta file"
+make_asset v5.0.0 test-sdk-5.0.0.tar.zst "sdk five" no
+write_releases "v1.0.0:true:false" "tools-v1.0.0:true:false" "v1.1.0:true:false" \
+  "tools-v2.0.0:true:false" "tools-v4.0.0:true:false" "v5.0.0:true:false" \
+  "v9.9.9:false:true"
+before_trees="$(tree_count)"
+
+run_tool
+same "exit code" "$rc" 4
+if grep -q "without test-sdk-5.0.0.tar.zst.meta.json" "$err"; then
+  ok "the run names the sidecar that is missing"
+else
+  bad "the run did not name the sidecar that is missing"
+fi
+true_that "nothing was recorded" \
+  "$(recorded sdk test-sdk 5.0.0 && echo false || echo true)"
+same "and nothing was published" "$(tree_count)" "$before_trees"
+
+rm -rf "$forge/assets/v5.0.0"
+write_releases "v1.0.0:true:false" "tools-v1.0.0:true:false" "v1.1.0:true:false" \
+  "tools-v2.0.0:true:false" "tools-v4.0.0:true:false" "v9.9.9:false:true"
+
 # --- an asset that does not match its checksum -----------------------
 
 note "an asset that does not match its checksum"
 make_asset v3.0.0 test-sdk-3.0.0.tar.zst "sdk three"
 printf '%s  %s\n' "$(printf 'not these bytes' | sha256sum | cut -d' ' -f1)" \
   test-sdk-3.0.0.tar.zst >"$forge/assets/v3.0.0/test-sdk-3.0.0.tar.zst.sha256"
-write_releases "v1.0.0:true:false" "v1.1.0:true:false" "v2.0.0:true:false" \
-  "v3.0.0:true:false" "v4.0.0:true:false" "v9.9.9:false:true"
+write_releases "v1.0.0:true:false" "tools-v1.0.0:true:false" "v1.1.0:true:false" \
+  "tools-v2.0.0:true:false" "v3.0.0:true:false" "tools-v4.0.0:true:false" \
+  "v9.9.9:false:true"
 before_trees="$(tree_count)"
 
 run_tool

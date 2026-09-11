@@ -165,7 +165,7 @@ error.
 
 | What | Header |
 |---|---|
-| package files, their `.sha256` sidecars | `public, max-age=31536000, immutable` |
+| package files, their `.sha256` and `.meta.json` sidecars | `public, max-age=31536000, immutable` |
 | content-named index parts (`index-…-<hash>.json`) | same |
 | archived key sets under `<source>/keys/` | same |
 | `index.json`, `keys.json`, `mirrors.json` and their `.sig` | `no-cache` |

@@ -21,6 +21,20 @@
 # every part of it at the same moment. Sources nothing touched keep the
 # snapshot they already had; only the ones that changed get a new one.
 #
+# One upstream repository can publish several *kinds* of release, each
+# versioned on its own, and the configuration says which kind feeds which
+# source by the pattern its tags match ("v*", "workspace-v*", "tools-v*").
+# Releases of another kind are not looked at: two kinds that number
+# independently will sooner or later offer the same version, and a source
+# has to take the archive from the release that is about it rather than
+# from whichever one happened to carry a matching file name.
+#
+# Each package is fetched with its sidecars: the checksum the build
+# published beside it, and the meta file that says what the package
+# requires of the next one in its chain. Where a source declares that its
+# packages carry meta files, one without is a refusal rather than a
+# package recorded with a hole in its chain.
+#
 # The same run with --refresh renews the signed documents instead of
 # looking for new releases. Expiry is what bounds a freeze: a mirror
 # serving a stale but validly signed copy is caught because the copy runs
@@ -147,11 +161,16 @@ publisher_keys=()
 # however the run ends.
 run_tmp=
 
-# Every asset of every release of the repository a source is fed from,
-# as "<tag>/<asset name>" to its download URL. Filled per source and read
-# by the fetch step, which needs the URL of a sidecar it did not select
-# itself.
+# Every asset of every release of the repository a source is fed from
+# whose tag is of that source's kind, as "<tag>/<asset name>" to its
+# download URL. Filled per source and read by the fetch step, which needs
+# the URL of a sidecar it did not select itself.
 declare -A asset_url=()
+
+# Whether the source being published declares that every package it
+# carries brings its meta file. Filled per source, like asset_url, and
+# read by the two steps that fetch and record one.
+meta_file_required=false
 
 tree_changed=false
 recorded_count=0
@@ -549,15 +568,23 @@ fetch_asset() {
   fi
   say "  checksum ok: $name"
 
-  # The declaration sidecar where a release carries one: a provisioner
-  # reads it before it unpacks anything, so it has to be served next to
-  # the archive rather than only inside it.
-  sidecar_url=${asset_url["$tag/$name.build-environment.json"]:-}
+  # The meta file: what the package requires of the next one in its
+  # chain, the hash of the inputs it was built from, and what it resolved
+  # to. Whoever resolves a chain reads it *before* it fetches anything
+  # else, so it is served next to the archive rather than only inside it,
+  # and the index records it by hash. It has no checksum sidecar of its
+  # own and needs none: it arrives over the same connection as the
+  # archive's, it is parsed and held against the package before it is
+  # recorded, and from then on the signed index is what pins its bytes.
+  sidecar_url=${asset_url["$tag/$name.meta.json"]:-}
   if [ -n "$sidecar_url" ]; then
     as_publisher curl --fail --silent --show-error --location \
       --max-time "$registry_publish_api_timeout" \
-      --output "$staging_dir/$name.build-environment.json" "$sidecar_url" ||
-      die "$EXIT_DOWNLOAD" "could not fetch $name.build-environment.json"
+      --output "$staging_dir/$name.meta.json" "$sidecar_url" ||
+      die "$EXIT_DOWNLOAD" "could not fetch $name.meta.json from $sidecar_url"
+  elif [ "$meta_file_required" = true ]; then
+    die "$EXIT_DOWNLOAD" \
+      "$tag publishes $name without $name.meta.json — this source records a meta file for every package it carries"
   fi
 }
 
@@ -567,8 +594,13 @@ fetch_asset() {
 record_asset() {
   local source_dir=$1 package=$2 version=$3 name=$4
   local digest size extra
+  local -a require_meta=()
 
-  for extra in "$name" "$name.sha256" "$name.build-environment.json"; do
+  if [ "$meta_file_required" = true ]; then
+    require_meta=(--require-meta)
+  fi
+
+  for extra in "$name" "$name.sha256" "$name.meta.json"; do
     [ -f "$staging_dir/$extra" ] || continue
     # Reflinks make this share extents with the staged copy instead of
     # doubling a half-gigabyte package on disk.
@@ -588,6 +620,7 @@ record_asset() {
     --file "$name" \
     --sha256 "$digest" \
     --size "$size" \
+    ${require_meta[@]+"${require_meta[@]}"} \
     --publisher-key "${publisher_keys[@]}" ||
     die "$EXIT_RECORD" "could not record $package $version in $source_dir"
   recorded_count=$((recorded_count + 1))
@@ -639,7 +672,7 @@ record_meta() {
 publish_source() {
   local name=$1
   local source_dir=$working_dir/$name
-  local repository tag asset_name url package pattern version line row entry
+  local repository tag tag_pattern asset_name url package pattern version line row entry
   local pending_count=0 has_meta=no did_any
   local -A pending=()
   local -a versions=()
@@ -651,7 +684,20 @@ publish_source() {
     return 0
   fi
 
-  say "$name (from $repository)"
+  # Which kind of release feeds this source. A repository that publishes
+  # only one kind declares none and every tag is looked at, which is what
+  # every source did before kinds existed.
+  tag_pattern=$(source_field "$name" tag)
+  meta_file_required=false
+  if [ "$(source_field "$name" meta_file_required)" = true ]; then
+    meta_file_required=true
+  fi
+
+  if [ -n "$tag_pattern" ]; then
+    say "$name (from $repository, tags $tag_pattern)"
+  else
+    say "$name (from $repository)"
+  fi
 
   fetch_releases "$repository" ||
     die "$EXIT_DISCOVERY" "could not find out which releases $repository has"
@@ -659,6 +705,13 @@ publish_source() {
   asset_url=()
   while IFS= read -r line; do
     [ -n "$line" ] || continue
+    IFS=$'\t' read -r tag asset_name url <<<"$line"
+    if [ -n "$tag_pattern" ]; then
+      # An unquoted pattern on the right is a glob, which is what the
+      # configuration declares.
+      # shellcheck disable=SC2053
+      [[ $tag == $tag_pattern ]] || continue
+    fi
     rows+=("$line")
   done < <(release_assets "$repository")
 
@@ -752,7 +805,7 @@ publish_source() {
       record_asset "$source_dir" "$package" "$version" "$asset_name"
       say "  recorded $package $version"
       rm -f -- "$staging_dir/$asset_name" "$staging_dir/$asset_name.sha256" \
-        "$staging_dir/$asset_name.build-environment.json"
+        "$staging_dir/$asset_name.meta.json"
     done < <(jq -r --arg s "$name" \
       '(.sources[$s].packages // [])[] | "\(.name)\t\(.asset)"' \
       "$registry_publish_publishing_config")

@@ -17,6 +17,17 @@ against the checksum the build published beside them, records them in the
 source, verifies the result with the reference verifier, and only then
 takes a snapshot and switches the served tree onto it.
 
+One repository can publish several *kinds* of release, each versioned on
+its own, and the publishing configuration says which kind feeds which
+source (`tag`, a glob over the release tag). Releases of another kind are
+not looked at: two kinds that number independently will sooner or later
+offer the same version, and a source has to take the archive from the
+release that is about it rather than from whichever one carried a
+matching file name. A source may also declare that every package it
+carries brings its meta file (`meta_file_required`), and then a release
+that publishes none stops the run instead of putting a version into the
+index whose requirements nobody can read.
+
 One run covers every source at once. Each source is snapshotted on its
 own and only if its content changed, but the served tree is composed once
 per run out of one snapshot per source: a release set that spans several

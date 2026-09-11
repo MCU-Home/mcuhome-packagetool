@@ -228,7 +228,8 @@ http {
 
         # --- package files ---------------------------------------------
         # A published version is immutable and is never deleted, so its
-        # bytes and its checksum sidecar never change either.
+        # bytes and its two sidecars never change either — the checksum,
+        # and the meta file whose hash the signed index records.
         location ~ \.tar\.zst$ {
             default_type application/zstd;
 {{ immutable() }}
@@ -236,6 +237,11 @@ http {
 
         location ~ \.tar\.zst\.sha256$ {
             default_type text/plain;
+{{ immutable() }}
+        }
+
+        location ~ \.tar\.zst\.meta\.json$ {
+            default_type application/json;
 {{ immutable() }}
         }
 
