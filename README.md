@@ -263,26 +263,57 @@ Two files are served beside a package archive, under the archive's own name:
   `meta_file` so that its bytes are pinned by the same signature the archive
   is.
 
-The meta file is one JSON object of schema 1:
+There used to be a third, `<archive>.build-environment.json`, the build
+environment's self-description. It is **retired**: the meta file supersedes
+it and says the same things in one place for every package rather than for
+one family of them. Nothing publishes it any more and the pipeline no longer
+looks for it.
+
+The meta file is one JSON object of schema 1 — here the build workspace,
+the middle link of the chain:
 
 ```json
 {
   "schema": 1,
-  "package": {"name": "mcuhome-build-tools", "version": "0.2.0",
-              "architecture": "linux-amd64"},
-  "requires": {"mcuhome-build-workspace": "~=0.2.0"},
+  "package": {"name": "mcuhome-build-workspace", "version": "0.2.0",
+              "architecture": null},
+  "requires": {"mcuhome-build-tools": "~=0.1.0"},
   "inputs_sha256": "9f2c…",
   "contents": {}
 }
 ```
 
+The chain runs one way and ends: the SDK requires a build workspace, a build
+workspace requires build tools, and **the tools require nothing** — a tools
+package carries no `requires` at all. Its `package` block is the one that
+names a platform: `{"name": "mcuhome-build-tools", "version": "0.1.0",
+"architecture": "linux-amd64"}`.
+
 | Member | Checked when it is recorded |
 |---|---|
 | `schema` | is 1; anything else is refused rather than guessed at |
-| `package` | `name` per the package-name grammar, `version` a PEP 440 version, `architecture` null or a platform — and all of it about the archive it lies beside |
-| `requires` | absent, or package name to PEP 440 specifier; a name may be prefixed with the registry host it is published on (`packages.example.org/mcuhome-build-workspace`) |
+| `package` | `name` per the package-name grammar, `version` a PEP 440 version, and `architecture` — a **required key**: `null` where the package is the same on every platform, the platform string (`"linux-amd64"`) where it is not. All of it is held against the archive it lies beside |
+| `requires` | absent, or package name to PEP 440 specifier; a name may be prefixed with the registry host it is published on (`packages.example.org/mcuhome-build-tools`) |
 | `inputs_sha256` | 64 lowercase hex digits |
 | `contents` | an object, and otherwise **untouched** |
+
+`requires` maps `[<host>/]<family name>` to a PEP 440 specifier and nothing
+else. Four consequences worth stating, because they are what a producer gets
+wrong:
+
+- The key is the **family** name (`mcuhome-build-tools`), not one platform's
+  package: a requirement is about a release, and its platforms are resolved
+  by whoever executes the build.
+- **Exact byte pins are not expressible here.** There is no `@sha256:` form
+  in a `requires` value — a package says which *versions* of the next one it
+  works with, and pinning one particular archive is a decision about one
+  device, made in that device's own `sources.` override.
+- An **empty specifier** (`""`) parses and means "any version". Producers
+  should not emit one: a constraint that accepts everything is a statement
+  nobody can act on, and leaving `requires` out says the same thing more
+  honestly.
+- `requires: {}` and an absent `requires` mean the same: this package
+  constrains nothing.
 
 `contents` is the producing side's own vocabulary — a workspace package's
 project revisions, a tools package's tool versions — and is deliberately
