@@ -10,6 +10,7 @@ cannot be made by a workflow at three in the morning.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -389,6 +390,249 @@ def test_the_verifier_refuses_a_meta_entry_that_claims_bytes(source: Path) -> No
     index = read_document(source / INDEX_FILE)
     index["packages"][TOOLS] = {
         "0.1.0": {"meta": MEMBERS, "sha256": "f" * 64, "file": "x.tar.zst", "size": 1}
+    }
+    write_signed(source / INDEX_FILE, index, [key("publisher-1")])
+    with pytest.raises(Refused, match="names packages, not bytes"):
+        verify_source(source, ANCHOR, now=NOW)
+
+
+# --------------------------------------------------------------------------- meta files
+
+SDK = "mcuhome-sdk"
+
+
+def _meta(**overrides: object) -> dict:
+    """A schema-1 meta file for the SDK package the helpers below record."""
+    document: dict = {
+        "schema": 1,
+        "package": {"name": SDK, "version": "2.4.0", "architecture": None},
+        "requires": {"mcuhome-build-workspace": "~=0.2.0"},
+        "inputs_sha256": "9" * 64,
+        "contents": {"paths": ["mcuhome/", "west.yml"]},
+    }
+    document.update(overrides)
+    return document
+
+
+def _record(
+    source: Path,
+    document: dict | str | None,
+    *,
+    name: str = SDK,
+    version: str = "2.4.0",
+    require_meta: bool = True,
+    day: int = 1,
+) -> str:
+    """Write the archive's sidecar (unless *document* is None) and record it."""
+    file = f"{name}-{version}.tar.zst"
+    (source / file).write_bytes(b"archive")
+    if document is not None:
+        payload = document if isinstance(document, str) else json.dumps(document, indent=2)
+        (source / f"{file}.meta.json").write_text(payload, encoding="utf-8")
+    return add_package(
+        source,
+        name=name,
+        version=version,
+        file=file,
+        sha256="a" * 64,
+        size=7,
+        require_meta=require_meta,
+        issued=BASE + timedelta(days=day),
+        signers=[key("publisher-1")],
+    )
+
+
+def test_a_meta_file_is_recorded_beside_the_archive(source: Path) -> None:
+    """Name, hash and size of the sidecar — and nothing of what it says."""
+    document = _meta()
+    _record(source, document)
+
+    entry = read_document(source / INDEX_FILE)["packages"][SDK]["2.4.0"]
+    payload = (source / f"{SDK}-2.4.0.tar.zst.meta.json").read_bytes()
+    assert entry["meta_file"] == {
+        "file": f"{SDK}-2.4.0.tar.zst.meta.json",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size": len(payload),
+    }
+    # The index answers "which versions exist"; the meta file answers
+    # "what does this one require". Nothing of the second is in the first.
+    assert set(entry) == {"file", "sha256", "size", "meta_file"}
+    assert "requires" not in json.dumps(read_document(source / INDEX_FILE))
+    assert "inputs_sha256" not in json.dumps(read_document(source / INDEX_FILE))
+    assert verify_source(source, ANCHOR, now=NOW)["entries"] == 1
+
+
+def test_a_package_may_have_no_meta_file(source: Path) -> None:
+    """Optional in general: the requirement is the source's, not the format's."""
+    _record(source, None, require_meta=False)
+    entry = read_document(source / INDEX_FILE)["packages"][SDK]["2.4.0"]
+    assert set(entry) == {"file", "sha256", "size"}
+    assert verify_source(source, ANCHOR, now=NOW)["entries"] == 1
+
+
+def test_a_source_that_requires_a_meta_file_refuses_a_package_without_one(source: Path) -> None:
+    with pytest.raises(SystemExit, match="has no .*meta.json beside its archive"):
+        _record(source, None)
+    assert read_document(source / INDEX_FILE)["packages"] == {}
+
+
+def test_a_meta_file_belongs_to_the_archive_it_lies_beside(source: Path) -> None:
+    """The one mistake a hash cannot catch: the right bytes, the wrong package."""
+    with pytest.raises(SystemExit, match="describes the package 'mcuhome-build-workspace'"):
+        _record(
+            source,
+            _meta(
+                package={
+                    "name": "mcuhome-build-workspace",
+                    "version": "2.4.0",
+                    "architecture": None,
+                }
+            ),
+        )
+    with pytest.raises(SystemExit, match="describes version 2.3.0"):
+        _record(source, _meta(package={"name": SDK, "version": "2.3.0", "architecture": None}))
+
+
+def test_a_meta_file_of_an_unknown_schema_is_refused(source: Path) -> None:
+    """Every member is read by somebody, so a format nobody knows is not read at all."""
+    with pytest.raises(SystemExit, match="declares schema 2"):
+        _record(source, _meta(schema=2))
+    with pytest.raises(SystemExit, match="declares schema None"):
+        _record(source, {k: v for k, v in _meta().items() if k != "schema"})
+
+
+def test_a_meta_file_that_is_not_json_is_refused(source: Path) -> None:
+    with pytest.raises(SystemExit, match="is not JSON"):
+        _record(source, "{not json at all")
+    with pytest.raises(SystemExit, match="is not a JSON object"):
+        _record(source, "[]")
+
+
+def test_the_shape_of_requires_is_checked(source: Path) -> None:
+    """Names per the package grammar, optionally host-prefixed; specifiers parsed."""
+    with pytest.raises(SystemExit, match="is not a PEP 440 specifier"):
+        _record(source, _meta(requires={"mcuhome-build-workspace": "newest please"}))
+    with pytest.raises(SystemExit, match="is not a package name"):
+        _record(source, _meta(requires={"MCUHome Build Workspace": "~=0.2.0"}))
+    with pytest.raises(SystemExit, match="is not a registry host"):
+        _record(source, _meta(requires={"not a host/mcuhome-build-workspace": "~=0.2.0"}))
+    with pytest.raises(SystemExit, match="has to be an object"):
+        _record(source, _meta(requires=["mcuhome-build-workspace~=0.2.0"]))
+
+
+def test_a_host_prefixed_requirement_is_accepted(source: Path) -> None:
+    """A package may require one published somewhere else entirely."""
+    _record(source, _meta(requires={"packages.example.org/mcuhome-build-workspace": ">=0.2,<1"}))
+    assert verify_source(source, ANCHOR, now=NOW)["entries"] == 1
+
+
+def test_a_package_that_requires_nothing_needs_no_requires(source: Path) -> None:
+    """The tools package is the end of the chain: it constrains nobody."""
+    _record(source, {k: v for k, v in _meta().items() if k != "requires"})
+    assert verify_source(source, ANCHOR, now=NOW)["entries"] == 1
+
+
+def test_the_input_hash_is_checked(source: Path) -> None:
+    with pytest.raises(SystemExit, match="inputs_sha256 is 'not a hash'"):
+        _record(source, _meta(inputs_sha256="not a hash"))
+    with pytest.raises(SystemExit, match="inputs_sha256 is None"):
+        _record(source, {k: v for k, v in _meta().items() if k != "inputs_sha256"})
+
+
+def test_contents_is_passed_through_untouched(source: Path) -> None:
+    """Whatever a producer records there is its own vocabulary, not ours."""
+    _record(source, _meta(contents={"x-something-nobody-here-knows": {"deeply": ["nested"]}}))
+    assert verify_source(source, ANCHOR, now=NOW)["entries"] == 1
+
+
+def test_contents_still_has_to_be_an_object(source: Path) -> None:
+    """Opaque is not shapeless: a consumer reads members off it."""
+    with pytest.raises(SystemExit, match="contents is list"):
+        _record(source, _meta(contents=["not an object"]))
+
+
+def test_a_per_platform_package_may_be_named_by_its_family(source: Path) -> None:
+    """`<family>_<platform>` composes, so the meta file may state either half."""
+    concrete = f"{TOOLS}_linux-amd64"
+    _record(
+        source,
+        _meta(package={"name": TOOLS, "version": "2.4.0", "architecture": "linux-amd64"}),
+        name=concrete,
+    )
+    entry = read_document(source / INDEX_FILE)["packages"][concrete]["2.4.0"]
+    assert entry["meta_file"]["file"] == f"{concrete}-2.4.0.tar.zst.meta.json"
+
+
+def test_a_platform_suffix_and_a_declared_architecture_must_agree(source: Path) -> None:
+    with pytest.raises(SystemExit, match="declares no architecture"):
+        _record(
+            source,
+            _meta(
+                package={"name": f"{TOOLS}_linux-amd64", "version": "2.4.0", "architecture": None}
+            ),
+            name=f"{TOOLS}_linux-amd64",
+        )
+    with pytest.raises(SystemExit, match="declares the architecture 'linux-arm64'"):
+        _record(
+            source,
+            _meta(
+                package={
+                    "name": f"{TOOLS}_linux-amd64",
+                    "version": "2.4.0",
+                    "architecture": "linux-arm64",
+                }
+            ),
+            name=f"{TOOLS}_linux-amd64",
+        )
+
+
+def test_a_published_meta_file_is_never_replaced_either(source: Path) -> None:
+    """Immutability reaches the sidecar, and the refusal says what changed."""
+    _record(source, _meta())
+    (source / f"{SDK}-2.4.0.tar.zst.meta.json").write_text(
+        json.dumps(_meta(requires={"mcuhome-build-workspace": "~=0.3.0"}), indent=2),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="already published.*its meta file is"):
+        add_package(
+            source,
+            name=SDK,
+            version="2.4.0",
+            file=f"{SDK}-2.4.0.tar.zst",
+            sha256="a" * 64,
+            size=7,
+            require_meta=True,
+            issued=BASE + timedelta(days=2),
+            signers=[key("publisher-1")],
+        )
+
+
+def test_the_verifier_refuses_a_malformed_meta_file_record(source: Path) -> None:
+    """The record is checked like the archive's own three members."""
+    _record(source, _meta())
+    for broken, fragment in (
+        ({"file": "x.meta.json", "sha256": "9" * 64}, "needs file, sha256 and size"),
+        ({"file": "../x", "sha256": "9" * 64, "size": 1}, "is not a plain file name"),
+        ({"file": "x.meta.json", "sha256": "NOT HEX", "size": 1}, "not 64 lowercase hex digits"),
+        ({"file": "x.meta.json", "sha256": "9" * 64, "size": "1"}, "is not a byte count"),
+    ):
+        index = read_document(source / INDEX_FILE)
+        index["packages"][SDK]["2.4.0"]["meta_file"] = broken
+        write_signed(source / INDEX_FILE, index, [key("publisher-1")])
+        with pytest.raises(Refused, match=fragment):
+            verify_source(source, ANCHOR, now=NOW)
+
+
+def test_the_verifier_refuses_a_meta_package_that_claims_a_meta_file(source: Path) -> None:
+    """A meta package has no archive, so nothing lies beside one."""
+    _publish_members(source)
+    index = read_document(source / INDEX_FILE)
+    index["packages"][TOOLS] = {
+        "0.1.0": {
+            "meta": MEMBERS,
+            "sha256": "f" * 64,
+            "meta_file": {"file": "x.meta.json", "sha256": "9" * 64, "size": 1},
+        }
     }
     write_signed(source / INDEX_FILE, index, [key("publisher-1")])
     with pytest.raises(Refused, match="names packages, not bytes"):

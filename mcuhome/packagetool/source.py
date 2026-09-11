@@ -12,7 +12,9 @@ Three operations matter and each is small:
 
 ``init``      lay a source down: ``keys.json`` (root-signed),
               ``mirrors.json`` and an empty ``index.json``
-``add``       record one package, in the part that covers it or in the head
+``add``       record one package — and, where one is published beside it,
+              the ``<archive>.meta.json`` sidecar that says what the
+              package requires (:mod:`mcuhome.packagetool.metafile`)
 ``add-meta``  record a *meta* package: one name standing for a set of
               concrete packages, one per architecture
 ``refresh``   renew the two publisher-signed documents before they expire
@@ -34,6 +36,7 @@ from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
+from mcuhome.packagetool import metafile
 from mcuhome.packagetool.documents import (
     INDEX_EXPIRY_DAYS,
     KEYS_EXPIRY_DAYS,
@@ -49,6 +52,7 @@ from mcuhome.packagetool.keys import SigningKey
 __all__ = [
     "INDEX_FILE",
     "KEYS_FILE",
+    "META_FILE_KEY",
     "META_KEY",
     "MIRRORS_FILE",
     "PublicKey",
@@ -74,6 +78,17 @@ KEYS_ARCHIVE = "keys"
 #: What makes an index entry a *meta* entry: it names packages instead of
 #: bytes, so it carries this member and neither ``file`` nor ``size``.
 META_KEY = "meta"
+
+#: Where an ordinary entry records the package's meta file, by file name,
+#: hash and size — the same three members the archive itself is recorded
+#: by, and nothing of its content.
+#:
+#: Deliberately *not* ``meta``: that member is what makes an entry a meta
+#: package, and every reader of an index — this tool, the reference
+#: verifier, the workbench, the browse page — decides which kind of entry
+#: it is holding by asking whether it is there. A sidecar recorded under
+#: that name would turn every ordinary package into a malformed meta one.
+META_FILE_KEY = "meta_file"
 
 
 @dataclass(frozen=True)
@@ -220,12 +235,81 @@ def _entries_of_part(source: Path, part: dict) -> dict:
     return packages if isinstance(packages, dict) else {}
 
 
-def _known_versions(source: Path, index: dict, name: str) -> set[str]:
-    """Every version of *name* the source already records, head and parts."""
-    found = set((index.get("packages") or {}).get(name, {}))
+def _entry_of(source: Path, index: dict, name: str, version: str) -> dict | None:
+    """One package version's entry, wherever in the source it is recorded."""
+    found = (index.get("packages") or {}).get(name, {}).get(version)
+    if isinstance(found, dict):
+        return found
     for part in index.get("parts") or []:
-        found |= set(_entries_of_part(source, part).get(name, {}))
-    return found
+        found = _entries_of_part(source, part).get(name, {}).get(version)
+        if isinstance(found, dict):
+            return found
+    return None
+
+
+def _meta_file_entry(
+    source: Path, *, name: str, version: str, file: str, required: bool
+) -> dict | None:
+    """The index record of this package's meta file, read from beside the archive.
+
+    Where the sidecar is there it is checked against the package being
+    recorded and then reduced to three members — file name, hash, size —
+    exactly as the archive is. Nothing of its content reaches the index:
+    the index answers "which versions exist", the meta file answers "what
+    does this one require", and keeping the second out of the first is
+    what lets a client resolve a chain by fetching one small document per
+    stage instead of an index that grew with every release.
+
+    The bytes are read once and both hashed and parsed from that copy, so
+    what was checked and what the index names cannot come apart.
+    """
+    path = source / (file + metafile.SUFFIX)
+    if not path.is_file():
+        if required:
+            raise SystemExit(
+                f"{name} {version} has no {path.name} beside its archive, and this source "
+                "records a meta file for every package it carries — publish the sidecar with "
+                "the release and record the version again"
+            )
+        return None
+    payload = path.read_bytes()
+    metafile.check(
+        metafile.parse(payload, what=str(path)), name=name, version=version, what=str(path)
+    )
+    return {
+        "file": path.name,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size": len(payload),
+    }
+
+
+def _stated_differently(published: dict, offered: dict) -> str:
+    """What a refused second record states differently, for the refusal to name.
+
+    A second attempt at a published version is refused either way — the
+    point is that the operator reading the journal can tell a re-run that
+    changed nothing from a release that was re-cut under a number it had
+    already used.
+    """
+    labels = {
+        "file": "the archive",
+        "sha256": "its hash",
+        "size": "its size",
+        META_FILE_KEY: "its meta file",
+    }
+    differences = [
+        f"{label} is {_rendered(published.get(member))} there and "
+        f"{_rendered(offered.get(member))} here"
+        for member, label in labels.items()
+        if published.get(member) != offered.get(member)
+    ]
+    return f" ({'; '.join(differences)})" if differences else ""
+
+
+def _rendered(value: object) -> str:
+    if isinstance(value, dict):
+        return f"{value.get('file')} ({value.get('sha256')})"
+    return "absent" if value is None else str(value)
 
 
 def add_package(
@@ -236,27 +320,39 @@ def add_package(
     file: str,
     sha256: str,
     size: int,
+    require_meta: bool = False,
     issued: datetime,
     signers: Sequence[SigningKey],
 ) -> str:
     """Record one package. Returns where it landed, for the workflow log.
 
+    The package's meta file is looked for beside the archive, under the
+    archive's name plus ``.meta.json``, and recorded with it where it is
+    there. *require_meta* turns its absence into a refusal, which is how
+    a source whose packages all carry one — the build environment's three
+    — keeps one from being published without it.
+
     Refuses if the version is already recorded anywhere in the source: a
-    published version is immutable, and a second entry under the same
-    number is the one thing the whole content-addressing exists to
-    prevent.
+    published version is immutable, meta file included, and a second
+    entry under the same number is the one thing the whole
+    content-addressing exists to prevent.
     """
     path = source / INDEX_FILE
     index = read_document(path)
     assert_advances(index, issued, INDEX_FILE)
 
-    if version in _known_versions(source, index, name):
+    entry = {"file": file, "sha256": sha256, "size": size}
+    record = _meta_file_entry(source, name=name, version=version, file=file, required=require_meta)
+    if record is not None:
+        entry[META_FILE_KEY] = record
+
+    published = _entry_of(source, index, name, version)
+    if published is not None:
         raise SystemExit(
-            f"{name} {version} is already published in this source — "
-            "a published version is never replaced"
+            f"{name} {version} is already published in this source — a published version is "
+            f"never replaced{_stated_differently(published, entry)}"
         )
 
-    entry = {"file": file, "sha256": sha256, "size": size}
     parts = list(index.get("parts") or [])
     target = covering_part(parts, version)
 
@@ -330,18 +426,6 @@ def meta_sha256(expanded: dict) -> str:
     ``verify.py`` recomputes rather than believes it.
     """
     return hashlib.sha256(canonical_json(expanded)).hexdigest()
-
-
-def _entry_of(source: Path, index: dict, name: str, version: str) -> dict | None:
-    """One package version's entry, wherever in the source it is recorded."""
-    found = (index.get("packages") or {}).get(name, {}).get(version)
-    if isinstance(found, dict):
-        return found
-    for part in index.get("parts") or []:
-        found = _entries_of_part(source, part).get(name, {}).get(version)
-        if isinstance(found, dict):
-            return found
-    return None
 
 
 def expand_meta(source: Path, index: dict, meta: dict, version: str) -> dict:

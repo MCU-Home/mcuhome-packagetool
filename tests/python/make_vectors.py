@@ -60,6 +60,19 @@ NOW = datetime(2026, 2, 1, 12, 0, 0, tzinfo=UTC)
 MIRROR = "https://packages.example.org/sdk/"
 PACKAGE = ("mcuhome-sdk", "2.4.0", "mcuhome-sdk-2.4.0.tar.zst", "a" * 64, 512345)
 
+#: The meta file published beside that archive. Written into the vector
+#: for real — unlike the archive, whose bytes no verdict depends on — so
+#: that a client implementation can fetch it, hash it against the
+#: ``meta_file`` record in the index, and read a ``requires`` out of it,
+#: which is the whole path a chain is resolved along.
+PACKAGE_META = {
+    "schema": 1,
+    "package": {"name": PACKAGE[0], "version": PACKAGE[1], "architecture": None},
+    "requires": {"mcuhome-build-workspace": "~=2.4.0"},
+    "inputs_sha256": "3" * 64,
+    "contents": {"paths": ["mcuhome/", "west.yml"]},
+}
+
 
 def key(name: str) -> SigningKey:
     """A vector key, generated on first use and committed afterwards."""
@@ -116,6 +129,7 @@ def build(
         write_signed(source / KEYS_FILE, document, root_signers)
     if with_package:
         name, version, filename, digest, size = PACKAGE
+        (source / (filename + ".meta.json")).write_bytes(dump(PACKAGE_META))
         add_package(
             source,
             name=name,
@@ -123,6 +137,7 @@ def build(
             file=filename,
             sha256=digest,
             size=size,
+            require_meta=True,
             issued=index_issued or issued + timedelta(minutes=1),
             signers=publisher_signers,
         )
@@ -296,6 +311,17 @@ def main() -> int:
         issued=BASE + timedelta(days=2),
         signers=[root_d, root_e],  # signed only by keys the anchor has never seen
     )
+
+    # 12 — an entry whose meta_file record is not one: the sidecar is
+    # recorded by name, hash and size like the archive, and a record
+    # missing one of them is as unusable as an entry missing its own.
+    source = build("malformed-meta-file", **standard)
+    document = read_document(source / INDEX_FILE)
+    document["packages"][PACKAGE[0]][PACKAGE[1]]["meta_file"] = {
+        "file": PACKAGE[2] + ".meta.json",
+        "sha256": "3" * 64,
+    }
+    write_signed(source / INDEX_FILE, document, [pub_1])
 
     print(f"{len(list(VECTORS.glob('*/'))) - 1} vectors written to {VECTORS}")
     return 0

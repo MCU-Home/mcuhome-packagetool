@@ -1,0 +1,18 @@
+{
+  "contents": {
+    "paths": [
+      "mcuhome/",
+      "west.yml"
+    ]
+  },
+  "inputs_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "package": {
+    "architecture": null,
+    "name": "mcuhome-sdk",
+    "version": "2.4.0"
+  },
+  "requires": {
+    "mcuhome-build-workspace": "~=2.4.0"
+  },
+  "schema": 1
+}

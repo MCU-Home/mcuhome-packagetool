@@ -31,7 +31,9 @@ What is checked, in order:
 6. every part named by the head — its sha256
 7. package entries — shape; the bytes themselves are checked when
    fetched. A *meta* entry, which names packages rather than bytes,
-   additionally has its hash recomputed from the members it points at
+   additionally has its hash recomputed from the members it points at;
+   an entry recording a ``meta_file`` has that record's shape checked
+   with the archive's own
 8. revocation — ``compromised`` invalidates the past, ``retired`` does
    not
 """
@@ -60,6 +62,7 @@ __all__ = [
     "canonical_json",
     "check_header",
     "check_meta_entry",
+    "check_meta_file",
     "check_signatures",
     "load_anchor",
     "verify_entries",
@@ -78,6 +81,16 @@ KEYS_FILE = "keys.json"
 MIRRORS_FILE = "mirrors.json"
 INDEX_FILE = "index.json"
 SIGNATURE_SUFFIX = ".sig"
+
+#: Where an ordinary entry records the package's meta file — the sidecar
+#: served beside the archive. Not ``meta``: that member is what makes an
+#: entry a *meta package*, and both kinds are told apart by asking
+#: whether it is there.
+META_FILE_KEY = "meta_file"
+
+#: A lowercase hex digest, spelled out rather than matched with a regular
+#: expression, which is the only import this module would need one for.
+HEX_DIGITS = "0123456789abcdef"
 
 
 class Refused(Exception):
@@ -401,7 +414,12 @@ def check_meta_entry(entries: dict[str, dict[str, dict]], name: str, version: st
     A **meta package** is a name standing for a set of concrete packages,
     one per coordinate of one or more dimensions — ``arch`` is the first,
     and the shape is deliberately general. Its entry names packages instead
-    of bytes, so it carries no ``file`` and no ``size``.
+    of bytes, so it carries no ``file``, no ``size`` and no ``meta_file``:
+    a meta package has no archive, so there is nothing beside an archive
+    for it to have. Whoever wants what one of its platforms requires
+    resolves the entry to that platform's package first and reads the
+    ``meta_file`` of *that* entry — one coordinate, one member, one
+    sidecar.
 
     Two rules are checked here, and both are recomputed rather than
     believed:
@@ -417,7 +435,7 @@ def check_meta_entry(entries: dict[str, dict[str, dict]], name: str, version: st
     """
     if not {"meta", "sha256"} <= set(entry):
         raise Refused(f"{name} {version}: a meta entry needs meta and sha256")
-    for absent in ("file", "size"):
+    for absent in ("file", "size", META_FILE_KEY):
         if absent in entry:
             raise Refused(
                 f"{name} {version}: a meta entry names packages, not bytes — it carries no {absent}"
@@ -454,6 +472,46 @@ def check_meta_entry(entries: dict[str, dict[str, dict]], name: str, version: st
         )
 
 
+def check_meta_file(name: str, version: str, entry: dict) -> None:
+    """The record of a package's meta file, where an entry carries one.
+
+    ``meta_file`` names the sidecar ``<archive>.meta.json`` served beside
+    the archive: what the package requires of the next one in its chain,
+    the hash of the inputs it was built from, and what it resolved to.
+    The index records it by file name, hash and size — the same three
+    members the archive itself is recorded by — and **never its
+    content**, so that resolving "the newest version satisfying this
+    constraint" stays a question the index answers on its own and reading
+    what that version requires is one small fetch.
+
+    It is optional. A source may carry packages that have none, and a
+    client that does not know the member ignores it, the way an older
+    client ignores anything else a later generation added. What is not
+    optional is its shape where it is there, and that is this: three
+    members, a plain file name in the source, a lowercase sha256, a byte
+    count. The bytes are checked when they are fetched, against the hash
+    recorded here.
+    """
+    record = entry.get(META_FILE_KEY)
+    if record is None:
+        return
+    if not isinstance(record, dict) or not {"file", "sha256", "size"} <= set(record):
+        raise Refused(f"{name} {version}: {META_FILE_KEY} needs file, sha256 and size")
+    filename = str(record["file"])
+    if "/" in filename or filename.startswith("."):
+        raise Refused(
+            f"{name} {version}: {META_FILE_KEY} {filename!r} is not a plain file name in the source"
+        )
+    digest = record["sha256"]
+    if not isinstance(digest, str) or len(digest) != 64 or set(digest) - set(HEX_DIGITS):
+        raise Refused(
+            f"{name} {version}: the {META_FILE_KEY} hash {digest!r} is not 64 lowercase hex digits"
+        )
+    size = record["size"]
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise Refused(f"{name} {version}: the {META_FILE_KEY} size {size!r} is not a byte count")
+
+
 def verify_entries(source: Path, index: dict) -> int:
     """The shape of every package entry, head and parts.
 
@@ -470,6 +528,8 @@ def verify_entries(source: Path, index: dict) -> int:
                 check_meta_entry(entries, name, version, entry)
             elif not {"file", "sha256", "size"} <= set(entry):
                 raise Refused(f"{name} {version}: entry needs file, sha256 and size")
+            else:
+                check_meta_file(name, version, entry)
             total += 1
     return total
 

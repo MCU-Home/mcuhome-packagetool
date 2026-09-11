@@ -39,6 +39,7 @@ REFUSED = [
     ("tampered-part", "hashes to"),
     ("below-threshold", "required"),
     ("min-client-too-high", "update the tool"),
+    ("malformed-meta-file", "needs file, sha256 and size"),
 ]
 
 
@@ -61,6 +62,28 @@ def test_parts_and_entries_are_counted() -> None:
     # One version in the head is none: both live in the part, because the
     # part covers their range and placement follows `covers`.
     assert report["entries"] == 2
+
+
+def test_the_corpus_carries_a_meta_file_a_client_can_follow() -> None:
+    """The whole path a chain is resolved along, in the vector itself.
+
+    The index names the sidecar by hash and size and says nothing about
+    its content; a client fetches those bytes, checks them against the
+    record, and reads ``requires`` out of them. One document per stage,
+    whatever the index grows to.
+    """
+    import hashlib
+
+    source = VECTORS / "valid"
+    index = json.loads((source / "index.json").read_text())
+    entry = index["packages"]["mcuhome-sdk"]["2.4.0"]
+    record = entry["meta_file"]
+    assert not {"requires", "inputs_sha256", "contents"} & set(entry)
+
+    payload = (source / record["file"]).read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == record["sha256"]
+    assert len(payload) == record["size"]
+    assert json.loads(payload)["requires"] == {"mcuhome-build-workspace": "~=2.4.0"}
 
 
 def test_rollback_is_refused_and_state_advances() -> None:

@@ -13,7 +13,8 @@ Commands:
 ``keygen``    a fresh Ed25519 key pair
 ``anchor``    a root key set as a client would embed or configure it
 ``init``      lay down a complete, empty source
-``add``       record one package in a source
+``add``       record one package in a source, with the meta file served
+              beside its archive
 ``add-meta``  record a meta package: one name for a set of concrete ones
 ``refresh``   renew the publisher-signed documents before they expire
 ``status``    how long each document is still valid (a CI guard)
@@ -157,6 +158,14 @@ def main(argv: list[str]) -> int:
     add.add_argument("--file", required=True)
     add.add_argument("--sha256", required=True)
     add.add_argument("--size", type=int, required=True)
+    add.add_argument(
+        "--require-meta",
+        action="store_true",
+        help=(
+            "refuse unless <file>.meta.json is there beside the archive; for a source whose "
+            "packages all carry one"
+        ),
+    )
     add.add_argument("--publisher-key", type=Path, nargs="*", default=[])
 
     add_meta = commands.add_parser("add-meta", help="record a meta package in a source")
@@ -260,6 +269,7 @@ def main(argv: list[str]) -> int:
             file=arguments.file,
             sha256=arguments.sha256,
             size=arguments.size,
+            require_meta=arguments.require_meta,
             issued=now,
             signers=_publisher_keys(arguments.publisher_key),
         )
