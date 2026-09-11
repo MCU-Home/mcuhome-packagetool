@@ -57,6 +57,19 @@ SDK pin against and what
 package's bytes by. Because a source is self-contained, a copy of one is worth
 exactly as much as the original.
 
+Those three are three **release lines of one repository**, each versioned on
+its own and tagged for its line:
+
+| Tag | Releases | Source |
+|---|---|---|
+| `v<version>` | `mcuhome-sdk` | `sdk` |
+| `workspace-v<version>` | `mcuhome-build-workspace` | `build-workspace` |
+| `tools-v<version>` | `mcuhome-build-tools_<os>-<arch>`, one asset per platform | `build-tools` |
+
+No line takes another's version, so two of them will sooner or later publish
+the same number. That is why each source declares which tags are its own
+rather than recognising an archive by its file name.
+
 ## Layout
 
 | Path | Purpose |
@@ -119,10 +132,12 @@ commits, licensing — are in the organization's
 ## Configuration
 
 `deploy/mcuhome/publishing.json` declares each source of the MCUHome
-registry: which upstream repository feeds it, which packages it carries — a
-list of `name` and release-asset `asset` pairs — optionally the meta package
-that stands for them, and the title and description the catalogue publishes
-for it. Adding a source is an entry in that file, not a change to a
+registry: which upstream repository feeds it, which release tags are its own
+(`tag`, a glob — `v*`, `workspace-v*`, `tools-v*`), which packages it carries
+— a list of `name` and release-asset `asset` pairs — whether every one of
+them has to bring its meta file (`meta_file_required`), optionally the meta
+package that stands for them, and the title and description the catalogue
+publishes for it. Adding a source is an entry in that file, not a change to a
 workflow.
 
 It sits with the rest of the instance configuration rather than at the
@@ -138,6 +153,51 @@ what makes that suffix readable — a package name is otherwise lowercase
 alphanumerics and `-`, so the first `_` splits the family from the platform.
 Publishing that source is one act for the whole list: a build that pins a
 version has to find every platform of it at once.
+
+## The index
+
+`index.json` is the signed list of what a source publishes: one entry per
+package and version, and nothing else about them.
+
+```json
+"mcuhome-build-workspace": {
+  "0.2.0": {
+    "file": "mcuhome-build-workspace-0.2.0.tar.zst",
+    "sha256": "996a117c…",
+    "size": 584893895,
+    "meta_file": {
+      "file": "mcuhome-build-workspace-0.2.0.tar.zst.meta.json",
+      "sha256": "5338eaab…",
+      "size": 412
+    }
+  }
+}
+```
+
+`file`, `sha256` and `size` are the archive. `meta_file` is the sidecar
+served beside it, recorded by exactly those same three members and **never
+by its content**: the index answers *which versions exist*, the meta file
+answers *what one of them requires*, and keeping the second out of the first
+is what keeps the index small enough to be fetched whole by everybody.
+
+So resolving a chain is two steps and one small fetch per stage:
+
+1. **Newest satisfying.** Take the version list the entry map already gives
+   you, keep the versions your constraint accepts, take the highest. No
+   fetch: the index is in hand.
+2. **What that version requires.** Fetch the one `meta_file` named by the
+   entry you picked, check its bytes against the `sha256` recorded there,
+   and read `requires` out of it. That constraint is the next stage's input,
+   and step 1 begins again.
+
+Archives are fetched for what a build actually uses, and for nothing else.
+
+The entry may grow further members later; a client that does not know one
+ignores it, exactly as it ignores anything else a later generation of the
+format added. `meta_file` is optional in the format — a source may carry
+packages that have none — and required per source by the publishing
+configuration, which is where "every package of *this* registry brings one"
+belongs.
 
 ## Meta packages
 
@@ -172,8 +232,16 @@ Three rules hold, and both sides check them from the index alone:
 - **The version invariant.** A meta package at version V exists exactly when
   every one of its members exists at V; the meta version *is* its members'
   version.
-- **No bytes.** A meta entry carries neither `file` nor `size`, because
-  there is nothing to fetch until it has been resolved.
+- **No bytes.** A meta entry carries neither `file` nor `size` nor
+  `meta_file`, because there is nothing to fetch until it has been resolved.
+
+That last rule is also the answer to "where is the meta file of a family?".
+There is none, and there could not be: a meta package has no archive, so
+nothing lies beside one, and its members' meta files differ per platform
+anyway. Whoever wants what a platform requires resolves the family entry to
+that platform's package first and reads the `meta_file` of *that* entry —
+one coordinate, one member, one sidecar, and exactly the same two steps as
+any other package.
 
 The publish pipeline writes the entry automatically, right after the members
 it points at; `python -m mcuhome.packagetool add-meta` is the same act by
@@ -183,12 +251,55 @@ hand.
 
 ## Sidecars
 
-A package file is served with its `.sha256`, and with any further sidecar
-the build wrote next to the archive — for the build-environment packages
-that is `<archive>.build-environment.json`, the environment's
-self-description. It is served beside the archive rather than only inside
-it because whoever provisions the environment reads it *before* it unpacks
-anything.
+Two files are served beside a package archive, under the archive's own name:
+
+- `<archive>.sha256` — the checksum the build published with it. It is what
+  the pipeline holds the downloaded bytes against before anything is
+  recorded, and it is served on because a mirror's copy can be checked
+  without the index.
+- `<archive>.meta.json` — what the package is and what it requires. Served
+  beside the archive rather than only inside it because whoever resolves a
+  chain reads it *before* it fetches anything, and recorded in the index as
+  `meta_file` so that its bytes are pinned by the same signature the archive
+  is.
+
+The meta file is one JSON object of schema 1:
+
+```json
+{
+  "schema": 1,
+  "package": {"name": "mcuhome-build-tools", "version": "0.2.0",
+              "architecture": "linux-amd64"},
+  "requires": {"mcuhome-build-workspace": "~=0.2.0"},
+  "inputs_sha256": "9f2c…",
+  "contents": {}
+}
+```
+
+| Member | Checked when it is recorded |
+|---|---|
+| `schema` | is 1; anything else is refused rather than guessed at |
+| `package` | `name` per the package-name grammar, `version` a PEP 440 version, `architecture` null or a platform — and all of it about the archive it lies beside |
+| `requires` | absent, or package name to PEP 440 specifier; a name may be prefixed with the registry host it is published on (`packages.example.org/mcuhome-build-workspace`) |
+| `inputs_sha256` | 64 lowercase hex digits |
+| `contents` | an object, and otherwise **untouched** |
+
+`contents` is the producing side's own vocabulary — a workspace package's
+project revisions, a tools package's tool versions — and is deliberately
+opaque here: a registry that validated it would need changing whenever a
+producer learned a new word, and it could not tell whether what it read was
+true either way.
+
+A package built per platform is published as `<family>_<platform>`, and its
+meta file may state either the concrete name or the family plus the
+architecture: the two compose into one name, so they say the same thing.
+Disagreeing with the archive is the refusal — a meta file beside the wrong
+package is the one mistake a hash cannot catch, because the bytes are
+exactly the ones somebody meant to publish.
+
+`add` records the sidecar where it finds one beside the archive;
+`add --require-meta` refuses where there is none, and the publishing
+configuration turns that on per source.
 
 The publisher key the tool signs with comes from `--publisher-key` or from
 `MCUHOME_PUBLISHER_KEYS`, which holds its PEM. Each source has its own

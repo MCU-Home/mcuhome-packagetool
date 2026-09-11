@@ -132,8 +132,9 @@ job, never a web page's.</p></noscript>
 <pre>keys.json      keys.json.sig      the root keys, and the publisher keys they authorise
 mirrors.json   mirrors.json.sig   where this source's data may be fetched
 index.json     index.json.sig     which file, and which bytes, for every version
-&lt;package files&gt;                   plus a .sha256 sidecar for each, and any
-                                  further sidecar the build wrote beside it</pre>
+&lt;package files&gt;                   plus two sidecars for each: .sha256, the
+                                  checksum the build published with it, and
+                                  .meta.json, what the package requires</pre>
 
 <p>Everything is signed with Ed25519. The signature covers the exact bytes of the document as
 served, and the hashes inside the index reach from there to every package file — so a mirror can
@@ -153,7 +154,10 @@ architecture to the concrete package name, and a <code>sha256</code>
 derived from those packages' own hashes — so pinning the family still pins
 exactly what every platform will get. It names no file and no size, because
 there is nothing to fetch until it has been resolved. A meta package exists
-at a version exactly when every one of its members does.</p>
+at a version exactly when every one of its members does, and it has no
+<code>.meta.json</code> of its own — it has no archive for one to lie
+beside. Whoever wants what a platform requires resolves the family to that
+platform's package and reads that package's meta file.</p>
 
 <h2>Verifying a copy</h2>
 
@@ -445,6 +449,12 @@ async function collect(source, base) {
           sha256: String(entry.sha256 || ""),
           href: named ? base + entry.file : null,
           file: named ? entry.file : null,
+          // The meta file is recorded by name, hash and size like the
+          // archive. Linked by the name the index records rather than by
+          // one derived from the archive's, because the index is what a
+          // mirror was given.
+          metaHref: (!isMeta && entry.meta_file && isPlainFileName(entry.meta_file.file))
+            ? base + entry.meta_file.file : null,
         });
       }
     }
@@ -596,6 +606,13 @@ function render() {
       link.addEventListener("click", (event) => askBeforeDownloading(event, row));
       files.append(link, document.createTextNode(" · "));
       files.append(el("a", "sha256", { href: row.href + ".sha256" }));
+      if (row.metaHref) {
+        files.append(document.createTextNode(" · "));
+        files.append(el("a", "meta", {
+          href: row.metaHref,
+          title: "what this package is and what it requires",
+        }));
+      }
     } else {
       files.append(el("span", "the index names no file for this entry", { class: "bad" }));
     }
