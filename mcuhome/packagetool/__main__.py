@@ -59,7 +59,7 @@ from mcuhome.packagetool.source import (
 
 #: A superseded part file may be removed once nothing references it, but
 #: only after this long — a lagging mirror and a client in the middle of
-#: resolving must never be cut off (ADR 0025 §2).
+#: resolving must never be cut off.
 PRUNE_GRACE_DAYS = 90
 
 #: How early ``status`` starts complaining. ``keys.json`` needs an

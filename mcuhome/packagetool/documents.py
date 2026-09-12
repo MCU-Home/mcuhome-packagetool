@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """The signed documents of a source: their header, their bytes, their signatures.
 
-ADR 0025 §3 gives every signed document the same four header fields, and
-§4 puts the signature in a detached sibling over **the exact bytes of the
-document as served**. Both halves live here, because "the exact bytes"
-only means something if one function decides them: :func:`dump` is that
-function, and every document this repository writes goes through it.
+Every signed document of a source carries the same four header fields —
+``version``, ``min_client``, ``issued``, ``expires`` — and its signature
+is a detached sibling over **the exact bytes of the document as
+served**. Both halves live here, because "the exact bytes" only means
+something if one function decides them: :func:`dump` is that function,
+and every document this repository writes goes through it.
 
 The serialisation is deliberately the same one
 ``scripts/build_sdk_archive.py`` already uses for a local index — two
@@ -39,7 +40,7 @@ __all__ = [
     "write_signed",
 ]
 
-#: Schema generation of every document this tool writes (ADR 0025 §3).
+#: Schema generation of every document this tool writes.
 #: Informational: no client refuses because of it.
 SCHEMA_VERSION = 1
 
@@ -69,7 +70,7 @@ def dump(document: object) -> bytes:
 
 
 def stamp(moment: datetime) -> str:
-    """RFC 3339 in UTC, seconds — the one timestamp spelling (ADR 0025 §3)."""
+    """RFC 3339 in UTC, seconds — the one timestamp spelling every document uses."""
     return moment.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
@@ -122,11 +123,11 @@ def write_signed(path: Path, document: object, signers: Sequence[SigningKey]) ->
 def assert_advances(previous: object, issued: datetime, what: str) -> None:
     """Refuse unless *issued* is strictly newer than the document being replaced.
 
-    ADR 0025 §3 closes the one weakness a timestamp has against a counter
-    — it can go backwards under a skewed clock or two concurrent
-    publishers — at the writing end rather than at the reading end. This
-    is that check, and it is the reason a client may treat ``issued`` as
-    monotonic.
+    ``issued`` is the freshness and anti-rollback comparator, and the one
+    weakness it has against a counter — it can go backwards under a
+    skewed clock or two concurrent publishers — is closed at the writing
+    end rather than at the reading end. This is that check, and it is
+    the reason a client may treat ``issued`` as monotonic.
     """
     if not isinstance(previous, dict):
         return

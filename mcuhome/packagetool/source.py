@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Building and maintaining one source: its key set, mirror list and index.
 
-A **source** is one self-contained directory (ADR 0025 §1): everything
-needed to use it lives at or below it, and nothing in it says anything
-about any other source. This module is the write side of that — the read
-side, and the authority on what a client must check, is ``verify.py`` at
-the repository root.
+A **source** is one self-contained directory: everything needed to use
+it lives at or below it, and nothing in it says anything about any other
+source. This module is the write side of that — the read side, and the
+authority on what a client must check, is ``verify.py`` at the
+repository root.
 
 Three operations matter and each is small:
 
@@ -20,7 +20,7 @@ Three operations matter and each is small:
 ``refresh``   renew the two publisher-signed documents before they expire
 
 What deliberately has no operation here is *deleting* anything.
-Superseded part files are the sole prunable artefact (§2), and
+Superseded part files are the sole prunable artefact, and
 :func:`unreferenced_parts` only reports them.
 """
 
@@ -138,8 +138,8 @@ def write_keys(
     The predecessor is archived under ``keys/<issued>.json`` before it is
     replaced and is named by the new document's ``previous``, so a client
     that has been offline across rotations can walk backwards to a key
-    set it still trusts and then verify forward (ADR 0025 §6). Archived
-    key sets are never removed.
+    set it still trusts and then verify forward. Archived key sets are
+    never removed.
     """
     path = source / KEYS_FILE
     previous_link: str | None = None
@@ -180,8 +180,8 @@ def part_filename(covers: dict, payload: bytes) -> str:
     """What a part file is called: a readable shard label plus its content hash.
 
     Immutability is the service's guarantee rather than every client's
-    discipline (ADR 0025 §2), and it is this name that gives it: the same
-    content always yields the same name, changed content always yields a
+    discipline, and it is this name that gives it: the same content
+    always yields the same name, changed content always yields a
     different one, so no cache at any layer can serve a stale part under
     a current name.
     """
@@ -215,7 +215,7 @@ def covering_part(parts: Sequence[dict], version: str) -> dict | None:
 
     Placement is a publishing decision, not a consequence of age: the
     publisher declares what a part covers and every entry goes where it
-    is covered (ADR 0025 §2).
+    is covered.
     """
     for part in parts:
         if _version_in(part.get("covers") or {}, version):
@@ -527,7 +527,7 @@ def add_meta_package(
 
 
 def unreferenced_parts(source: Path) -> list[Path]:
-    """Part files no longer named by the head — prunable after §2's grace period."""
+    """Part files no longer named by the head — prunable once the grace period is over."""
     index = read_document(source / INDEX_FILE)
     referenced = {str(part.get("file")) for part in index.get("parts") or []}
     return sorted(

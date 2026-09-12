@@ -3,9 +3,9 @@
 """The publishing side: what it writes, and what it refuses to write.
 
 The refusals matter more than the writes. A published version is
-immutable and eternal (ADR 0025 §1), and every guard here exists so that
-the one irreversible mistake — replacing something already published —
-cannot be made by a workflow at three in the morning.
+immutable and eternal, and every guard here exists so that the one
+irreversible mistake — replacing something already published — cannot be
+made by a workflow at three in the morning.
 """
 
 from __future__ import annotations

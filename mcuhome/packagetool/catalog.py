@@ -4,9 +4,9 @@
 
 The browsable page needs to know which directories are sources. That is a
 convenience, and it must never become anything else: **nothing above a
-source has authority** (ADR 0025 §1). A client resolves the source it was
-configured with, against the anchor it was configured with; it does not
-discover one here, and this file is signed by nobody on purpose.
+source has authority**. A client resolves the source it was configured
+with, against the anchor it was configured with; it does not discover
+one here, and this file is signed by nobody on purpose.
 
 Saying that in the file itself is the point of the note below. A
 directory listing that looks official is exactly how a trust model gets

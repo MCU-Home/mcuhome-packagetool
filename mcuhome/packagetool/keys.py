@@ -3,9 +3,9 @@
 """Ed25519 key material: generation, identity, signing.
 
 Two kinds of key exist, and the difference is where the private half
-lives rather than anything about the key itself (ADR 0025 §5): **root**
-keys are offline and sign only ``keys.json``, **publisher** keys live in
-a protected CI environment and sign a source's ``index.json`` and
+lives rather than anything about the key itself: **root** keys are
+offline and sign only ``keys.json``, **publisher** keys live in a
+protected CI environment and sign a source's ``index.json`` and
 ``mirrors.json``.
 
 A key's **identity is the SHA-256 of its raw 32-byte public key**, hex.
@@ -14,9 +14,10 @@ same id, and a key id in a signature therefore names bytes rather than a
 label somebody chose.
 
 Private keys are stored as unencrypted PKCS#8 PEM. That is a deliberate
-choice for the development key set only — ADR 0025's consequences say
-so, and the v1.0 ceremony replaces them with passphrase-protected keys
-kept apart. The file mode is 0600 either way.
+choice for the development key set only — until v1.0 these keys are
+generated without passphrases and kept in the workspace, and the v1.0
+ceremony replaces them with passphrase-protected keys kept apart. The
+file mode is 0600 either way.
 """
 
 from __future__ import annotations

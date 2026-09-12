@@ -6,8 +6,8 @@ The vectors are committed, and this script is how they are regenerated —
 they exist so that a *client* implementation (the command line, the
 workbench, a build server, somebody else's tool) can be tested against
 the same corpus as the reference verifier, before that client exists.
-That is what makes ADR 0025 §9 a transcription rather than a second
-design.
+That is what keeps the normative verification algorithm a transcription
+of tested behaviour rather than a second design.
 
 Everything is stamped from fixed times so a regenerated corpus differs
 only where its content differs; tests verify "as of" ``NOW``.

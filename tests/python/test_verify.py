@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The reference verifier against the committed corpus.
 
-Every case states the verdict ADR 0025 §9 requires and a fragment of the
-reason a user would read, so a refusal that starts happening for the
-wrong reason is a failure too — "it refused" is not the same as "it
+Every case states the verdict the normative rules require and a fragment
+of the reason a user would read, so a refusal that starts happening for
+the wrong reason is a failure too — "it refused" is not the same as "it
 refused because the part hash did not match".
 """
 
